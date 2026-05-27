@@ -134,20 +134,27 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                 registered_date = None
 
         # --- Build the signal ---
+        # Field names match signals.vacant_registrations columns directly.
+        # `source`, `boarded`, `condemned`, `registration_number` are in-memory
+        # only — they are stripped before write to vacant_registrations and
+        # used to project the unified distress_events row.
         return VbrListingInsert(
             parcel_id=pid,
-            registration_number=None,  # Saint Paul doesn't publish a per-record ID
-            category=category_label,
-            status=str(attributes.get("DWELLING_TYPE") or "unknown"),
-            registered_date=registered_date,
-            boarded=boarded,
-            condemned=condemned,
-            source=self.source_name,
+            city="Saint Paul",
+            registry_type=category_label,
+            date_entered_registry=registered_date,
+            is_active=True,
             raw_data={
                 "attributes": attributes,
                 "geometry": geometry,
+                "dwelling_type": str(attributes.get("DWELLING_TYPE") or "unknown"),
+                "_source": self.source_name,
             },
             observed_at=datetime.now(timezone.utc),
+            source=self.source_name,
+            registration_number=None,  # Saint Paul doesn't publish a per-record ID
+            boarded=boarded,
+            condemned=condemned,
         )
 
     # ---- Write ----
@@ -161,7 +168,7 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
 
         Three writes happen per scraper run:
           1. resolve_parcel() for each unique parcel
-          2. signals.vbr_listings  (typed table)
+          2. signals.vacant_registrations  (typed table)
           3. signals.distress_events (unified feed)
         """
         if not signals:
@@ -208,14 +215,23 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         for parcel_payload in unique_parcels.values():
             resolve_parcel(parcel_payload)
 
-        # --- Step 2: Write typed vbr_listings rows ---
-        signal_rows = [
-            sig.model_dump(mode="json", exclude_none=True) for sig in signals
-        ]
+        # --- Step 2: Write typed signals.vacant_registrations rows ---
+        # Strip in-memory-only fields that don't exist as columns in
+        # signals.vacant_registrations: source, boarded, condemned,
+        # registration_number. They live in raw_data already (under _source)
+        # and drive the unified event_type / severity via to_event().
+        _IN_MEMORY_ONLY = {"source", "boarded", "condemned", "registration_number"}
+        signal_rows = []
+        for sig in signals:
+            row = sig.model_dump(mode="json", exclude_none=True)
+            for k in _IN_MEMORY_ONLY:
+                row.pop(k, None)
+            signal_rows.append(row)
+
         new_typed, failed_typed = write_typed_signals_dedup(
-            "vbr_listings",
+            "vacant_registrations",
             signal_rows,
-            on_conflict="parcel_id,source,registered_date",
+            on_conflict="parcel_id,date_entered_registry",
         )
 
         # --- Step 3: Write unified distress_events ---
