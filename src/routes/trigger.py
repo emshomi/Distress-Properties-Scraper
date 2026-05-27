@@ -3,16 +3,21 @@ Admin-protected manual scraper trigger endpoint.
 
 Operators call POST /trigger/{scraper_name} to run a specific scraper
 on demand, outside its scheduled cron window.
+
+For ArcGIS-based scrapers, an optional `max_records` query parameter
+limits the fetch — useful for test runs (e.g., loading just 100 parcels
+to validate field mapping before the full 448K scrape).
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Path, status as http_status
+from fastapi import APIRouter, HTTPException, Path, Query, status as http_status
 
 from src.middleware.auth import AdminKeyRequired
 from src.scrapers.base_scraper import BaseScraper
+from src.scrapers.hennepin_parcels import HennepinParcelsScraper
 from src.scrapers.hennepin_sheriff import HennepinSheriffScraper
 from src.scrapers.mcro_probate import McroProbateScraper
 from src.scrapers.mpls_311 import MplsThreeOneOneScraper
@@ -36,6 +41,7 @@ from src.utils.logger import logger
 _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "mpls_311": MplsThreeOneOneScraper,
     "hennepin_sheriff": HennepinSheriffScraper,
+    "hennepin_parcels": HennepinParcelsScraper,
     "ramsey_sheriff": RamseySheriffScraper,
     "mpls_vbr": MplsVacantBuildingScraper,
     "saint_paul_vacant": SaintPaulVacantBuildingScraper,
@@ -61,6 +67,17 @@ async def trigger_scraper(
         max_length=100,
         pattern=r"^[a-z][a-z0-9_]*$",
     ),
+    max_records: int | None = Query(
+        default=None,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "Optional: limit number of records fetched. Used for test runs "
+            "on large ArcGIS datasets (e.g., max_records=100 to validate "
+            "field mapping before a full scrape). Only honored by ArcGIS "
+            "scrapers — other scrapers ignore it."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Trigger a scraper run on demand."""
     scraper_class = _SCRAPER_REGISTRY.get(scraper_name)
@@ -78,13 +95,27 @@ async def trigger_scraper(
             ),
         )
 
-    logger.info("Manual trigger received", scraper_name=scraper_name)
+    logger.info(
+        "Manual trigger received",
+        scraper_name=scraper_name,
+        max_records=max_records,
+    )
 
     try:
         scraper = scraper_class()
+        # Apply max_records override if set and the scraper supports it
+        if max_records is not None and hasattr(
+            scraper, "_max_records_override"
+        ):
+            scraper._max_records_override = max_records  # type: ignore[attr-defined]
+
+        metadata: dict[str, Any] = {"trigger_source": "trigger_endpoint"}
+        if max_records is not None:
+            metadata["max_records"] = max_records
+
         result = await scraper.run(
             trigger="manual",
-            metadata={"trigger_source": "trigger_endpoint"},
+            metadata=metadata,
         )
     except ScraperDisabledError as exc:
         raise HTTPException(
