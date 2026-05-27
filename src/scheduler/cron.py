@@ -7,7 +7,9 @@ happen automatically without operator intervention.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -152,7 +154,15 @@ def start_scheduler() -> AsyncIOScheduler:
             replace_existing=True,
         )
 
-        next_run = trigger.get_next_fire_time(None, None)
+        try:
+            next_run = trigger.get_next_fire_time(None, datetime.now(tz=ZoneInfo(_SCHEDULE_TIMEZONE)))
+        except Exception as next_run_error:  # noqa: BLE001
+            logger.warning(
+                "Could not compute next fire time",
+                scraper=scraper_class.source_name,
+                error=str(next_run_error),
+            )
+            next_run = None
         logger.info(
             "Registered scheduled scraper job",
             scraper=scraper_class.source_name,
