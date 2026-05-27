@@ -126,6 +126,13 @@ class ParcelUpsert(BaseModel):
     # Status fields
     vacancy_status: VacancyStatus | None = None
 
+    # Source-specific raw attributes preserved verbatim.
+    # Schema varies by scraper — Hennepin parcels store the 80+ ArcGIS
+    # attributes here for later mining of distress signals (FORFEIT_LAND_IND,
+    # EARLIEST_DELQ_YR, COMP_JUDG_IND, TAXPAYER_NM, etc.).
+    # Stored in core.parcels.raw_data (JSONB).
+    raw_data: dict[str, Any] | None = None
+
     # Provenance (data_sources list is unioned, not overwritten)
     data_sources: list[str] = Field(default_factory=list)
     last_observed_at: datetime | None = None
@@ -156,6 +163,7 @@ class Parcel(BaseModel):
     estimated_equity: Decimal | None = None
     estimated_mortgage_balance: Decimal | None = None
     vacancy_status: str | None = None
+    raw_data: dict[str, Any] | None = None
     data_sources: list[str] = Field(default_factory=list)
     first_observed_at: datetime | None = None
     last_observed_at: datetime | None = None
