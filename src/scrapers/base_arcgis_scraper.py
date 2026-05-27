@@ -19,6 +19,12 @@ Subclasses must:
   - Implement write(signals) → (new, updated, failed)
 
 The base class handles fetch() and the run() lifecycle.
+
+For large datasets (e.g., Hennepin's 448K parcels), subclasses can override:
+  - page_size:         records per HTTP request (default 1000)
+  - max_pages:         hard cap on total pages (default 100 = 100K records)
+  - progress_log_every: log progress every N records (default 5000)
+  - max_records_override: optional runtime cap (set via run metadata)
 """
 
 from __future__ import annotations
@@ -42,7 +48,8 @@ SIGNAL = TypeVar("SIGNAL")
 
 # ArcGIS standard query params we always send
 _DEFAULT_PAGE_SIZE: int = 1000
-_MAX_PAGES: int = 100  # Safety cap — 100k records max per run
+_DEFAULT_MAX_PAGES: int = 100  # Safety cap — 100k records max per run by default
+_DEFAULT_PROGRESS_LOG_EVERY: int = 5000
 
 
 def arcgis_date_to_iso(value: Any) -> str | None:
@@ -106,6 +113,22 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
     # Specific fields to fetch. Default '*' = all fields.
     # Subclasses can narrow this if a service has dozens of irrelevant fields.
     out_fields: ClassVar[str] = "*"
+
+    # Records per HTTP request. ArcGIS services typically cap at 1000-2000.
+    page_size: ClassVar[int] = _DEFAULT_PAGE_SIZE
+
+    # Maximum number of pages to fetch. Safety cap.
+    # Override in subclasses for large datasets (e.g., 500 for ~500K records).
+    max_pages: ClassVar[int] = _DEFAULT_MAX_PAGES
+
+    # Log progress every N records during fetch.
+    progress_log_every: ClassVar[int] = _DEFAULT_PROGRESS_LOG_EVERY
+
+    # ---- Runtime override (set per-run via metadata) ----
+    # If set to a positive int, the scraper stops fetching after this many records.
+    # Useful for test runs (e.g., max_records=100 for initial validation).
+    # Set on the instance, not the class.
+    _max_records_override: int | None = None
 
     # ---- Abstract methods subclasses must implement ----
 
@@ -204,46 +227,84 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
 
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         """
-        Fetch ALL features from the ArcGIS service via pagination.
+        Fetch features from the ArcGIS service via pagination.
+
+        Honors:
+          - self.page_size            (records per HTTP request)
+          - self.max_pages            (hard cap on pages)
+          - self._max_records_override (runtime cap, e.g. for test runs)
+          - self.progress_log_every   (logging cadence)
 
         Returns a list of raw feature dicts, each with 'attributes' and
         (optionally) 'geometry' keys.
         """
+        page_size = self.page_size
+        max_pages = self.max_pages
+        record_cap = self._max_records_override
+
         logger.info(
             "ArcGIS fetch starting",
             source=self.source_name,
             url=self.feature_service_url,
             where=self.where_clause,
+            page_size=page_size,
+            max_pages=max_pages,
+            max_records_override=record_cap,
         )
 
         all_features: list[dict[str, Any]] = []
-        page_size = _DEFAULT_PAGE_SIZE
+        next_progress_threshold = self.progress_log_every
 
         async with httpx.AsyncClient(
             timeout=settings.scraper_request_timeout_seconds,
             headers={"User-Agent": "DistressProperties/1.0"},
         ) as client:
-            for page in range(_MAX_PAGES):
+            for page in range(max_pages):
                 offset = page * page_size
-                data = await self._fetch_page(client, offset, page_size)
+
+                # If a record cap is set and we've already reached it, stop.
+                if record_cap is not None and len(all_features) >= record_cap:
+                    logger.info(
+                        "ArcGIS fetch stopping early — record cap reached",
+                        source=self.source_name,
+                        record_cap=record_cap,
+                        fetched=len(all_features),
+                    )
+                    break
+
+                # If a record cap is set, narrow the next page size if needed
+                effective_page_size = page_size
+                if record_cap is not None:
+                    remaining = record_cap - len(all_features)
+                    effective_page_size = min(page_size, remaining)
+
+                data = await self._fetch_page(
+                    client, offset, effective_page_size
+                )
                 features = data.get("features") or []
                 all_features.extend(features)
 
-                logger.debug(
-                    "ArcGIS page fetched",
-                    source=self.source_name,
-                    page=page,
-                    offset=offset,
-                    page_count=len(features),
-                    cumulative=len(all_features),
-                )
+                # Progress logging at human-readable thresholds
+                if len(all_features) >= next_progress_threshold:
+                    logger.info(
+                        "ArcGIS fetch progress",
+                        source=self.source_name,
+                        cumulative=len(all_features),
+                        page=page + 1,
+                    )
+                    while next_progress_threshold <= len(all_features):
+                        next_progress_threshold += self.progress_log_every
 
                 # If we got fewer than a full page, we're done
-                if len(features) < page_size:
+                if len(features) < effective_page_size:
                     break
 
-                # If the service signals "exceededTransferLimit" is False, we're done
-                if not data.get("exceededTransferLimit", False) and len(features) == 0:
+                # If the service signals exceededTransferLimit=False AND we
+                # got 0 features, that's also a stop signal
+                if (
+                    not data.get("exceededTransferLimit", False)
+                    and len(features) == 0
+                ):
                     break
 
         logger.info(
