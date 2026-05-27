@@ -99,6 +99,7 @@ class Settings(BaseSettings):
 
     scraper_mpls_311_enabled: bool = Field(default=True)
     scraper_hennepin_sheriff_enabled: bool = Field(default=True)
+    scraper_hennepin_parcels_enabled: bool = Field(default=True)
     scraper_ramsey_sheriff_enabled: bool = Field(default=True)
     scraper_mpls_vbr_enabled: bool = Field(default=True)
     scraper_saint_paul_vacant_enabled: bool = Field(default=True)
