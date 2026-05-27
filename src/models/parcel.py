@@ -103,7 +103,7 @@ class ParcelUpsert(BaseModel):
     address: str | None = Field(default=None, max_length=500)
     city: str | None = Field(default=None, max_length=200)
     zip: str | None = Field(default=None, max_length=10)
-    zip4: str | None = Field(default=None, max_length=10)
+    zip_plus_four: str | None = Field(default=None, max_length=10)
 
     # Geographic coordinates (fill-in semantics)
     lat: float | None = Field(default=None, ge=-90, le=90)
@@ -114,8 +114,8 @@ class ParcelUpsert(BaseModel):
     year_built: int | None = Field(default=None, ge=1700, le=2100)
     sqft: int | None = Field(default=None, ge=0)
     lot_sqft: int | None = Field(default=None, ge=0)
-    bedrooms: int | None = Field(default=None, ge=0, le=50)
-    bathrooms: float | None = Field(default=None, ge=0, le=50)
+    beds: int | None = Field(default=None, ge=0, le=50)
+    baths: float | None = Field(default=None, ge=0, le=50)
     stories: int | None = Field(default=None, ge=0, le=20)
 
     # Financial estimates (overwrite semantics — newer values always win)
@@ -142,15 +142,15 @@ class Parcel(BaseModel):
     address: str | None = None
     city: str | None = None
     zip: str | None = None
-    zip4: str | None = None
+    zip_plus_four: str | None = None
     lat: float | None = None
     lng: float | None = None
     property_type: str | None = None
     year_built: int | None = None
     sqft: int | None = None
     lot_sqft: int | None = None
-    bedrooms: int | None = None
-    bathrooms: float | None = None
+    beds: int | None = None
+    baths: float | None = None
     stories: int | None = None
     estimated_market_value: Decimal | None = None
     estimated_equity: Decimal | None = None
