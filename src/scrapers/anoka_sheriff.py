@@ -87,7 +87,23 @@ _RE_ORIG_PRINCIPAL = re.compile(
     r"ORIGINAL\s+PRINCIPAL[^$]*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", re.I
 )
 
-_USER_AGENT = "DistressProperties/1.0 (public-benefit; respects robots)"
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+# Full browser-like headers — the Anoka ASP.NET server stalls or blocks bare UAs.
+_BROWSER_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 def _safe_str(value: Any) -> str | None:
@@ -160,19 +176,38 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []
 
-        timeout = getattr(settings, "scraper_request_timeout_seconds", 30)
+        # Generous timeout — the county server can be slow. Browser headers
+        # because the ASP.NET app stalls on bare/unknown User-Agents.
+        timeout = httpx.Timeout(60.0, connect=20.0)
         async with httpx.AsyncClient(
             timeout=timeout,
-            headers={"User-Agent": _USER_AGENT},
+            headers=_BROWSER_HEADERS,
             follow_redirects=True,
         ) as client:
             # 1. GET the list page once to learn the form structure.
-            try:
-                resp = await client.get(_LIST_URL)
-            except httpx.HTTPError as e:
+            #    Retry a couple of times — the county server can be flaky.
+            resp = None
+            last_err: Exception | None = None
+            for attempt in range(3):
+                try:
+                    resp = await client.get(_LIST_URL)
+                    break
+                except httpx.HTTPError as e:
+                    last_err = e
+                    logger.warning(
+                        "Anoka list GET attempt failed",
+                        source=self.source_name,
+                        attempt=attempt + 1,
+                        error_type=type(e).__name__,
+                        error_repr=repr(e),
+                    )
+                    await asyncio.sleep(2.0)
+            if resp is None:
                 raise SourceUnavailableError(
-                    f"Anoka list GET failed: {e}", source=self.source_name
-                ) from e
+                    f"Anoka list GET failed after retries: "
+                    f"{type(last_err).__name__}: {last_err!r}",
+                    source=self.source_name,
+                )
             if resp.status_code != 200:
                 raise SourceUnavailableError(
                     f"Anoka list returned {resp.status_code}",
