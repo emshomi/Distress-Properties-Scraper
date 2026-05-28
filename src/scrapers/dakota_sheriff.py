@@ -205,8 +205,12 @@ class DakotaSheriffScraper(BaseArcGISScraper[DistressEventInsert]):
 
                     features = data.get("features") or []
                     for feat in features:
-                        feat["_year"] = year
-                        feat["_layer_id"] = layer_id
+                        # Tag inside ATTRIBUTES (not the feature) — the base
+                        # parse() passes feature["attributes"] to parse_feature,
+                        # so tags on the feature itself would be invisible.
+                        attrs = feat.setdefault("attributes", {})
+                        attrs["_year"] = year
+                        attrs["_layer_id"] = layer_id
                     all_features.extend(features)
 
                     logger.info(
