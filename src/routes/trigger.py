@@ -25,6 +25,7 @@ from fastapi import APIRouter, HTTPException, Path, Query, status as http_status
 
 from src.middleware.auth import AdminKeyRequired
 from src.scrapers.base_scraper import BaseScraper
+from src.scrapers.dakota_sheriff import DakotaSheriffScraper
 from src.scrapers.hennepin_parcels import HennepinParcelsScraper
 from src.scrapers.hennepin_sheriff import HennepinSheriffScraper
 from src.scrapers.mcro_probate import McroProbateScraper
@@ -50,6 +51,7 @@ _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "mpls_311": MplsThreeOneOneScraper,
     "hennepin_sheriff": HennepinSheriffScraper,
     "hennepin_parcels": HennepinParcelsScraper,
+    "dakota_sheriff": DakotaSheriffScraper,
     "ramsey_sheriff": RamseySheriffScraper,
     "mpls_vbr": MplsVacantBuildingScraper,
     "saint_paul_vacant": SaintPaulVacantBuildingScraper,
