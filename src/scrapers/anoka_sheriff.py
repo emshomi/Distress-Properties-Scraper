@@ -515,14 +515,14 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 page = await context.new_page()
 
                 # Touch the list page once to establish navigation
-                # context (Referer chain, etc.) — does NOT submit. The
-                # session is already warm via the cookies above.
+                # context (Referer chain, JS-set state, etc.).
                 try:
                     await page.goto(
                         _LIST_URL,
                         wait_until="domcontentloaded",
                         timeout=30000,
                     )
+                    await asyncio.sleep(0.5)
                 except (PlaywrightTimeout, PlaywrightError) as e:
                     logger.warning(
                         "Playwright: list page pre-load failed; "
@@ -530,6 +530,128 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         source=self.source_name,
                         error_type=type(e).__name__,
                     )
+
+                # Submit the search via in-page fetch(). Earlier we
+                # tried page.context.request.post (Playwright's separate
+                # API request stack) — server returned the empty form.
+                # In-page fetch is different: it goes through Chromium's
+                # NATIVE network stack, with the same TLS fingerprint,
+                # HTTP version, and request internals as a real user's
+                # click. If the server discriminates between API-style
+                # POSTs and real-browser POSTs, this is the path that
+                # passes for a real browser.
+                #
+                # Why we POST at all when we already have warm cookies:
+                # cookie injection alone failed every detail GET. The
+                # server must be checking something beyond the cookie —
+                # likely server-side session state that's only set when
+                # a search POST is processed *in this browser context*
+                # (not just any POST that shares the SessionId).
+                try:
+                    fetch_result = await page.evaluate(
+                        """
+                        async () => {
+                            const form = document.querySelector('form');
+                            if (!form) return {
+                                ok: false, reason: 'no form'
+                            };
+
+                            // Set Pending dropdown
+                            for (const sel of form.querySelectorAll(
+                                'select'
+                            )) {
+                                const labels = [...sel.options].map(
+                                    o => (o.textContent || '')
+                                        .toLowerCase()
+                                );
+                                if (labels.some(
+                                        l => l.includes('pending')
+                                    ) && labels.some(
+                                        l => l.includes('completed')
+                                    )) {
+                                    for (const opt of sel.options) {
+                                        if ((opt.textContent || '')
+                                            .toLowerCase()
+                                            .includes('pending')) {
+                                            sel.value = opt.value;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+
+                            // Build form data the way a real submit
+                            // does: every input/select, plus the
+                            // submit button's name=value.
+                            const data = new URLSearchParams();
+                            for (const inp of form.querySelectorAll(
+                                'input'
+                            )) {
+                                if (inp.name && inp.type !== 'submit') {
+                                    data.append(
+                                        inp.name, inp.value || ''
+                                    );
+                                }
+                            }
+                            for (const sel of form.querySelectorAll(
+                                'select'
+                            )) {
+                                if (sel.name) {
+                                    data.append(
+                                        sel.name, sel.value || ''
+                                    );
+                                }
+                            }
+                            const btn = form.querySelector(
+                                'input[type=submit][value=Submit]'
+                            );
+                            if (btn && btn.name) {
+                                data.append(btn.name, btn.value);
+                            }
+
+                            // Real-browser POST via native fetch.
+                            const url = form.action
+                                || window.location.href;
+                            const response = await fetch(url, {
+                                method: 'POST',
+                                body: data,
+                                credentials: 'include',
+                                redirect: 'follow',
+                                headers: {
+                                    'Content-Type':
+                                        'application/x-www-form-urlencoded'
+                                }
+                            });
+                            const html = await response.text();
+                            return {
+                                ok: response.ok,
+                                status: response.status,
+                                url: response.url,
+                                body_length: html.length,
+                                has_results: html.toLowerCase()
+                                    .includes('records found'),
+                                has_detail_links: html.toLowerCase()
+                                    .includes('foreclosurenotice')
+                            };
+                        }
+                        """
+                    )
+                    logger.info(
+                        "Playwright: in-page fetch POST",
+                        source=self.source_name,
+                        **fetch_result,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Playwright: in-page fetch POST raised",
+                        source=self.source_name,
+                        error_type=type(e).__name__,
+                        error_repr=repr(e),
+                    )
+
+                # Small pause so any server-side session work settles.
+                await asyncio.sleep(1.0)
 
                 detail_ok = 0
                 detail_bounced = 0
