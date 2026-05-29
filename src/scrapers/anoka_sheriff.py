@@ -323,21 +323,30 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 # mode's postback carries a valid (current) __VIEWSTATE.
                 soup = BeautifulSoup(post.text, "lxml")
 
-            # 3. Detail-page enrichment, reusing the SAME httpx client.
-            # Our earlier attempt with httpx + a 6-header browser set
-            # bounced every detail GET to error.aspx. Our Playwright
-            # attempt couldn't even warm the session — the search POST
-            # via context.request.post got the empty form back.
-            #
-            # Theory we're now testing: the server bounces detail GETs
-            # because they're missing the Sec-Fetch-* headers that real
-            # browsers send when navigating to a same-origin page after
-            # a successful search. The search POST itself is permissive
-            # (no Sec-Fetch-* check), but the detail page IS strict.
-            # Reusing this client keeps the cookies from the search POST
-            # — the only piece that's known to be right — and we layer
-            # on the navigation-style headers on top.
-            await self._enrich_details_with_httpx(client, all_rows)
+            # 3. Detail-page enrichment. Earlier attempts:
+            #   - httpx detail GETs with warm cookies + 6 headers: bounce
+            #   - httpx detail GETs with warm cookies + Sec-Fetch-*: bounce
+            #   - Playwright detail GETs with cold cookies: bounce
+            #   - Playwright form-submission to warm cookies: blocked
+            # The single combination we haven't tried: Playwright (real
+            # Chromium fingerprint + JS execution) with cookies WARMED
+            # by httpx's known-working search POST. That's now the path.
+            # We extract httpx's cookies here and pass them to Playwright,
+            # which adds them to the context BEFORE any navigation.
+            httpx_cookies = []
+            for c in client.cookies.jar:
+                httpx_cookies.append(
+                    {
+                        "name": c.name,
+                        "value": c.value or "",
+                        "domain": c.domain
+                        or "foreclosures.co.anoka.mn.us",
+                        "path": c.path or "/",
+                    }
+                )
+            await self._enrich_details_with_playwright(
+                httpx_cookies, all_rows
+            )
 
         logger.info(
             "Anoka fetch complete",
@@ -439,20 +448,26 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
     # ---- Playwright detail-page enrichment ----
 
     async def _enrich_details_with_playwright(
-        self, all_rows: list[dict[str, Any]]
+        self,
+        httpx_cookies: list[dict[str, Any]],
+        all_rows: list[dict[str, Any]],
     ) -> None:
         """Fill in mortgagor/amount-due/tax-parcel by browsing the detail
-        pages with headless Chromium.
+        pages with headless Chromium, using cookies that httpx ALREADY
+        warmed via its successful search POST.
 
-        Modifies `all_rows` in place via the existing `_parse_detail` helper.
-        Tolerates per-row failures with a warning — Pending Sales rows still
-        have list-level data (address, city, sale date) even if detail
-        enrichment fails.
+        Why this exists: every other combination bounced. httpx-only
+        detail GETs (even with full Sec-Fetch-* headers) all redirect to
+        error.aspx. Playwright trying to submit the form in-page (via
+        click, JS form.submit, or context.request.post) cannot warm the
+        session — the search either doesn't dispatch or is rejected by
+        the server, leaving cold cookies. Real users succeed because
+        their session is warmed by a real form click in a real browser.
+        This method approximates that: httpx does the warming POST (the
+        ONE thing httpx is known to do successfully here), we copy its
+        cookies into a real Chromium context, and from then on it's a
+        real browser hitting the detail pages with the right session.
         """
-        # Local import: only the workflow that runs this scraper installs
-        # the Chromium binaries via `playwright install`. Keeping the import
-        # inside the method means modules that don't run this code path
-        # don't break if Playwright's runtime isn't available.
         from playwright.async_api import (
             async_playwright,
             Error as PlaywrightError,
@@ -470,282 +485,56 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     viewport={"width": 1280, "height": 800},
                     locale="en-US",
                 )
-                # Hide the standard headless-Chromium tell. Some ASP.NET
-                # apps with anti-bot middleware check this; the cost of
-                # masking it is zero and the cost of NOT masking is
-                # potentially serving us a stripped-down page that
-                # doesn't behave like the one a real user sees.
+                # Mask the standard headless-Chromium tell. Cheap.
                 await context.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', "
                     "{ get: () => undefined });"
                 )
+
+                # KEY STEP: inject httpx's warm cookies BEFORE any
+                # navigation. From the server's perspective, this
+                # browser context already participated in a successful
+                # search and is allowed to view detail pages.
+                if httpx_cookies:
+                    await context.add_cookies(httpx_cookies)
+                    logger.info(
+                        "Playwright: injected warm cookies from httpx",
+                        source=self.source_name,
+                        cookie_count=len(httpx_cookies),
+                        cookie_names=[
+                            c.get("name") for c in httpx_cookies
+                        ],
+                    )
+                else:
+                    logger.warning(
+                        "Playwright: no httpx cookies to inject; "
+                        "detail fetches will likely bounce",
+                        source=self.source_name,
+                    )
+
                 page = await context.new_page()
 
-                # First navigate to the list page. Use `networkidle` (not
-                # `domcontentloaded`) so any inline JS that initializes
-                # __doPostBack / __VIEWSTATE has time to finish before we
-                # submit.
+                # Touch the list page once to establish navigation
+                # context (Referer chain, etc.) — does NOT submit. The
+                # session is already warm via the cookies above.
                 try:
                     await page.goto(
                         _LIST_URL,
-                        wait_until="networkidle",
+                        wait_until="domcontentloaded",
                         timeout=30000,
                     )
-                    await asyncio.sleep(0.5)
                 except (PlaywrightTimeout, PlaywrightError) as e:
                     logger.warning(
-                        "Playwright: list-page warm-up failed; "
+                        "Playwright: list page pre-load failed; "
                         "continuing anyway",
                         source=self.source_name,
                         error_type=type(e).__name__,
                     )
 
-                # Submit the search form. We've tried in succession:
-                #   1. page.click() with expect_navigation — click registered,
-                #      no navigation followed (timed out at 10s).
-                #   2. page.click() with no_wait_after — click registered,
-                #      page never updated (no "records found" within 30s).
-                #   3. form.submit() via JS — submit invoked, navigation
-                #      started but never completed (hung at "navigation to
-                #      finish").
-                #
-                # The conclusion: there's something about this ASP.NET
-                # WebForms app that makes in-page form submission unreliable
-                # in headless Chromium. So we abandon that approach entirely
-                # and do an explicit POST via page.context.request — which
-                # shares cookies with the browser context but lets us
-                # construct the request fully. Once the cookies are warmed
-                # by this POST, subsequent page.goto() calls to detail URLs
-                # will see the same session the server is expecting.
-                submit_ok = False
-                try:
-                    # Parse hidden + dropdown fields from the current page
-                    # so we can replay them in the POST body. Critically,
-                    # we FIRST set the Pending/Completed dropdown to the
-                    # "Pending" option — otherwise we'd send whatever
-                    # value the page rendered with, which (we discovered)
-                    # is "Completed" and has zero rows, so the search
-                    # returns an empty page that looks just like the
-                    # initial form.
-                    form_data = await page.evaluate(
-                        """
-                        () => {
-                            const form = document.querySelector('form');
-                            if (!form) return null;
-
-                            // Find the Sales-Type dropdown by content
-                            // (option labels containing "pending" AND
-                            // "completed"), then select its Pending
-                            // option. This mirrors the label-matching
-                            // logic the httpx code uses.
-                            for (const sel of form.querySelectorAll(
-                                'select'
-                            )) {
-                                const labels = [...sel.options].map(
-                                    o => (o.textContent || '').toLowerCase()
-                                );
-                                const hasPending = labels.some(
-                                    l => l.includes('pending')
-                                );
-                                const hasCompleted = labels.some(
-                                    l => l.includes('completed')
-                                );
-                                if (hasPending && hasCompleted) {
-                                    for (const opt of sel.options) {
-                                        if ((opt.textContent || '')
-                                            .toLowerCase()
-                                            .includes('pending')) {
-                                            sel.value = opt.value;
-                                            break;
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-
-                            // Now read everything back out.
-                            const data = {};
-                            for (const inp of form.querySelectorAll(
-                                'input[type=hidden]'
-                            )) {
-                                if (inp.name) data[inp.name] = inp.value || '';
-                            }
-                            for (const inp of form.querySelectorAll(
-                                'input[type=text]'
-                            )) {
-                                if (inp.name) data[inp.name] = inp.value || '';
-                            }
-                            for (const sel of form.querySelectorAll('select')) {
-                                if (sel.name) data[sel.name] = sel.value || '';
-                            }
-                            // Simulate a click on the Submit button by
-                            // including its name=value as a POST field —
-                            // this is what a real browser does when the
-                            // user clicks the button, and ASP.NET needs it
-                            // to route the postback.
-                            const btn = form.querySelector(
-                                'input[type=submit][value=Submit]'
-                            );
-                            if (btn && btn.name) data[btn.name] = btn.value;
-                            return data;
-                        }
-                        """
-                    )
-                    if not form_data:
-                        raise RuntimeError("could not read form fields")
-
-                    # Log what we're about to send so we can debug if the
-                    # server rejects it. We only log the keys (and a few
-                    # short values) — __VIEWSTATE is huge so we elide it.
-                    field_summary = {
-                        k: (v[:60] + "...")
-                        if isinstance(v, str) and len(v) > 60
-                        else v
-                        for k, v in form_data.items()
-                    }
-                    logger.info(
-                        "Playwright: form data prepared for POST",
-                        source=self.source_name,
-                        field_count=len(form_data),
-                        fields=field_summary,
-                    )
-
-                    # POST directly via the Playwright request context.
-                    # This call shares cookies with `page` (same context),
-                    # so any session marker the server sets back is
-                    # automatically used by subsequent page.goto() calls.
-                    #
-                    # We send a comprehensive set of headers — a real
-                    # browser sends ~12 headers on a form POST, and our
-                    # earlier 3-header attempt got the empty form back
-                    # (server probably saw it as a bot probe). Matching a
-                    # real Chromium navigation request more closely should
-                    # get the server to actually run the search.
-                    response = await page.context.request.post(
-                        _LIST_URL,
-                        data=form_data,
-                        headers={
-                            "Accept": (
-                                "text/html,application/xhtml+xml,"
-                                "application/xml;q=0.9,image/avif,"
-                                "image/webp,image/apng,*/*;q=0.8"
-                            ),
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Cache-Control": "max-age=0",
-                            "Content-Type": (
-                                "application/x-www-form-urlencoded"
-                            ),
-                            "Origin": (
-                                "https://foreclosures.co.anoka.mn.us"
-                            ),
-                            "Referer": _LIST_URL,
-                            "Sec-Fetch-Dest": "document",
-                            "Sec-Fetch-Mode": "navigate",
-                            "Sec-Fetch-Site": "same-origin",
-                            "Sec-Fetch-User": "?1",
-                            "Upgrade-Insecure-Requests": "1",
-                            "User-Agent": _USER_AGENT,
-                        },
-                        timeout=60000,
-                    )
-                    body = await response.text()
-                    has_results = "records found" in body.lower()
-
-                    # Pull a handful of signals from the body so we can
-                    # tell what kind of page the server actually returned:
-                    # the search form again? an error page? something
-                    # else? We do this without dumping the whole 20KB.
-                    body_lower = body.lower()
-                    body_signals = {
-                        "has_records_found": has_results,
-                        "has_search_form": (
-                            "btnsubmit" in body_lower
-                            and "viewstate" in body_lower
-                        ),
-                        "has_error": (
-                            "error" in body_lower[:2000]
-                            or "expired" in body_lower[:2000]
-                        ),
-                        "has_results_table": (
-                            "<table" in body_lower
-                            and ("details" in body_lower
-                                 or "sale date" in body_lower)
-                        ),
-                    }
-                    # Also grab the page title and a small text sample —
-                    # these are usually the most diagnostic.
-                    import re as _re
-
-                    title_match = _re.search(
-                        r"<title>(.*?)</title>", body, _re.IGNORECASE
-                    )
-                    page_title = (
-                        title_match.group(1).strip()[:120]
-                        if title_match
-                        else "?"
-                    )
-
-                    logger.info(
-                        "Playwright: form POST via context.request",
-                        source=self.source_name,
-                        status=response.status,
-                        body_length=len(body),
-                        page_title=page_title,
-                        signals=body_signals,
-                    )
-
-                    # Dump a snippet of the body so we can see exactly
-                    # what the server returned. Find the <body> tag and
-                    # grab a slice from there — that's the visible
-                    # content. Falls back to a slice from the middle of
-                    # the document if we can't find <body>.
-                    body_start_match = _re.search(
-                        r"<body[^>]*>", body, _re.IGNORECASE
-                    )
-                    if body_start_match:
-                        snippet_start = body_start_match.end()
-                    else:
-                        snippet_start = len(body) // 3
-                    body_snippet = body[
-                        snippet_start:snippet_start + 1500
-                    ]
-                    # Strip HTML tags for readability in logs.
-                    snippet_text = _re.sub(
-                        r"<[^>]+>", " ", body_snippet
-                    )
-                    snippet_text = _re.sub(
-                        r"\s+", " ", snippet_text
-                    ).strip()[:800]
-                    logger.info(
-                        "Playwright: form POST body snippet",
-                        source=self.source_name,
-                        snippet=snippet_text,
-                    )
-                    if response.status == 200 and has_results:
-                        submit_ok = True
-                except Exception as e:
-                    logger.warning(
-                        "Playwright: form POST failed",
-                        source=self.source_name,
-                        error_type=type(e).__name__,
-                        error_repr=repr(e),
-                    )
-
-                if submit_ok:
-                    logger.info(
-                        "Playwright: session warmed via direct POST",
-                        source=self.source_name,
-                    )
-                else:
-                    logger.warning(
-                        "Playwright: session not confirmed warm; "
-                        "detail fetches may still bounce",
-                        source=self.source_name,
-                    )
-
                 detail_ok = 0
                 detail_bounced = 0
                 detail_errors = 0
+                bounced_examples: list[str] = []
 
                 for row in all_rows:
                     detail_id = row.get("detail_id")
@@ -763,12 +552,10 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         final_url = page.url.lower()
                         if "error.aspx" in final_url:
                             detail_bounced += 1
-                            logger.warning(
-                                "Playwright: detail bounced to error",
-                                source=self.source_name,
-                                detail_id=detail_id,
-                                final_url=page.url,
-                            )
+                            if len(bounced_examples) < 2:
+                                bounced_examples.append(
+                                    f"id={detail_id} -> {page.url}"
+                                )
                             continue
 
                         html = await page.content()
@@ -777,8 +564,6 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                             row.update(parsed)
                             detail_ok += 1
                         else:
-                            # Got a non-error page but parsing returned
-                            # nothing — log so we can investigate.
                             logger.warning(
                                 "Playwright: detail parsed empty",
                                 source=self.source_name,
@@ -807,10 +592,12 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     detail_ok=detail_ok,
                     detail_bounced=detail_bounced,
                     detail_errors=detail_errors,
+                    bounced_examples=bounced_examples,
                     total=len(all_rows),
                 )
             finally:
                 await browser.close()
+
 
     # ---- HTML parsing helpers ----
 
