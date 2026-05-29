@@ -434,26 +434,61 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 submit_ok = False
                 try:
                     # Parse hidden + dropdown fields from the current page
-                    # so we can replay them in the POST body.
+                    # so we can replay them in the POST body. Critically,
+                    # we FIRST set the Pending/Completed dropdown to the
+                    # "Pending" option — otherwise we'd send whatever
+                    # value the page rendered with, which (we discovered)
+                    # is "Completed" and has zero rows, so the search
+                    # returns an empty page that looks just like the
+                    # initial form.
                     form_data = await page.evaluate(
                         """
                         () => {
-                            const data = {};
                             const form = document.querySelector('form');
                             if (!form) return null;
-                            // hidden inputs (__VIEWSTATE etc.)
+
+                            // Find the Sales-Type dropdown by content
+                            // (option labels containing "pending" AND
+                            // "completed"), then select its Pending
+                            // option. This mirrors the label-matching
+                            // logic the httpx code uses.
+                            for (const sel of form.querySelectorAll(
+                                'select'
+                            )) {
+                                const labels = [...sel.options].map(
+                                    o => (o.textContent || '').toLowerCase()
+                                );
+                                const hasPending = labels.some(
+                                    l => l.includes('pending')
+                                );
+                                const hasCompleted = labels.some(
+                                    l => l.includes('completed')
+                                );
+                                if (hasPending && hasCompleted) {
+                                    for (const opt of sel.options) {
+                                        if ((opt.textContent || '')
+                                            .toLowerCase()
+                                            .includes('pending')) {
+                                            sel.value = opt.value;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+
+                            // Now read everything back out.
+                            const data = {};
                             for (const inp of form.querySelectorAll(
                                 'input[type=hidden]'
                             )) {
                                 if (inp.name) data[inp.name] = inp.value || '';
                             }
-                            // text/date inputs (left blank by default)
                             for (const inp of form.querySelectorAll(
                                 'input[type=text]'
                             )) {
                                 if (inp.name) data[inp.name] = inp.value || '';
                             }
-                            // dropdowns — take their currently-selected value
                             for (const sel of form.querySelectorAll('select')) {
                                 if (sel.name) data[sel.name] = sel.value || '';
                             }
