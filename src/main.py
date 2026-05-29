@@ -133,8 +133,13 @@ app = FastAPI(
 # CORS
 # ============================================================
 
-_cors_allowed_origins: list[str] = []
+_cors_allowed_origins: list[str] = [
+    "https://govire.com",
+    "https://www.govire.com",
+    "https://distress-properties-frontend.vercel.app",
+]
 
+# Optional override via FRONTEND_ORIGIN env var (e.g. a Vercel preview URL)
 if settings.frontend_origin:
     _cors_allowed_origins.append(str(settings.frontend_origin))
 
