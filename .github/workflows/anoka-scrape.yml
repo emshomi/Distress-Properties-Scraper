@@ -1,0 +1,67 @@
+name: Anoka Sheriff Scraper
+
+# Manual-only trigger for now — once we confirm GitHub's IPs can reach Anoka,
+# we'll uncomment the schedule block below to run it automatically every day.
+on:
+  workflow_dispatch:
+  # schedule:
+  #   # 12:00 UTC = 6am Central (standard) / 7am Central (DST). Daily.
+  #   - cron: '0 12 * * *'
+
+jobs:
+  scrape:
+    name: Run Anoka scraper
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # the scraper fetches detail pages with delays; should finish well under this
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Anoka scraper
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+
+          # --- Feature flags: enable only Anoka, leave the rest off ---
+          # (This script only invokes the Anoka scraper directly, but the
+          #  config module reads all flags at import time, so we set them.)
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'true'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+
+        run: |
+          python -m scripts.run_anoka_sheriff github_actions
