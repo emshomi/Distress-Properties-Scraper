@@ -18,7 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.config import settings
 from src.db.supabase_client import ping_supabase
-from src.routes import discover, health, status, trigger
+from src.routes import discover, health, properties, status, trigger
 from src.scheduler.cron import start_scheduler, stop_scheduler
 from src.utils.errors import ServiceError, error_envelope
 from src.utils.logger import logger
@@ -175,6 +175,7 @@ app.include_router(health.router)
 app.include_router(status.router)
 app.include_router(trigger.router)
 app.include_router(discover.router)
+app.include_router(properties.router)
 
 
 # ============================================================
