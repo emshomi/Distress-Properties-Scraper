@@ -407,6 +407,38 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         error_type=type(e).__name__,
                     )
 
+                # Submit the search form to "execute" a Pending Sales query.
+                # This is the step that turned out to matter: navigating to
+                # detail URLs directly (even from a warmed-up list page)
+                # bounces to error.aspx, but POSTing the search form first
+                # establishes whatever session marker the server checks.
+                # The default form state ("Pending Sales", all cities) is
+                # exactly what we want, so we don't need to change any
+                # fields — just click Submit.
+                try:
+                    async with page.expect_navigation(
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    ):
+                        await page.click(
+                            'input[type="submit"][value="Submit"]',
+                            timeout=10000,
+                        )
+                    await asyncio.sleep(1.0)
+                    logger.info(
+                        "Playwright: search form submitted; "
+                        "session warmed for detail fetches",
+                        source=self.source_name,
+                    )
+                except (PlaywrightTimeout, PlaywrightError) as e:
+                    logger.warning(
+                        "Playwright: search-form submit failed; "
+                        "detail fetches will likely bounce",
+                        source=self.source_name,
+                        error_type=type(e).__name__,
+                        error_repr=repr(e),
+                    )
+
                 detail_ok = 0
                 detail_bounced = 0
                 detail_errors = 0
