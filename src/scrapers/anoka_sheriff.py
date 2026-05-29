@@ -607,6 +607,34 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         page_title=page_title,
                         signals=body_signals,
                     )
+
+                    # Dump a snippet of the body so we can see exactly
+                    # what the server returned. Find the <body> tag and
+                    # grab a slice from there — that's the visible
+                    # content. Falls back to a slice from the middle of
+                    # the document if we can't find <body>.
+                    body_start_match = _re.search(
+                        r"<body[^>]*>", body, _re.IGNORECASE
+                    )
+                    if body_start_match:
+                        snippet_start = body_start_match.end()
+                    else:
+                        snippet_start = len(body) // 3
+                    body_snippet = body[
+                        snippet_start:snippet_start + 1500
+                    ]
+                    # Strip HTML tags for readability in logs.
+                    snippet_text = _re.sub(
+                        r"<[^>]+>", " ", body_snippet
+                    )
+                    snippet_text = _re.sub(
+                        r"\s+", " ", snippet_text
+                    ).strip()[:800]
+                    logger.info(
+                        "Playwright: form POST body snippet",
+                        source=self.source_name,
+                        snippet=snippet_text,
+                    )
                     if response.status == 200 and has_results:
                         submit_ok = True
                 except Exception as e:
