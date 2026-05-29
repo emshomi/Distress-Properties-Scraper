@@ -323,49 +323,25 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 # mode's postback carries a valid (current) __VIEWSTATE.
                 soup = BeautifulSoup(post.text, "lxml")
 
-            # 3. Enrich each row with its detail page (owner, parcel, amounts).
-            # The detail page enforces ASP.NET session/Referer protection: a
-            # direct GET to ForeclosureNotice.aspx?id=X without a Referer
-            # pointing back to the list page returns the "Web Page Has Expired"
-            # error.aspx (still with HTTP 200 — silent failure). Sending Referer
-            # matches what the browser sends when the user clicks a Details
-            # link from the list, which is the access pattern the server
-            # expects. We additionally detect the error-page redirect so we
-            # can log when the workaround stops working in the future.
-            for row in all_rows:
-                detail_id = row.get("detail_id")
-                if not detail_id:
-                    continue
-                try:
-                    await asyncio.sleep(_DETAIL_DELAY_SECONDS)
-                    d = await client.get(
-                        _DETAIL_URL.format(id=detail_id),
-                        headers={"Referer": _LIST_URL},
-                    )
-                    final_url = str(d.url).lower()
-                    body_head = d.text[:2000].lower() if d.text else ""
-                    is_error_page = (
-                        "error.aspx" in final_url
-                        or "web page has expired" in body_head
-                    )
-                    if d.status_code == 200 and not is_error_page:
-                        row.update(self._parse_detail(d.text))
-                    else:
-                        logger.warning(
-                            "Anoka detail page returned error/expired notice",
-                            source=self.source_name,
-                            detail_id=detail_id,
-                            final_url=str(d.url),
-                            status_code=d.status_code,
-                        )
-                except httpx.HTTPError as e:
-                    # Tolerate detail failures — keep the list row as-is.
-                    logger.warning(
-                        "Anoka detail fetch failed",
-                        source=self.source_name,
-                        detail_id=detail_id,
-                        error=str(e),
-                    )
+        # 3. Enrich each row with its detail page using Playwright (headless
+        # Chromium). We tried direct httpx GETs to ForeclosureNotice.aspx with
+        # cookies + Referer — the server still bounced every request to
+        # error.aspx ("Web Page Has Expired"). The Anoka ASP.NET application
+        # appears to require some combination of browser-native headers
+        # (Sec-Fetch-*, sec-ch-ua), JS-established session tokens, or both,
+        # that an HTTP-only client can't easily reproduce. Playwright is the
+        # reliable answer: it's a real Chromium instance, so it behaves
+        # exactly like the user's browser when they click "Details" from the
+        # list page (which we verified works manually).
+        #
+        # Implementation note: Playwright is imported here (inside the method)
+        # rather than at module-top because the binary it needs (`chromium`)
+        # only exists in environments that ran `playwright install chromium`.
+        # The GitHub Actions workflow does this; a pure-API import in places
+        # without the binary would still work for the Python module, but the
+        # cleaner pattern is to keep this dependency localized to where it's
+        # used.
+        await self._enrich_details_with_playwright(all_rows)
 
         logger.info(
             "Anoka fetch complete",
@@ -373,6 +349,132 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             total_rows=len(all_rows),
         )
         return all_rows
+
+    # ---- Playwright detail-page enrichment ----
+
+    async def _enrich_details_with_playwright(
+        self, all_rows: list[dict[str, Any]]
+    ) -> None:
+        """Fill in mortgagor/amount-due/tax-parcel by browsing the detail
+        pages with headless Chromium.
+
+        Modifies `all_rows` in place via the existing `_parse_detail` helper.
+        Tolerates per-row failures with a warning — Pending Sales rows still
+        have list-level data (address, city, sale date) even if detail
+        enrichment fails.
+        """
+        # Local import: only the workflow that runs this scraper installs
+        # the Chromium binaries via `playwright install`. Keeping the import
+        # inside the method means modules that don't run this code path
+        # don't break if Playwright's runtime isn't available.
+        from playwright.async_api import (
+            async_playwright,
+            Error as PlaywrightError,
+            TimeoutError as PlaywrightTimeout,
+        )
+
+        if not all_rows:
+            return
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                context = await browser.new_context(
+                    user_agent=_USER_AGENT,
+                    viewport={"width": 1280, "height": 800},
+                    locale="en-US",
+                )
+                page = await context.new_page()
+
+                # First navigate to the list page to establish whatever
+                # session state the Anoka ASP.NET app needs. We don't
+                # actually submit the search form — just landing on the
+                # list page in a real browser is enough to make subsequent
+                # detail-page GETs succeed (we verified this manually).
+                try:
+                    await page.goto(
+                        _LIST_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    # Small pause to let any JS finish setting cookies.
+                    await asyncio.sleep(1.0)
+                except (PlaywrightTimeout, PlaywrightError) as e:
+                    logger.warning(
+                        "Playwright: list-page warm-up failed; "
+                        "continuing anyway",
+                        source=self.source_name,
+                        error_type=type(e).__name__,
+                    )
+
+                detail_ok = 0
+                detail_bounced = 0
+                detail_errors = 0
+
+                for row in all_rows:
+                    detail_id = row.get("detail_id")
+                    if not detail_id:
+                        continue
+
+                    url = _DETAIL_URL.format(id=detail_id)
+                    try:
+                        await asyncio.sleep(_DETAIL_DELAY_SECONDS)
+                        await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                        final_url = page.url.lower()
+                        if "error.aspx" in final_url:
+                            detail_bounced += 1
+                            logger.warning(
+                                "Playwright: detail bounced to error",
+                                source=self.source_name,
+                                detail_id=detail_id,
+                                final_url=page.url,
+                            )
+                            continue
+
+                        html = await page.content()
+                        parsed = self._parse_detail(html)
+                        if parsed:
+                            row.update(parsed)
+                            detail_ok += 1
+                        else:
+                            # Got a non-error page but parsing returned
+                            # nothing — log so we can investigate.
+                            logger.warning(
+                                "Playwright: detail parsed empty",
+                                source=self.source_name,
+                                detail_id=detail_id,
+                                final_url=page.url,
+                            )
+                    except PlaywrightTimeout:
+                        detail_errors += 1
+                        logger.warning(
+                            "Playwright: detail load timeout",
+                            source=self.source_name,
+                            detail_id=detail_id,
+                        )
+                    except PlaywrightError as e:
+                        detail_errors += 1
+                        logger.warning(
+                            "Playwright: detail navigation error",
+                            source=self.source_name,
+                            detail_id=detail_id,
+                            error=str(e),
+                        )
+
+                logger.info(
+                    "Playwright detail enrichment complete",
+                    source=self.source_name,
+                    detail_ok=detail_ok,
+                    detail_bounced=detail_bounced,
+                    detail_errors=detail_errors,
+                    total=len(all_rows),
+                )
+            finally:
+                await browser.close()
 
     # ---- HTML parsing helpers ----
 
