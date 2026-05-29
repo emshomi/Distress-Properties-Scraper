@@ -473,30 +473,104 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     if not form_data:
                         raise RuntimeError("could not read form fields")
 
+                    # Log what we're about to send so we can debug if the
+                    # server rejects it. We only log the keys (and a few
+                    # short values) — __VIEWSTATE is huge so we elide it.
+                    field_summary = {
+                        k: (v[:60] + "...")
+                        if isinstance(v, str) and len(v) > 60
+                        else v
+                        for k, v in form_data.items()
+                    }
+                    logger.info(
+                        "Playwright: form data prepared for POST",
+                        source=self.source_name,
+                        field_count=len(form_data),
+                        fields=field_summary,
+                    )
+
                     # POST directly via the Playwright request context.
                     # This call shares cookies with `page` (same context),
                     # so any session marker the server sets back is
                     # automatically used by subsequent page.goto() calls.
+                    #
+                    # We send a comprehensive set of headers — a real
+                    # browser sends ~12 headers on a form POST, and our
+                    # earlier 3-header attempt got the empty form back
+                    # (server probably saw it as a bot probe). Matching a
+                    # real Chromium navigation request more closely should
+                    # get the server to actually run the search.
                     response = await page.context.request.post(
                         _LIST_URL,
                         data=form_data,
                         headers={
-                            "Referer": _LIST_URL,
+                            "Accept": (
+                                "text/html,application/xhtml+xml,"
+                                "application/xml;q=0.9,image/avif,"
+                                "image/webp,image/apng,*/*;q=0.8"
+                            ),
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Cache-Control": "max-age=0",
                             "Content-Type": (
                                 "application/x-www-form-urlencoded"
                             ),
+                            "Origin": (
+                                "https://foreclosures.co.anoka.mn.us"
+                            ),
+                            "Referer": _LIST_URL,
+                            "Sec-Fetch-Dest": "document",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-Site": "same-origin",
+                            "Sec-Fetch-User": "?1",
+                            "Upgrade-Insecure-Requests": "1",
                             "User-Agent": _USER_AGENT,
                         },
                         timeout=60000,
                     )
                     body = await response.text()
                     has_results = "records found" in body.lower()
+
+                    # Pull a handful of signals from the body so we can
+                    # tell what kind of page the server actually returned:
+                    # the search form again? an error page? something
+                    # else? We do this without dumping the whole 20KB.
+                    body_lower = body.lower()
+                    body_signals = {
+                        "has_records_found": has_results,
+                        "has_search_form": (
+                            "btnsubmit" in body_lower
+                            and "viewstate" in body_lower
+                        ),
+                        "has_error": (
+                            "error" in body_lower[:2000]
+                            or "expired" in body_lower[:2000]
+                        ),
+                        "has_results_table": (
+                            "<table" in body_lower
+                            and ("details" in body_lower
+                                 or "sale date" in body_lower)
+                        ),
+                    }
+                    # Also grab the page title and a small text sample —
+                    # these are usually the most diagnostic.
+                    import re as _re
+
+                    title_match = _re.search(
+                        r"<title>(.*?)</title>", body, _re.IGNORECASE
+                    )
+                    page_title = (
+                        title_match.group(1).strip()[:120]
+                        if title_match
+                        else "?"
+                    )
+
                     logger.info(
                         "Playwright: form POST via context.request",
                         source=self.source_name,
                         status=response.status,
                         body_length=len(body),
-                        has_results=has_results,
+                        page_title=page_title,
+                        signals=body_signals,
                     )
                     if response.status == 200 and has_results:
                         submit_ok = True
