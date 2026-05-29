@@ -4,9 +4,9 @@ name: Anoka Sheriff Scraper
 # we'll uncomment the schedule block below to run it automatically every day.
 on:
   workflow_dispatch:
-  # schedule:
-  #   # 12:00 UTC = 6am Central (standard) / 7am Central (DST). Daily.
-  #   - cron: '0 12 * * *'
+  schedule:
+    # 12:00 UTC = 6am Central (standard) / 7am Central (DST). Daily.
+    - cron: '0 12 * * *'
 
 jobs:
   scrape:
