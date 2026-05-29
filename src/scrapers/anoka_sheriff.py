@@ -408,31 +408,40 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     )
 
                 # Submit the search form to "execute" a Pending Sales query.
-                # This is the step that turned out to matter: navigating to
-                # detail URLs directly (even from a warmed-up list page)
-                # bounces to error.aspx, but POSTing the search form first
-                # establishes whatever session marker the server checks.
-                # The default form state ("Pending Sales", all cities) is
-                # exactly what we want, so we don't need to change any
-                # fields — just click Submit.
+                # This step turned out to matter: navigating to detail URLs
+                # directly (even from a warmed-up list page) bounces to
+                # error.aspx, but POSTing the search form first establishes
+                # whatever session marker the server checks. The default
+                # form state ("Pending Sales", all cities) is exactly what
+                # we want, so we click Submit without modifying any fields.
+                #
+                # Subtle interaction with Playwright: ASP.NET WebForms POSTs
+                # back to the same URL, so Playwright's built-in
+                # auto-wait-on-click (which looks for "scheduled navigations
+                # to finish") times out at 10s waiting for a URL change
+                # that never comes. We pass no_wait_after=True to bypass
+                # that auto-wait and instead poll explicitly for the
+                # results-count text ("N pending sales records found")
+                # that the page renders after the form is processed.
                 try:
-                    async with page.expect_navigation(
-                        wait_until="domcontentloaded",
+                    await page.click(
+                        'input[type="submit"][value="Submit"]',
+                        timeout=10000,
+                        no_wait_after=True,
+                    )
+                    await page.wait_for_selector(
+                        'text=records found',
                         timeout=30000,
-                    ):
-                        await page.click(
-                            'input[type="submit"][value="Submit"]',
-                            timeout=10000,
-                        )
-                    await asyncio.sleep(1.0)
+                    )
+                    await asyncio.sleep(0.5)
                     logger.info(
                         "Playwright: search form submitted; "
-                        "session warmed for detail fetches",
+                        "results loaded, session warmed",
                         source=self.source_name,
                     )
                 except (PlaywrightTimeout, PlaywrightError) as e:
                     logger.warning(
-                        "Playwright: search-form submit failed; "
+                        "Playwright: search-form submit/result-wait failed; "
                         "detail fetches will likely bounce",
                         source=self.source_name,
                         error_type=type(e).__name__,
