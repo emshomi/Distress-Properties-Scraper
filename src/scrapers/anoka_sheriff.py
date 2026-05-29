@@ -324,15 +324,40 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 soup = BeautifulSoup(post.text, "lxml")
 
             # 3. Enrich each row with its detail page (owner, parcel, amounts).
+            # The detail page enforces ASP.NET session/Referer protection: a
+            # direct GET to ForeclosureNotice.aspx?id=X without a Referer
+            # pointing back to the list page returns the "Web Page Has Expired"
+            # error.aspx (still with HTTP 200 — silent failure). Sending Referer
+            # matches what the browser sends when the user clicks a Details
+            # link from the list, which is the access pattern the server
+            # expects. We additionally detect the error-page redirect so we
+            # can log when the workaround stops working in the future.
             for row in all_rows:
                 detail_id = row.get("detail_id")
                 if not detail_id:
                     continue
                 try:
                     await asyncio.sleep(_DETAIL_DELAY_SECONDS)
-                    d = await client.get(_DETAIL_URL.format(id=detail_id))
-                    if d.status_code == 200:
+                    d = await client.get(
+                        _DETAIL_URL.format(id=detail_id),
+                        headers={"Referer": _LIST_URL},
+                    )
+                    final_url = str(d.url).lower()
+                    body_head = d.text[:2000].lower() if d.text else ""
+                    is_error_page = (
+                        "error.aspx" in final_url
+                        or "web page has expired" in body_head
+                    )
+                    if d.status_code == 200 and not is_error_page:
                         row.update(self._parse_detail(d.text))
+                    else:
+                        logger.warning(
+                            "Anoka detail page returned error/expired notice",
+                            source=self.source_name,
+                            detail_id=detail_id,
+                            final_url=str(d.url),
+                            status_code=d.status_code,
+                        )
                 except httpx.HTTPError as e:
                     # Tolerate detail failures — keep the list row as-is.
                     logger.warning(
