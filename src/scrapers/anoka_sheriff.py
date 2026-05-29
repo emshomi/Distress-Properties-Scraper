@@ -384,21 +384,28 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     viewport={"width": 1280, "height": 800},
                     locale="en-US",
                 )
+                # Hide the standard headless-Chromium tell. Some ASP.NET
+                # apps with anti-bot middleware check this; the cost of
+                # masking it is zero and the cost of NOT masking is
+                # potentially serving us a stripped-down page that
+                # doesn't behave like the one a real user sees.
+                await context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', "
+                    "{ get: () => undefined });"
+                )
                 page = await context.new_page()
 
-                # First navigate to the list page to establish whatever
-                # session state the Anoka ASP.NET app needs. We don't
-                # actually submit the search form — just landing on the
-                # list page in a real browser is enough to make subsequent
-                # detail-page GETs succeed (we verified this manually).
+                # First navigate to the list page. Use `networkidle` (not
+                # `domcontentloaded`) so any inline JS that initializes
+                # __doPostBack / __VIEWSTATE has time to finish before we
+                # submit.
                 try:
                     await page.goto(
                         _LIST_URL,
-                        wait_until="domcontentloaded",
+                        wait_until="networkidle",
                         timeout=30000,
                     )
-                    # Small pause to let any JS finish setting cookies.
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
                 except (PlaywrightTimeout, PlaywrightError) as e:
                     logger.warning(
                         "Playwright: list-page warm-up failed; "
@@ -407,30 +414,79 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         error_type=type(e).__name__,
                     )
 
-                # Submit the search form to "execute" a Pending Sales query.
-                # This step turned out to matter: navigating to detail URLs
-                # directly (even from a warmed-up list page) bounces to
-                # error.aspx, but POSTing the search form first establishes
-                # whatever session marker the server checks. The default
-                # form state ("Pending Sales", all cities) is exactly what
-                # we want, so we click Submit without modifying any fields.
+                # Submit the search form. We bypass `page.click()` on the
+                # Submit button — past attempts found that the click
+                # registers but the form doesn't actually submit (no
+                # navigation, no page change). Most likely the button's
+                # native submit is being short-circuited by ASP.NET's JS,
+                # which expects __EVENTTARGET to be set before submission.
                 #
-                # Subtle interaction with Playwright: ASP.NET WebForms POSTs
-                # back to the same URL, so Playwright's built-in
-                # auto-wait-on-click (which looks for "scheduled navigations
-                # to finish") times out at 10s waiting for a URL change
-                # that never comes. We pass no_wait_after=True to bypass
-                # that auto-wait and instead poll explicitly for the
-                # results-count text ("N pending sales records found")
-                # that the page renders after the form is processed.
+                # Instead, we set __EVENTTARGET ourselves (to the button's
+                # name, which is the standard ASP.NET postback contract)
+                # and call form.submit() directly via JS. This produces an
+                # honest POST with all the right hidden fields and tells
+                # the server which event handler to invoke.
+                submit_result: dict = {}
                 try:
-                    await page.click(
-                        'input[type="submit"][value="Submit"]',
-                        timeout=10000,
-                        no_wait_after=True,
+                    submit_result = await page.evaluate(
+                        """
+                        () => {
+                            const btn = document.querySelector(
+                                'input[type=submit][value=Submit]'
+                            );
+                            if (!btn) return {ok: false,
+                                reason: 'no submit button found'};
+                            const form = btn.closest('form');
+                            if (!form) return {ok: false,
+                                reason: 'button has no form ancestor'};
+
+                            // Ensure __EVENTTARGET exists and is set to
+                            // the button's postback name. This is what
+                            // ASP.NET WebForms uses to identify which
+                            // button was clicked.
+                            let et = form.querySelector(
+                                'input[name=__EVENTTARGET]'
+                            );
+                            if (!et) {
+                                et = document.createElement('input');
+                                et.type = 'hidden';
+                                et.name = '__EVENTTARGET';
+                                form.appendChild(et);
+                            }
+                            et.value = btn.name || '';
+
+                            // Also ensure __EVENTARGUMENT exists (often
+                            // expected by ASP.NET even when empty).
+                            let ea = form.querySelector(
+                                'input[name=__EVENTARGUMENT]'
+                            );
+                            if (!ea) {
+                                ea = document.createElement('input');
+                                ea.type = 'hidden';
+                                ea.name = '__EVENTARGUMENT';
+                                form.appendChild(ea);
+                            }
+
+                            form.submit();
+                            return {
+                                ok: true,
+                                target: btn.name,
+                                action: form.action,
+                            };
+                        }
+                        """
                     )
+                    logger.info(
+                        "Playwright: form.submit() invoked",
+                        source=self.source_name,
+                        submit_result=submit_result,
+                    )
+
+                    # Wait for the results to render. After a successful
+                    # search the page contains "N pending sales records
+                    # found" — that's the signal we're really after.
                     await page.wait_for_selector(
-                        'text=records found',
+                        "text=records found",
                         timeout=30000,
                     )
                     await asyncio.sleep(0.5)
@@ -440,12 +496,29 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         source=self.source_name,
                     )
                 except (PlaywrightTimeout, PlaywrightError) as e:
+                    # Diagnostic dump: what page did we actually end up
+                    # on, and what does it contain? Without this we'd be
+                    # guessing again.
+                    try:
+                        url_now = page.url
+                        title_now = await page.title()
+                        body_sample = await page.evaluate(
+                            "document.body.innerText.substring(0, 500)"
+                        )
+                    except Exception:
+                        url_now = "?"
+                        title_now = "?"
+                        body_sample = "?"
                     logger.warning(
                         "Playwright: search-form submit/result-wait failed; "
                         "detail fetches will likely bounce",
                         source=self.source_name,
                         error_type=type(e).__name__,
                         error_repr=repr(e),
+                        submit_result=submit_result,
+                        url_after=url_now,
+                        title_after=title_now,
+                        body_sample=body_sample[:400],
                     )
 
                 detail_ok = 0
