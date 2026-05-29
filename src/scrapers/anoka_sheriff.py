@@ -657,6 +657,12 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 detail_bounced = 0
                 detail_errors = 0
                 bounced_examples: list[str] = []
+                # One-shot diagnostic: dump the text context around
+                # field-name keywords whenever a detail page is fetched
+                # OK but the parser misses amount_due or tax_parcel_no.
+                # This is how we learn what label variants the pages use
+                # without being able to open them manually in a browser.
+                missing_field_dumps = 0
 
                 for row in all_rows:
                     detail_id = row.get("detail_id")
@@ -685,6 +691,50 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         if parsed:
                             row.update(parsed)
                             detail_ok += 1
+
+                            # Diagnostic: when amount_due or tax_parcel
+                            # is missing, dump text context around the
+                            # relevant keywords so we can see what
+                            # label variants this page uses.
+                            missing_amt = parsed.get("amount_due") is None
+                            missing_tax = (
+                                parsed.get("tax_parcel_no") is None
+                            )
+                            if (missing_amt or missing_tax) and (
+                                missing_field_dumps < 5
+                            ):
+                                page_text = BeautifulSoup(
+                                    html, "lxml"
+                                ).get_text(" ", strip=True)
+                                upper = page_text.upper()
+                                contexts: dict[str, str] = {}
+                                for kw in (
+                                    "AMOUNT",
+                                    "PARCEL",
+                                    "PIN",
+                                    "PROPERTY ID",
+                                    "PROPERTY IDENTIFICATION",
+                                    "PRINCIPAL",
+                                ):
+                                    idx = upper.find(kw)
+                                    if idx >= 0:
+                                        start = max(0, idx - 30)
+                                        end = min(
+                                            len(page_text), idx + 250
+                                        )
+                                        contexts[kw.lower()] = (
+                                            page_text[start:end]
+                                        )
+                                logger.info(
+                                    "detail field debug — text context",
+                                    source=self.source_name,
+                                    detail_id=detail_id,
+                                    status=parsed.get("status"),
+                                    got_amount_due=not missing_amt,
+                                    got_tax_parcel=not missing_tax,
+                                    contexts=contexts,
+                                )
+                                missing_field_dumps += 1
                         else:
                             logger.warning(
                                 "Playwright: detail parsed empty",
