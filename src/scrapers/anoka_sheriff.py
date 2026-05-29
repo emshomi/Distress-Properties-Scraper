@@ -323,25 +323,21 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 # mode's postback carries a valid (current) __VIEWSTATE.
                 soup = BeautifulSoup(post.text, "lxml")
 
-        # 3. Enrich each row with its detail page using Playwright (headless
-        # Chromium). We tried direct httpx GETs to ForeclosureNotice.aspx with
-        # cookies + Referer — the server still bounced every request to
-        # error.aspx ("Web Page Has Expired"). The Anoka ASP.NET application
-        # appears to require some combination of browser-native headers
-        # (Sec-Fetch-*, sec-ch-ua), JS-established session tokens, or both,
-        # that an HTTP-only client can't easily reproduce. Playwright is the
-        # reliable answer: it's a real Chromium instance, so it behaves
-        # exactly like the user's browser when they click "Details" from the
-        # list page (which we verified works manually).
-        #
-        # Implementation note: Playwright is imported here (inside the method)
-        # rather than at module-top because the binary it needs (`chromium`)
-        # only exists in environments that ran `playwright install chromium`.
-        # The GitHub Actions workflow does this; a pure-API import in places
-        # without the binary would still work for the Python module, but the
-        # cleaner pattern is to keep this dependency localized to where it's
-        # used.
-        await self._enrich_details_with_playwright(all_rows)
+            # 3. Detail-page enrichment, reusing the SAME httpx client.
+            # Our earlier attempt with httpx + a 6-header browser set
+            # bounced every detail GET to error.aspx. Our Playwright
+            # attempt couldn't even warm the session — the search POST
+            # via context.request.post got the empty form back.
+            #
+            # Theory we're now testing: the server bounces detail GETs
+            # because they're missing the Sec-Fetch-* headers that real
+            # browsers send when navigating to a same-origin page after
+            # a successful search. The search POST itself is permissive
+            # (no Sec-Fetch-* check), but the detail page IS strict.
+            # Reusing this client keeps the cookies from the search POST
+            # — the only piece that's known to be right — and we layer
+            # on the navigation-style headers on top.
+            await self._enrich_details_with_httpx(client, all_rows)
 
         logger.info(
             "Anoka fetch complete",
@@ -349,6 +345,96 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             total_rows=len(all_rows),
         )
         return all_rows
+
+    # ---- httpx detail-page enrichment ----
+
+    async def _enrich_details_with_httpx(
+        self,
+        client: httpx.AsyncClient,
+        all_rows: list[dict[str, Any]],
+    ) -> None:
+        """Fetch each row's detail page over httpx, reusing the search
+        POST's cookies, with browser-equivalent navigation headers.
+        """
+        # Headers that mirror what Chrome sends when the user clicks a
+        # link from the list page to a same-origin detail page.
+        # _BROWSER_HEADERS already covers Accept / Accept-Language /
+        # Accept-Encoding / Connection / User-Agent / Upgrade-Insecure-
+        # Requests; we add the Sec-Fetch-* and Referer here so the full
+        # set looks like a real same-origin navigation.
+        nav_headers = {
+            **_BROWSER_HEADERS,
+            "Referer": _LIST_URL,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+        }
+
+        detail_ok = 0
+        detail_bounced = 0
+        detail_errors = 0
+        bounced_examples: list[str] = []
+
+        for row in all_rows:
+            detail_id = row.get("detail_id")
+            if not detail_id:
+                continue
+
+            url = _DETAIL_URL.format(id=detail_id)
+            try:
+                await asyncio.sleep(_DETAIL_DELAY_SECONDS)
+                resp = await client.get(url, headers=nav_headers)
+
+                # The Anoka app handles a rejected/expired session by
+                # serving a 200 response from error.aspx (after redirect)
+                # OR by returning the error page inline at the original
+                # URL. Check both — final URL AND body content.
+                final_url = str(resp.url).lower()
+                body_lower = resp.text[:2000].lower()
+                bounced = (
+                    "error.aspx" in final_url
+                    or "web page has expired" in body_lower
+                    or "page has expired" in body_lower
+                )
+
+                if bounced:
+                    detail_bounced += 1
+                    if len(bounced_examples) < 2:
+                        bounced_examples.append(
+                            f"id={detail_id} → {resp.url}"
+                        )
+                    continue
+
+                parsed = self._parse_detail(resp.text)
+                if parsed:
+                    row.update(parsed)
+                    detail_ok += 1
+                else:
+                    logger.warning(
+                        "httpx: detail parsed empty",
+                        source=self.source_name,
+                        detail_id=detail_id,
+                        final_url=str(resp.url),
+                    )
+            except httpx.HTTPError as e:
+                detail_errors += 1
+                logger.warning(
+                    "httpx: detail fetch error",
+                    source=self.source_name,
+                    detail_id=detail_id,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+
+        logger.info(
+            "httpx detail enrichment complete",
+            source=self.source_name,
+            detail_ok=detail_ok,
+            detail_bounced=detail_bounced,
+            detail_errors=detail_errors,
+            bounced_examples=bounced_examples,
+        )
 
     # ---- Playwright detail-page enrichment ----
 
