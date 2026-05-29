@@ -176,9 +176,10 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []
 
-        # Generous timeout — the county server can be slow. Browser headers
+        # Generous timeout — the county server can be slow, especially on the
+        # Completed Sales query (a heavier database read). Browser headers
         # because the ASP.NET app stalls on bare/unknown User-Agents.
-        timeout = httpx.Timeout(60.0, connect=20.0)
+        timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(
             timeout=timeout,
             headers=_BROWSER_HEADERS,
@@ -256,14 +257,54 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 if submit and submit.get("name"):
                     form[submit["name"]] = submit.get("value", "Submit")
 
-                try:
-                    post = await client.post(_LIST_URL, data=form)
-                except httpx.HTTPError as e:
+                # Retry the mode POST a few times — the Anoka ASP.NET server
+                # is flaky and slow, especially on the heavier Completed Sales
+                # query. If retries are exhausted, only Pending Sales is fatal:
+                # Pending is the high-value forward calendar (upcoming auctions
+                # we still have time to act on), while Completed Sales is just
+                # the 12-month redemption-window history — useful but optional.
+                post = None
+                post_last_err: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        post = await client.post(_LIST_URL, data=form)
+                        break
+                    except httpx.HTTPError as e:
+                        post_last_err = e
+                        logger.warning(
+                            "Anoka mode POST attempt failed",
+                            source=self.source_name,
+                            mode=mode,
+                            attempt=attempt + 1,
+                            error_type=type(e).__name__,
+                            error_repr=repr(e),
+                        )
+                        await asyncio.sleep(3.0)
+
+                if post is None:
+                    if mode.lower() == "completed sales":
+                        logger.warning(
+                            "Skipping Anoka Completed Sales after retries exhausted",
+                            source=self.source_name,
+                            error_type=(
+                                type(post_last_err).__name__ if post_last_err else None
+                            ),
+                        )
+                        continue
                     raise SourceUnavailableError(
-                        f"Anoka {mode} POST failed: {e}",
+                        f"Anoka {mode} POST failed after retries: "
+                        f"{type(post_last_err).__name__}: {post_last_err!r}",
                         source=self.source_name,
-                    ) from e
+                    )
+
                 if post.status_code != 200:
+                    if mode.lower() == "completed sales":
+                        logger.warning(
+                            "Skipping Anoka Completed Sales due to non-200 response",
+                            source=self.source_name,
+                            status_code=post.status_code,
+                        )
+                        continue
                     raise SourceUnavailableError(
                         f"Anoka {mode} POST returned {post.status_code}",
                         source=self.source_name,
