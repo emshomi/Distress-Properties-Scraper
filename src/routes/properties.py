@@ -2,8 +2,13 @@
 Public properties + stats endpoints for the govire.com frontend.
 
 Returns live data from signals.distress_events and core.parcels —
-NO hardcoded numbers. The frontend (src/components/SignalCatalog.tsx,
-src/components/PropertiesView.tsx) consumes these endpoints directly.
+NO hardcoded numbers.
+
+Each upstream scraper writes raw_data in its own shape (we built them
+in different sessions before standardizing), so a per-source extractor
+maps each shape to a common output payload. The /properties endpoint
+exposes a `category` filter so the frontend table can render the right
+columns for the selected signal type.
 
 Routes:
     GET /stats                              — live signal counts
@@ -23,20 +28,11 @@ from src.utils.logger import logger
 
 
 # ============================================================
-# DISPLAY-LAYER CONFIG (no data — just classification mappings)
+# CATEGORY + COUNTY MAPPINGS
 # ============================================================
-# Each category is defined by a LIST OF FILTERS. A filter is a dict
-# of column->value that must all match (AND). Multiple filters per
-# category are OR'd together (sum of independent queries).
-#
-# This shape handles two real cases:
-#   (1) "vacant" — match by source only; one or more sources.
-#   (2) "tax_forfeit" / "tax_delinquent" — share ONE source
-#       (hennepin_tax_roll) but split by event_type. Filtering by
-#       source alone would double-count.
-#
-# Add new sources here as scrapers go live; the frontend's
-# src/data/stats.ts owns the human-readable strings to match.
+# Categories pair (source[, event_type]) tuples — same shape used in
+# /stats counts. Sharing one source of truth means a count and a
+# table query for the same category always reference the same rows.
 
 _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
     "foreclosure": [
@@ -49,9 +45,6 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "carver_sheriff"},
     ],
     "tax_forfeit": [
-        # Hennepin tax_roll source contains BOTH forfeit and delinquent
-        # records — distinguished by event_type. Without this filter
-        # we'd double-count 4,251 across both categories.
         {"source": "hennepin_tax_roll", "event_type": "tax_forfeit"},
         {"source": "ramsey_tax_roll", "event_type": "tax_forfeit"},
         {"source": "mn_dor_red_book"},
@@ -65,11 +58,8 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "hennepin_tax_roll", "event_type": "tax_delinquent"},
         {"source": "ramsey_tax_roll", "event_type": "tax_delinquent"},
     ],
-    # "parcels" handled separately — counted from core.parcels.
 }
 
-# Map signal source → MN county name. Used for per-county breakdown
-# and for the ?county=... filter on /properties.
 _SOURCE_TO_COUNTY: dict[str, str] = {
     "anoka_sheriff": "Anoka",
     "dakota_sheriff": "Dakota",
@@ -88,6 +78,286 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
 
 
 router = APIRouter(tags=["properties"])
+
+
+# ============================================================
+# PER-SOURCE RAW_DATA EXTRACTORS
+# ============================================================
+# Each scraper persisted raw_data with its own conventions. These
+# extractors map each known shape into a common dict the frontend can
+# render. Unknown sources fall through to a generic extractor that
+# does best-effort with common keys.
+
+
+def _extract_anoka(raw: dict, row: dict) -> dict[str, Any]:
+    """anoka_sheriff (today's scraper) — {list, detail} shape."""
+    list_ = raw.get("list") or {}
+    detail = raw.get("detail") or {}
+    return {
+        "address": list_.get("address") or detail.get("detail_address"),
+        "city": list_.get("city"),
+        "zip": list_.get("zip"),
+        "owner": detail.get("owner_name"),
+        "sale_date": list_.get("scheduled_date") or row.get("event_date"),
+        "sale_time": detail.get("sale_time"),
+        "amount": row.get("event_value"),
+        "status": detail.get("status") or "Active",
+        "tax_parcel_no": detail.get("tax_parcel_no"),
+        "original_principal": detail.get("original_principal"),
+        "municipality": list_.get("city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": None,
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+    }
+
+
+def _extract_dakota(raw: dict, row: dict) -> dict[str, Any]:
+    """dakota_sheriff — ArcGIS feature service shape: attributes + geometry."""
+    attrs = raw.get("attributes") or {}
+    geom = raw.get("geometry") or {}
+    return {
+        "address": attrs.get("GeoAddress"),
+        "city": attrs.get("GeoCity") or attrs.get("CITYNAME"),
+        "zip": None,
+        # Dakota's feed doesn't include the mortgagor name — the
+        # GIS service only exposes address, sale amount, and date.
+        "owner": None,
+        "sale_date": row.get("event_date"),
+        "sale_time": None,
+        "amount": attrs.get("SaleAmount") or row.get("event_value"),
+        # Dakota records are completed sales (already happened).
+        "status": "Sold",
+        "tax_parcel_no": None,
+        "original_principal": None,
+        "municipality": attrs.get("GeoCity"),
+        "lat": geom.get("y"),
+        "lng": geom.get("x"),
+        "neighborhood": None,
+        "registered_date": None,
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+    }
+
+
+def _extract_mpls_vbr(raw: dict, row: dict) -> dict[str, Any]:
+    """mpls_vbr — VBR_MPLS feature service: attributes + top-level owner_name."""
+    attrs = raw.get("attributes") or {}
+    return {
+        "address": attrs.get("Address"),
+        "city": attrs.get("City"),
+        "zip": attrs.get("Zip"),
+        "owner": raw.get("owner_name") or attrs.get("Property_O"),
+        "sale_date": None,
+        "sale_time": None,
+        # event_value here is the VBR annual fee, not a sale price.
+        "amount": row.get("event_value"),
+        "status": attrs.get("Property_s"),
+        "tax_parcel_no": attrs.get("APN_Txt"),
+        "original_principal": None,
+        "municipality": attrs.get("City"),
+        "lat": attrs.get("Latitude"),
+        "lng": attrs.get("Longitude"),
+        "neighborhood": raw.get("neighborhood"),
+        "registered_date": (
+            raw.get("condemned_date") or row.get("event_date")
+        ),
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+    }
+
+
+def _extract_saint_paul_vacant(raw: dict, row: dict) -> dict[str, Any]:
+    """saint_paul_vacant — Saint Paul DSI ArcGIS feed. ALL-CAPS keys
+    (ADDRESS, PIN, VACANT_AS_OF, VB_CATEGORY, DWELLING_TYPE). Note
+    that LONGGITUDE is misspelled in the source data — we read it
+    as-is. Saint Paul DSI does NOT publish owner names, so the owner
+    field stays null and the table renders an em-dash for it."""
+    attrs = raw.get("attributes") or {}
+
+    # Parse VACANT_AS_OF (MM/DD/YYYY) to ISO so the frontend's date
+    # formatter renders it consistently with other sources.
+    vacant_as_of = attrs.get("VACANT_AS_OF")
+    registered_iso: Optional[str] = None
+    if vacant_as_of and isinstance(vacant_as_of, str):
+        parts = vacant_as_of.split("/")
+        if len(parts) == 3:
+            try:
+                month, day, year = (int(p) for p in parts)
+                registered_iso = (
+                    f"{year:04d}-{month:02d}-{day:02d}"
+                )
+            except ValueError:
+                registered_iso = vacant_as_of
+
+    # Category 1/2/3 → human-readable label. Saint Paul's three-tier
+    # vacant-building classification maps to escalating risk:
+    #   1 = sound + secured (lowest risk)
+    #   2 = boarded (moderate)
+    #   3 = nuisance / hazardous (highest risk, condemnable)
+    vb_cat = str(attrs.get("VB_CATEGORY") or "").strip()
+    status_label = {
+        "1": "Category 1 (sound)",
+        "2": "Category 2 (boarded)",
+        "3": "Category 3 (nuisance)",
+    }.get(vb_cat, row.get("title") or "Vacant")
+
+    # Latitude / longitude are strings in this feed and longitude is
+    # misspelled. Convert to floats so the future map view can plot.
+    def _to_float(v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "address": attrs.get("ADDRESS"),
+        # The feed has no City field; this is the Saint Paul DSI feed
+        # by definition, so we set it explicitly.
+        "city": "Saint Paul",
+        "zip": None,
+        # Saint Paul DSI does not publish owner names in its public
+        # feed (unlike Minneapolis VBR, which does).
+        "owner": None,
+        "sale_date": None,
+        "sale_time": None,
+        "amount": row.get("event_value"),
+        "status": status_label,
+        "tax_parcel_no": attrs.get("PIN"),
+        "original_principal": None,
+        "municipality": "Saint Paul",
+        "lat": _to_float(attrs.get("LATITUDE")),
+        # Sic — source data misspells "longitude".
+        "lng": _to_float(attrs.get("LONGGITUDE")),
+        # Saint Paul tracks by ward/district + census tract rather
+        # than by neighborhood; surface ward as the closest analog.
+        "neighborhood": (
+            f"Ward {attrs.get('WARD')}"
+            if attrs.get("WARD")
+            else None
+        ),
+        "registered_date": registered_iso or row.get("event_date"),
+        "market_value": None,
+        "earliest_delq_year": None,
+        # Saint-Paul-specific extras (the frontend may render these
+        # when the vacant tab is active).
+        "dwelling_type": (
+            raw.get("dwelling_type") or attrs.get("DWELLING_TYPE")
+        ),
+        "ward": attrs.get("WARD"),
+    }
+
+
+def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
+    """hennepin_tax_roll — mined from parcels; no street address (only
+    municipality + owner). Tax delinquent vs forfeit distinguished by
+    event_type, not source."""
+    market_raw = raw.get("market_value")
+    market_value: Optional[float]
+    try:
+        market_value = float(market_raw) if market_raw is not None else None
+    except (TypeError, ValueError):
+        market_value = None
+
+    return {
+        "address": None,
+        "city": raw.get("municipality"),
+        "zip": None,
+        "owner": raw.get("owner_name"),
+        "sale_date": None,
+        "sale_time": None,
+        # event_value on tax rows is the market value — we surface it
+        # as amount as well so the frontend can show one column.
+        "amount": market_value if market_value is not None else row.get("event_value"),
+        "status": (
+            "Tax-forfeited"
+            if row.get("event_type") == "tax_forfeit"
+            else "Tax-delinquent"
+        ),
+        "tax_parcel_no": row.get("parcel_id"),
+        "original_principal": None,
+        "municipality": raw.get("municipality"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": None,
+        "market_value": market_value,
+        "earliest_delq_year": raw.get("earliest_delq_year"),
+        "dwelling_type": None,
+        "ward": None,
+    }
+
+
+def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
+    """Fallback extractor for unknown sources. Tries common keys."""
+    return {
+        "address": (
+            raw.get("address")
+            or (raw.get("attributes") or {}).get("Address")
+        ),
+        "city": (
+            raw.get("city")
+            or (raw.get("attributes") or {}).get("City")
+        ),
+        "zip": raw.get("zip"),
+        "owner": raw.get("owner_name") or raw.get("owner"),
+        "sale_date": row.get("event_date"),
+        "sale_time": None,
+        "amount": row.get("event_value"),
+        "status": None,
+        "tax_parcel_no": row.get("parcel_id"),
+        "original_principal": None,
+        "municipality": raw.get("municipality") or raw.get("city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": row.get("event_date"),
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+    }
+
+
+_EXTRACTORS: dict[str, Any] = {
+    "anoka_sheriff": _extract_anoka,
+    "dakota_sheriff": _extract_dakota,
+    "mpls_vbr": _extract_mpls_vbr,
+    "saint_paul_vacant": _extract_saint_paul_vacant,
+    "saint_paul_dsi": _extract_saint_paul_vacant,
+    "hennepin_tax_roll": _extract_hennepin_tax,
+    "ramsey_tax_roll": _extract_hennepin_tax,
+}
+
+
+def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch to the right per-source extractor and merge common fields."""
+    source = row.get("source") or ""
+    raw = row.get("raw_data") or {}
+    extractor = _EXTRACTORS.get(source, _extract_generic)
+    extracted = extractor(raw, row)
+
+    return {
+        "source": source,
+        "source_id": row.get("source_id"),
+        "parcel_id": row.get("parcel_id"),
+        "county": _SOURCE_TO_COUNTY.get(source),
+        "event_type": row.get("event_type"),
+        "title": row.get("title"),
+        "description": row.get("description"),
+        "observed_at": row.get("observed_at"),
+        **extracted,
+    }
 
 
 # ============================================================
@@ -115,41 +385,8 @@ def _count_for_filter(filter_dict: dict[str, str]) -> int:
         return 0
 
 
-def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Flatten a distress_events row into a public-API shape."""
-    raw = row.get("raw_data") or {}
-    list_data = raw.get("list") or {}
-    detail = raw.get("detail") or {}
-    source = row.get("source") or ""
-    return {
-        "source": row.get("source"),
-        "source_id": row.get("source_id"),
-        "parcel_id": row.get("parcel_id"),
-        "county": _SOURCE_TO_COUNTY.get(source),
-        "sale_date": (
-            list_data.get("scheduled_date") or row.get("event_date")
-        ),
-        "sale_time": detail.get("sale_time"),
-        "address": (
-            list_data.get("address") or detail.get("detail_address")
-        ),
-        "city": list_data.get("city"),
-        "zip": list_data.get("zip"),
-        "mortgagor": detail.get("owner_name"),
-        "amount_due": row.get("event_value"),
-        "tax_parcel_no": detail.get("tax_parcel_no"),
-        "original_principal": detail.get("original_principal"),
-        "status": detail.get("status") or "Active",
-        "severity": row.get("severity"),
-        "event_type": row.get("event_type"),
-        "title": row.get("title"),
-        "description": row.get("description"),
-        "observed_at": row.get("observed_at"),
-    }
-
-
 # ============================================================
-# GET /stats — live counts for the homepage
+# GET /stats
 # ============================================================
 
 
@@ -159,30 +396,13 @@ def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
     summary="Live signal counts (categories + summary + counties).",
 )
 async def stats_endpoint() -> dict[str, Any]:
-    """
-    Compute live counts for the homepage signal catalog.
-
-    Returns three sections — categories (per signal type),
-    summary (totals), counties (per-county breakdown). Frontend
-    pairs these with static presentation strings.
-    """
-    # Per-category counts. Each category is a list of filters; we sum
-    # their independent counts. This lets a single source (e.g.
-    # hennepin_tax_roll) contribute to multiple categories by event_type
-    # without double-counting.
+    """Live counts for the homepage signal catalog."""
     categories: list[dict[str, Any]] = []
     for cat_id, filters in _CATEGORY_FILTERS.items():
         total = sum(_count_for_filter(f) for f in filters)
-        # Surface the unique source names that fed this category so
-        # the frontend can show "Source: X, Y" labels honestly.
         srcs = sorted({f.get("source", "") for f in filters if f.get("source")})
-        categories.append({
-            "id": cat_id,
-            "count": total,
-            "sources": srcs,
-        })
+        categories.append({"id": cat_id, "count": total, "sources": srcs})
 
-    # Parcels: foundational, counted from core.parcels.
     try:
         parcels_result = (
             core_table("parcels")
@@ -203,19 +423,9 @@ async def stats_endpoint() -> dict[str, Any]:
         "sources": ["core.parcels"],
     })
 
-    # totalSignals = sum of distress signals (parcels excluded — they
-    # are a foundation, not an event of distress).
-    total_signals = sum(
-        c["count"] for c in categories if c["id"] != "parcels"
-    )
+    total_signals = sum(c["count"] for c in categories if c["id"] != "parcels")
 
-    # Discover which sources have actually delivered any data. We
-    # probe each KNOWN source with a count query rather than pulling
-    # all rows and deduping in Python — that older approach hit
-    # Supabase's default ~1,000-row response cap and lost sources
-    # whose rows were buried below the cap (the high-count
-    # hennepin_tax_roll alone has 4,251 rows and crowded out smaller
-    # sources, making "counties_covered" undercount).
+    # Probe each known source for presence (avoids the 1k-row response cap).
     distinct_sources: set[str] = set()
     for src in _SOURCE_TO_COUNTY.keys():
         try:
@@ -241,7 +451,6 @@ async def stats_endpoint() -> dict[str, Any]:
         if src in _SOURCE_TO_COUNTY
     }
 
-    # Newest observed_at — the "live as of" timestamp.
     try:
         newest = (
             signals_table("distress_events")
@@ -256,7 +465,6 @@ async def stats_endpoint() -> dict[str, Any]:
     except Exception:
         last_updated = None
 
-    # Per-county breakdown for the counties currently delivering data.
     counties_breakdown: list[dict[str, Any]] = []
     for county in sorted(distinct_counties):
         county_sources = [
@@ -297,12 +505,46 @@ async def stats_endpoint() -> dict[str, Any]:
 # ============================================================
 
 
+def _apply_category_filter(query: Any, category: str) -> Any:
+    """Apply category-specific filter to a Supabase query.
+
+    Categories that need an event_type discriminator (tax_forfeit,
+    tax_delinquent) get both the source IN-list and the event_type
+    equality applied. Source-only categories (foreclosure, vacant)
+    just get the IN-list.
+    """
+    filters = _CATEGORY_FILTERS.get(category, [])
+    sources = sorted({f.get("source", "") for f in filters if f.get("source")})
+    if not sources:
+        return query
+    query = query.in_("source", sources)
+
+    # If every filter in this category specifies the SAME event_type,
+    # apply that as an additional constraint. Used by tax_forfeit /
+    # tax_delinquent — both share hennepin_tax_roll as a source so we
+    # MUST narrow by event_type to avoid mixing them.
+    event_types = {f.get("event_type") for f in filters if f.get("event_type")}
+    if len(event_types) == 1:
+        only = next(iter(event_types))
+        query = query.eq("event_type", only)
+
+    return query
+
+
 @router.get(
     "/properties",
     status_code=http_status.HTTP_200_OK,
     summary="List distressed properties (filterable, paginated).",
 )
 async def list_properties(
+    category: Optional[str] = Query(
+        default=None,
+        pattern="^(foreclosure|tax_forfeit|vacant|tax_delinquent)$",
+        description=(
+            "Restrict to one signal category. The frontend table "
+            "renders different columns per category."
+        ),
+    ),
     source: Optional[str] = Query(
         default=None,
         description="Filter by data source (e.g. 'anoka_sheriff').",
@@ -353,6 +595,9 @@ async def list_properties(
                 count="exact",
             )
         )
+
+        if category:
+            query = _apply_category_filter(query, category)
 
         if source:
             query = query.eq("source", source)
