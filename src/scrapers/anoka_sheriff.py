@@ -414,111 +414,110 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         error_type=type(e).__name__,
                     )
 
-                # Submit the search form. We bypass `page.click()` on the
-                # Submit button — past attempts found that the click
-                # registers but the form doesn't actually submit (no
-                # navigation, no page change). Most likely the button's
-                # native submit is being short-circuited by ASP.NET's JS,
-                # which expects __EVENTTARGET to be set before submission.
+                # Submit the search form. We've tried in succession:
+                #   1. page.click() with expect_navigation — click registered,
+                #      no navigation followed (timed out at 10s).
+                #   2. page.click() with no_wait_after — click registered,
+                #      page never updated (no "records found" within 30s).
+                #   3. form.submit() via JS — submit invoked, navigation
+                #      started but never completed (hung at "navigation to
+                #      finish").
                 #
-                # Instead, we set __EVENTTARGET ourselves (to the button's
-                # name, which is the standard ASP.NET postback contract)
-                # and call form.submit() directly via JS. This produces an
-                # honest POST with all the right hidden fields and tells
-                # the server which event handler to invoke.
-                submit_result: dict = {}
+                # The conclusion: there's something about this ASP.NET
+                # WebForms app that makes in-page form submission unreliable
+                # in headless Chromium. So we abandon that approach entirely
+                # and do an explicit POST via page.context.request — which
+                # shares cookies with the browser context but lets us
+                # construct the request fully. Once the cookies are warmed
+                # by this POST, subsequent page.goto() calls to detail URLs
+                # will see the same session the server is expecting.
+                submit_ok = False
                 try:
-                    submit_result = await page.evaluate(
+                    # Parse hidden + dropdown fields from the current page
+                    # so we can replay them in the POST body.
+                    form_data = await page.evaluate(
                         """
                         () => {
-                            const btn = document.querySelector(
+                            const data = {};
+                            const form = document.querySelector('form');
+                            if (!form) return null;
+                            // hidden inputs (__VIEWSTATE etc.)
+                            for (const inp of form.querySelectorAll(
+                                'input[type=hidden]'
+                            )) {
+                                if (inp.name) data[inp.name] = inp.value || '';
+                            }
+                            // text/date inputs (left blank by default)
+                            for (const inp of form.querySelectorAll(
+                                'input[type=text]'
+                            )) {
+                                if (inp.name) data[inp.name] = inp.value || '';
+                            }
+                            // dropdowns — take their currently-selected value
+                            for (const sel of form.querySelectorAll('select')) {
+                                if (sel.name) data[sel.name] = sel.value || '';
+                            }
+                            // Simulate a click on the Submit button by
+                            // including its name=value as a POST field —
+                            // this is what a real browser does when the
+                            // user clicks the button, and ASP.NET needs it
+                            // to route the postback.
+                            const btn = form.querySelector(
                                 'input[type=submit][value=Submit]'
                             );
-                            if (!btn) return {ok: false,
-                                reason: 'no submit button found'};
-                            const form = btn.closest('form');
-                            if (!form) return {ok: false,
-                                reason: 'button has no form ancestor'};
-
-                            // Ensure __EVENTTARGET exists and is set to
-                            // the button's postback name. This is what
-                            // ASP.NET WebForms uses to identify which
-                            // button was clicked.
-                            let et = form.querySelector(
-                                'input[name=__EVENTTARGET]'
-                            );
-                            if (!et) {
-                                et = document.createElement('input');
-                                et.type = 'hidden';
-                                et.name = '__EVENTTARGET';
-                                form.appendChild(et);
-                            }
-                            et.value = btn.name || '';
-
-                            // Also ensure __EVENTARGUMENT exists (often
-                            // expected by ASP.NET even when empty).
-                            let ea = form.querySelector(
-                                'input[name=__EVENTARGUMENT]'
-                            );
-                            if (!ea) {
-                                ea = document.createElement('input');
-                                ea.type = 'hidden';
-                                ea.name = '__EVENTARGUMENT';
-                                form.appendChild(ea);
-                            }
-
-                            form.submit();
-                            return {
-                                ok: true,
-                                target: btn.name,
-                                action: form.action,
-                            };
+                            if (btn && btn.name) data[btn.name] = btn.value;
+                            return data;
                         }
                         """
                     )
-                    logger.info(
-                        "Playwright: form.submit() invoked",
-                        source=self.source_name,
-                        submit_result=submit_result,
-                    )
+                    if not form_data:
+                        raise RuntimeError("could not read form fields")
 
-                    # Wait for the results to render. After a successful
-                    # search the page contains "N pending sales records
-                    # found" — that's the signal we're really after.
-                    await page.wait_for_selector(
-                        "text=records found",
-                        timeout=30000,
+                    # POST directly via the Playwright request context.
+                    # This call shares cookies with `page` (same context),
+                    # so any session marker the server sets back is
+                    # automatically used by subsequent page.goto() calls.
+                    response = await page.context.request.post(
+                        _LIST_URL,
+                        data=form_data,
+                        headers={
+                            "Referer": _LIST_URL,
+                            "Content-Type": (
+                                "application/x-www-form-urlencoded"
+                            ),
+                            "User-Agent": _USER_AGENT,
+                        },
+                        timeout=60000,
                     )
-                    await asyncio.sleep(0.5)
+                    body = await response.text()
+                    has_results = "records found" in body.lower()
                     logger.info(
-                        "Playwright: search form submitted; "
-                        "results loaded, session warmed",
+                        "Playwright: form POST via context.request",
                         source=self.source_name,
+                        status=response.status,
+                        body_length=len(body),
+                        has_results=has_results,
                     )
-                except (PlaywrightTimeout, PlaywrightError) as e:
-                    # Diagnostic dump: what page did we actually end up
-                    # on, and what does it contain? Without this we'd be
-                    # guessing again.
-                    try:
-                        url_now = page.url
-                        title_now = await page.title()
-                        body_sample = await page.evaluate(
-                            "document.body.innerText.substring(0, 500)"
-                        )
-                    except Exception:
-                        url_now = "?"
-                        title_now = "?"
-                        body_sample = "?"
+                    if response.status == 200 and has_results:
+                        submit_ok = True
+                except Exception as e:
                     logger.warning(
-                        "Playwright: search-form submit/result-wait failed; "
-                        "detail fetches will likely bounce",
+                        "Playwright: form POST failed",
                         source=self.source_name,
                         error_type=type(e).__name__,
                         error_repr=repr(e),
-                        submit_result=submit_result,
-                        url_after=url_now,
-                        title_after=title_now,
-                        body_sample=body_sample[:400],
+                    )
+
+                if submit_ok:
+                    logger.info(
+                        "Playwright: session warmed via direct POST",
+                        source=self.source_name,
+                    )
+                else:
+                    logger.warning(
+                        "Playwright: session not confirmed warm; "
+                        "detail fetches may still bounce",
+                        source=self.source_name,
                     )
 
                 detail_ok = 0
