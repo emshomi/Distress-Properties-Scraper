@@ -79,12 +79,38 @@ _DETAIL_DELAY_SECONDS = 0.4
 _SEARCH_MODES = ("Pending Sales", "Completed Sales")
 
 # Regexes to pull structured facts out of the free-text legal Notice.
-_RE_TAX_PARCEL = re.compile(r"TAX\s+PARCEL\s+NO\.?\s*:?\s*([0-9A-Za-z\-]+)", re.I)
+# Anoka detail pages come in (at least) two flavors with different
+# labels for the same facts:
+#   - HOA/condo lien notices use "Tax Parcel No." and prose like
+#     "the amount of $X for unpaid association assessments".
+#   - Bank-mortgage notices use "Tax Parcel ID Number" / "TAX PARCEL
+#     IDENTIFICATION NUMBER" / "PROPERTY IDENTIFICATION NUMBER" and
+#     "AMOUNT CLAIMED TO BE DUE ON THE MORTGAGE...".
+# These regexes are written to span both.
+_RE_TAX_PARCEL = re.compile(
+    r"(?:TAX\s+PARCEL|PROPERTY)\s+"
+    r"(?:NO\.?|ID(?:ENTIFICATION)?(?:\s+NUMBER)?)"
+    r"\s*:?\s*"
+    r"([0-9][0-9A-Za-z\-]+)",
+    re.I,
+)
+# Matches "AMOUNT DUE", "AMOUNT CLAIMED TO BE DUE", and similar variants.
 _RE_AMOUNT_DUE = re.compile(
-    r"AMOUNT\s+DUE[^$]*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", re.I
+    r"AMOUNT\s+(?:CLAIMED\s+TO\s+BE\s+)?DUE\b[^$]{0,200}\$\s*"
+    r"([0-9][0-9,]*\.?[0-9]{0,2})",
+    re.I,
+)
+# Fallback for HOA / condo notices that don't use an AMOUNT DUE label —
+# they phrase it as prose: "...to [Association name], the amount of
+# $X for unpaid association assessments...". This must be specific
+# enough that it doesn't match every "amount of $X" in legal text.
+_RE_HOA_AMOUNT = re.compile(
+    r"the\s+amount\s+of\s+\$\s*([0-9][0-9,]*\.?[0-9]{0,2})"
+    r"\s+for\s+unpaid\s+(?:association|condominium|HOA)",
+    re.I,
 )
 _RE_ORIG_PRINCIPAL = re.compile(
-    r"ORIGINAL\s+PRINCIPAL[^$]*\$?\s*([0-9][0-9,]*\.?[0-9]{0,2})", re.I
+    r"ORIGINAL\s+PRINCIPAL[^$]*\$\s*([0-9][0-9,]*\.?[0-9]{0,2})", re.I
 )
 
 _USER_AGENT = (
@@ -701,7 +727,7 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                                 parsed.get("tax_parcel_no") is None
                             )
                             if (missing_amt or missing_tax) and (
-                                missing_field_dumps < 5
+                                missing_field_dumps < 2
                             ):
                                 page_text = BeautifulSoup(
                                     html, "lxml"
@@ -840,11 +866,22 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         if detail_addr:
             out["detail_address"] = detail_addr
 
-        # Status often shows in the small header table ("Postponed", etc.).
-        for kw in ("Postponed", "Cancelled", "Canceled", "Sold", "Held", "Pending"):
-            if re.search(rf"\b{kw}\b", text, re.I):
-                out["status"] = kw
-                break
+        # Status: prefer a labeled "Status:" field (which Anoka's pages
+        # do have — the user's manual visit confirmed "Status:
+        # Postponed" appears as a structured label). Only fall back to
+        # a free-text keyword scan for clear postponement/cancellation
+        # signals — and crucially NOT for "Sold" or "Pending" which
+        # appear in legal boilerplate on every active notice ("the
+        # property will be sold at public auction... pending the
+        # outcome of...") and cause 50% of rows to be mistagged.
+        labeled_status = _value_after(r"Status")
+        if labeled_status and len(labeled_status) < 60:
+            out["status"] = labeled_status.strip(": ")
+        else:
+            for kw in ("Postponed", "Cancelled", "Canceled"):
+                if re.search(rf"\b{kw}\b", text, re.I):
+                    out["status"] = kw
+                    break
 
         # Structured facts from the legal notice body.
         m = _RE_TAX_PARCEL.search(text)
@@ -853,6 +890,11 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         m = _RE_AMOUNT_DUE.search(text)
         if m:
             out["amount_due"] = m.group(1)
+        else:
+            # HOA/condo notices use prose, not a labeled field.
+            m = _RE_HOA_AMOUNT.search(text)
+            if m:
+                out["amount_due"] = m.group(1)
         m = _RE_ORIG_PRINCIPAL.search(text)
         if m:
             out["original_principal"] = m.group(1)
