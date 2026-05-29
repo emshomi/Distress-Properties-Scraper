@@ -209,21 +209,31 @@ async def stats_endpoint() -> dict[str, Any]:
         c["count"] for c in categories if c["id"] != "parcels"
     )
 
-    # Discover which sources have actually delivered any data.
-    try:
-        sources_result = (
-            signals_table("distress_events")
-            .select("source")
-            .limit(10000)
-            .execute()
-        )
-        distinct_sources = {
-            row["source"]
-            for row in (sources_result.data or [])
-            if row.get("source")
-        }
-    except Exception:
-        distinct_sources = set()
+    # Discover which sources have actually delivered any data. We
+    # probe each KNOWN source with a count query rather than pulling
+    # all rows and deduping in Python — that older approach hit
+    # Supabase's default ~1,000-row response cap and lost sources
+    # whose rows were buried below the cap (the high-count
+    # hennepin_tax_roll alone has 4,251 rows and crowded out smaller
+    # sources, making "counties_covered" undercount).
+    distinct_sources: set[str] = set()
+    for src in _SOURCE_TO_COUNTY.keys():
+        try:
+            r = (
+                signals_table("distress_events")
+                .select("id", count="exact")
+                .eq("source", src)
+                .limit(1)
+                .execute()
+            )
+            if (r.count or 0) > 0:
+                distinct_sources.add(src)
+        except Exception as e:
+            logger.warning(
+                "stats: source existence probe failed",
+                source=src,
+                error_type=type(e).__name__,
+            )
 
     distinct_counties = {
         _SOURCE_TO_COUNTY[src]
