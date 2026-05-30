@@ -500,6 +500,8 @@ def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
     extractor = _EXTRACTORS.get(source, _extract_generic)
     extracted = extractor(raw, row)
 
+   redemption = _redemption_fields(source, raw, row)
+
     return {
         "source": source,
         "source_id": row.get("source_id"),
@@ -510,8 +512,8 @@ def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
         "description": row.get("description"),
         "observed_at": row.get("observed_at"),
         **extracted,
+        **redemption,
     }
-
 
 # ============================================================
 # Helpers
