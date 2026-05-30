@@ -793,7 +793,7 @@ async def list_properties(
                     "raw_data->detail->>status", "null"
                 )
 
-       if redemption:
+        if redemption:
             # Redemption-window filter. Where a source publishes the exact
             # redemption date (Hennepin: raw_data->>redemptionExpirationDate)
             # we filter on that real date so the filter and the displayed
