@@ -713,6 +713,18 @@ async def list_properties(
         alias="status",
         description="Filter by status: 'active' or 'postponed'.",
     ),
+
+    redemption: Optional[str] = Query(
+        default=None,
+        pattern="^(in_redemption|expiring_soon|expired)$",
+        description=(
+            "Filter foreclosure rows by redemption-window state. "
+            "Approximated via event_date (redemption ≈ sale + ~6 months) "
+            "so it works uniformly across all sheriff counties."
+        ),
+    ),
+
+    
     min_amount: Optional[float] = Query(
         default=None,
         ge=0,
