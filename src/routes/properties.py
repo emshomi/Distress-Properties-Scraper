@@ -385,6 +385,113 @@ _EXTRACTORS: dict[str, Any] = {
     "ramsey_tax_roll": _extract_hennepin_tax,
 }
 
+# ============================================================
+# REDEMPTION-WINDOW COMPUTATION
+# ============================================================
+# Minnesota sheriff sales carry a redemption period (typically 6 months)
+# during which the prior owner can reclaim the property. That window is
+# the actionable signal for investors, so we compute it for every
+# foreclosure row:
+#   * Hennepin publishes redemptionExpirationDate per record — we read it
+#     directly (handles 5-week / 2-month / 12-month edge cases exactly).
+#   * Anoka / Dakota don't publish it, so we estimate sale_date + 6 months
+#     (the 95%-accurate statutory default). We tag these `is_estimated`.
+# State buckets (relative to today):
+#   in_redemption  — expires in > 90 days
+#   expiring_soon  — expires within 90 days (urgent)
+#   expired        — expiration already passed
+# Non-foreclosure rows get all-null redemption fields.
+
+from datetime import date as _date, datetime as _datetime, timedelta as _timedelta
+
+_REDEMPTION_DEFAULT_DAYS = 182  # ~6 months, MN statutory default
+_REDEMPTION_EXPIRING_SOON_DAYS = 90
+
+# Sources that are sheriff foreclosure sales (carry a redemption window).
+_FORECLOSURE_SOURCES = {
+    "anoka_sheriff",
+    "dakota_sheriff",
+    "hennepin_sheriff",
+    "ramsey_sheriff",
+    "washington_sheriff",
+    "scott_sheriff",
+    "carver_sheriff",
+}
+
+
+def _coerce_date(value: Any) -> Optional[_date]:
+    """Parse a date or ISO datetime string into a date. Tolerant of the
+    several shapes our sources store (ISO datetime, YYYY-MM-DD, MM/DD/YYYY)."""
+    if value is None:
+        return None
+    if isinstance(value, _date) and not isinstance(value, _datetime):
+        return value
+    if isinstance(value, _datetime):
+        return value.date()
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1]
+    try:
+        return _datetime.fromisoformat(s).date()
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return _datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
+    """Compute redemption_ends_at / days_left / redemption_state for a row.
+
+    Returns all-null fields for non-foreclosure sources.
+    """
+    null_result = {
+        "redemption_ends_at": None,
+        "redemption_days_left": None,
+        "redemption_state": None,
+        "redemption_is_estimated": None,
+    }
+    if source not in _FORECLOSURE_SOURCES:
+        return null_result
+
+    ends_at: Optional[_date] = None
+    is_estimated = False
+
+    # Hennepin: read the server-computed exact date.
+    published = raw.get("redemptionExpirationDate")
+    ends_at = _coerce_date(published)
+
+    # Anoka / Dakota (and any future sheriff source without a published
+    # date): estimate sale_date + 6 months.
+    if ends_at is None:
+        sale_date = _coerce_date(row.get("event_date"))
+        if sale_date is not None:
+            ends_at = sale_date + _timedelta(days=_REDEMPTION_DEFAULT_DAYS)
+            is_estimated = True
+
+    if ends_at is None:
+        return null_result
+
+    days_left = (ends_at - _date.today()).days
+    if days_left < 0:
+        state = "expired"
+    elif days_left <= _REDEMPTION_EXPIRING_SOON_DAYS:
+        state = "expiring_soon"
+    else:
+        state = "in_redemption"
+
+    return {
+        "redemption_ends_at": ends_at.isoformat(),
+        "redemption_days_left": days_left,
+        "redemption_state": state,
+        "redemption_is_estimated": is_estimated,
+    }
+
+
 
 def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
     """Dispatch to the right per-source extractor and merge common fields."""
