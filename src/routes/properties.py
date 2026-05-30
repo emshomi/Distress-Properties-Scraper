@@ -376,6 +376,7 @@ def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
 
 _EXTRACTORS: dict[str, Any] = {
     "anoka_sheriff": _extract_anoka,
+    "hennepin_sheriff": _extract_hennepin_sheriff,
     "dakota_sheriff": _extract_dakota,
     "mpls_vbr": _extract_mpls_vbr,
     "saint_paul_vacant": _extract_saint_paul_vacant,
