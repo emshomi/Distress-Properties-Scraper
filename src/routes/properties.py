@@ -297,6 +297,51 @@ def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
         "ward": None,
     }
 
+def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
+    """hennepin_sheriff — clean JSON API. raw_data holds the full detail
+    record at the top level (not nested under list/detail). Mortgagors are
+    a list of {display} objects; redemptionExpirationDate is server-computed
+    by Hennepin so we surface it directly rather than recomputing it."""
+    mortgagors = raw.get("mortgagors") or []
+    owner = None
+    if isinstance(mortgagors, list):
+        names = [
+            (m.get("display") or "").strip()
+            for m in mortgagors
+            if isinstance(m, dict) and (m.get("display") or "").strip()
+        ]
+        owner = "; ".join(n for n in names if n) or None
+
+    return {
+        "address": raw.get("address"),
+        "city": raw.get("city"),
+        "zip": None,
+        "owner": owner,
+        "sale_date": raw.get("dateOfSale") or row.get("event_date"),
+        "sale_time": None,
+        "amount": raw.get("finalBidAmount") or row.get("event_value"),
+        # Completed sheriff sales; the actionable state is the redemption
+        # window, which the redemption-window UI will derive from
+        # redemption_ends_at below.
+        "status": "Sold",
+        "tax_parcel_no": None,
+        "original_principal": None,
+        "municipality": raw.get("city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": None,
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+        # Hennepin publishes this; preserved for the redemption-window work.
+        "redemption_ends_at": raw.get("redemptionExpirationDate"),
+        "mortgagee": raw.get("mortgagee"),
+        "law_firm": raw.get("lawFirm"),
+        "type_of_sale": raw.get("typeOfSale"),
+    }
+
 
 def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
     """Fallback extractor for unknown sources. Tries common keys."""
