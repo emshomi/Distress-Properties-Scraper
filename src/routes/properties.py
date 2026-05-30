@@ -793,36 +793,50 @@ async def list_properties(
                     "raw_data->detail->>status", "null"
                 )
 
-        if redemption:
-            # Redemption-window filter, approximated via event_date so it
-            # works uniformly across all sheriff counties (Hennepin stores
-            # the exact date in raw_data; Anoka/Dakota don't store it at
-            # all). Redemption ≈ sale_date + ~6 months (182 days). The
-            # displayed date/pill still use the exact value where available;
-            # only this bucketing is approximate.
+       if redemption:
+            # Redemption-window filter. Where a source publishes the exact
+            # redemption date (Hennepin: raw_data->>redemptionExpirationDate)
+            # we filter on that real date so the filter and the displayed
+            # pill always agree. Where it's absent (Anoka/Dakota) we fall
+            # back to the event_date approximation (sale + ~182 days), which
+            # is ~95% accurate. The .or_() combines: "(exact date in range)
+            # OR (no exact date AND approximate sale_date in range)".
             from datetime import date as _d, timedelta as _td
 
             today = _d.today()
-            # Boundary sale dates:
-            #   sale + 182 = redemption end
-            #   "expiring soon" = redemption end within 90 days
-            #   => sale_date between (today-182) and (today-92)
-            #   "in redemption" = redemption end > 90 days out
-            #   => sale_date after (today-92)
-            #   "expired" = redemption end already passed
-            #   => sale_date before (today-182)
+            today_s = today.isoformat()
+            soon_cutoff = (today + _td(days=90)).isoformat()  # exact-date side
+            # Approximation boundaries (sale_date space; redemption≈sale+182):
             soon_start = (today - _td(days=182)).isoformat()
             soon_end = (today - _td(days=92)).isoformat()
             in_redemption_after = (today - _td(days=92)).isoformat()
             expired_before = (today - _td(days=182)).isoformat()
 
+            # JSON path to Hennepin's published date inside raw_data.
+            rk = "raw_data->>redemptionExpirationDate"
+
             if redemption == "in_redemption":
-                query = query.gt("event_date", in_redemption_after)
+                # Exact: redemption date strictly after the 90-day cutoff.
+                # Approx: row has no exact date AND sold < 92 days ago.
+                query = query.or_(
+                    f"{rk}.gt.{soon_cutoff},"
+                    f"and({rk}.is.null,event_date.gt.{in_redemption_after})"
+                )
             elif redemption == "expiring_soon":
-                query = query.gte("event_date", soon_start)
-                query = query.lte("event_date", soon_end)
+                # Exact: redemption date between today and today+90.
+                # Approx: no exact date AND sold 92–182 days ago.
+                query = query.or_(
+                    f"and({rk}.gte.{today_s},{rk}.lte.{soon_cutoff}),"
+                    f"and({rk}.is.null,event_date.gte.{soon_start},"
+                    f"event_date.lte.{soon_end})"
+                )
             elif redemption == "expired":
-                query = query.lt("event_date", expired_before)
+                # Exact: redemption date already passed.
+                # Approx: no exact date AND sold > 182 days ago.
+                query = query.or_(
+                    f"{rk}.lt.{today_s},"
+                    f"and({rk}.is.null,event_date.lt.{expired_before})"
+                )
 
         
 
