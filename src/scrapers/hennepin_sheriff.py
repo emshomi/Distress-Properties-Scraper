@@ -1,300 +1,482 @@
 """
-Hennepin County Sheriff Sale scraper.
+Hennepin County Sheriff Foreclosure Sales scraper.
 
-Downloads the weekly sheriff sale notice PDF, extracts the parcel records
-via pdfplumber (tables-first, text fallback), and writes sheriff_sale
-signals.
+Source: Hennepin County public foreclosure API (clean JSON, no auth wall
+        beyond an Azure APIM subscription key).
+    Frontend:  https://foreclosure.hennepin.us/
+    List:      POST https://api.hennepincounty.gov/hcso-public-services-api/v1/Foreclosure/Search
+    Detail:    GET  https://api.hennepincounty.gov/hcso-public-services-api/v1/Foreclosure/{saleRecordNumber}
 
-PDFs are published at:
-    https://www.hennepinsheriff.org/sheriff-sales/notices
+License / posture: official Hennepin County government API. Public foreclosure
+notice data under the Minnesota Government Data Practices Act. No anti-bot
+terms, no robots restriction on the API host. We fetch politely (small delays).
+
+=== WHY THIS IS THE EASIEST SHERIFF SOURCE WE HAVE ===
+Unlike Anoka (bot-resistant ASP.NET WebForms requiring Playwright) and the
+HTML-scraping counties, Hennepin exposes a modern JSON API:
+  * List endpoint paginates cleanly (10/page; ~47 pages; ~465 records).
+  * Detail endpoint returns the full record by saleRecordNumber, INCLUDING a
+    server-computed `redemptionExpirationDate` — we READ it rather than
+    computing sale_date + 6 months. This handles the 5-week / 2-month /
+    12-month redemption edge cases automatically and correctly.
+
+=== AUTH ===
+The API sits behind Azure API Management and requires a subscription key
+header: `Ocp-Apim-Subscription-Key`. It is a public, client-side key (shipped
+in the site's JS), but we read it from settings/env so it can be rotated
+without a code change. Falls back to the known published value if unset.
+
+=== DATA AVAILABLE ===
+List record:    saleRecordNumber, dateOfSale, typeOfSale, address, city,
+                mortgagors[].display
+Detail record:  + mortgagee, toWhomSold, finalBidAmount,
+                redemptionExpirationDate, lawFirm, mortgageDocumentNumber,
+                comments, noticeOfIntent
+
+=== ARCHITECTURE ===
+  fetch():
+    1. POST Search with {pagination:{activePage, pageSize}} until all pages
+       are collected. Read totalPages from the first response.
+    2. For each saleRecordNumber, GET the detail endpoint. Detail failures
+       are tolerated (we keep the list row's basic fields).
+  parse():  convert each enriched record into a DistressEventInsert
+            (sheriff_sale / completed_sale). The full detail JSON is stored
+            in raw_data so redemptionExpirationDate is preserved for the
+            redemption-window UI work.
+  write():  synthesize a stable parcel_id (HENNEPIN-FC-{saleRecordNumber});
+            resolve_parcel + write_events_dedup, mirroring the Anoka scraper.
+
+Severity:
+  redemption window still open (future expiration)  -> high  (actionable)
+  redemption expired / unknown                       -> low/medium
 """
 
 from __future__ import annotations
 
-import re
+import asyncio
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from io import BytesIO
 from typing import Any, ClassVar
 
 import httpx
-import pdfplumber
-from bs4 import BeautifulSoup
 
 from src.config import settings
 from src.models.parcel import ParcelUpsert
-from src.models.signal import SheriffSaleInsert
+from src.models.signal import DistressEventInsert
 from src.scrapers.base_scraper import BaseScraper
-from src.services.audit_logger import log_error
-from src.services.event_writer import (
-    write_events_dedup,
-    write_typed_signals_dedup,
-)
+from src.services.event_writer import write_events_dedup
 from src.services.parcel_resolver import resolve_parcel
-from src.utils.errors import ParseError, SourceUnavailableError
+from src.utils.errors import SourceUnavailableError
 from src.utils.logger import logger
-from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
-from src.utils.retry import retry_on_transient
-
-# Index page listing recent sheriff sale notice PDFs
-_INDEX_URL = "https://www.hennepinsheriff.org/sheriff-sales/notices"
-
-# Regex to find PIDs in extracted text (13 digits, optionally with separators)
-_PID_PATTERN = re.compile(r"\b(\d{2}[-.\s]?\d{3}[-.\s]?\d{2}[-.\s]?\d{2}[-.\s]?\d{4})\b")
-
-# Regex to extract dollar amounts
-_AMOUNT_PATTERN = re.compile(r"\$\s*([\d,]+(?:\.\d{2})?)")
-
-# Regex for dates like MM/DD/YYYY or MM-DD-YYYY
-_DATE_PATTERN = re.compile(r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b")
 
 
-def _parse_amount(text: str) -> Decimal | None:
-    """Extract a dollar amount from text, or None."""
-    match = _AMOUNT_PATTERN.search(text)
-    if not match:
+_API_BASE = "https://api.hennepincounty.gov/hcso-public-services-api/v1/Foreclosure"
+_LIST_URL = f"{_API_BASE}/Search"
+_DETAIL_URL = f"{_API_BASE}/{{record}}"
+
+# Public client-side APIM subscription key shipped in the site's JS. Read from
+# settings/env when available so it can be rotated without a redeploy; this
+# literal is only a fallback to avoid hard-blocking if the env var is unset.
+_FALLBACK_SUBSCRIPTION_KEY = "e522a816143443189f09de85c4288b98"
+
+_PAGE_SIZE = 10
+# Defensive ceiling so a malformed totalPages can never spin forever.
+# ~47 pages today; 200 leaves enormous headroom.
+_MAX_PAGES = 200
+
+# Politeness: small delay between detail-record fetches.
+_DETAIL_DELAY_SECONDS = 0.25
+# Small delay between list-page POSTs.
+_LIST_DELAY_SECONDS = 0.2
+
+
+def _subscription_key() -> str:
+    """Read the APIM key from settings if present, else the fallback."""
+    for attr in ("hennepin_api_key", "HENNEPIN_API_KEY"):
+        val = getattr(settings, attr, None)
+        if val:
+            return str(val)
+    return _FALLBACK_SUBSCRIPTION_KEY
+
+
+def _headers() -> dict[str, str]:
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://foreclosure.hennepin.us",
+        "Referer": "https://foreclosure.hennepin.us/",
+        "Ocp-Apim-Subscription-Key": _subscription_key(),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+    }
+
+
+def _search_body(active_page: int) -> dict[str, Any]:
+    """Mirror the exact payload the site sends; only activePage varies."""
+    return {
+        "dateOfSale": {"minDate": None, "maxDate": None},
+        "address": None,
+        "city": None,
+        "mortgagorName": None,
+        "pagination": {"activePage": active_page, "pageSize": _PAGE_SIZE},
+    }
+
+
+def _safe_str(value: Any) -> str | None:
+    if value is None:
         return None
-    raw = match.group(1).replace(",", "")
+    s = str(value).strip()
+    return s or None
+
+
+def _safe_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
     try:
-        return Decimal(raw)
+        d = Decimal(str(value).replace(",", "").strip())
+        return d if d >= 0 else None
     except (InvalidOperation, ValueError):
         return None
 
 
-def _parse_date(text: str) -> date | None:
-    """Extract a MM/DD/YYYY date from text, or None."""
-    match = _DATE_PATTERN.search(text)
-    if not match:
+def _parse_iso_date(value: Any) -> date | None:
+    """Parse the API's ISO datetimes (e.g. '2025-06-03T00:00:00')."""
+    if not value:
         return None
+    s = str(value).strip()
+    # Strip a trailing 'Z' if present so fromisoformat is happy.
+    if s.endswith("Z"):
+        s = s[:-1]
     try:
-        month, day, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
-        return date(year, month, day)
-    except (ValueError, TypeError):
+        return datetime.fromisoformat(s).date()
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _mortgagor_names(mortgagors: Any) -> str | None:
+    """Join mortgagors[].display into a single owner string."""
+    if not isinstance(mortgagors, list):
         return None
-
-
-def _split_into_blocks(text: str) -> list[str]:
-    """
-    Split PDF text into per-parcel blocks anchored on PIDs.
-
-    Each block contains one PID and the text around it. The split point is
-    where the next PID appears.
-    """
-    pids: list[tuple[int, str]] = [
-        (m.start(), m.group(1)) for m in _PID_PATTERN.finditer(text)
+    names = [
+        _safe_str(m.get("display"))
+        for m in mortgagors
+        if isinstance(m, dict) and _safe_str(m.get("display"))
     ]
-    if not pids:
-        return []
-
-    blocks: list[str] = []
-    for i, (start, _pid) in enumerate(pids):
-        end = pids[i + 1][0] if i + 1 < len(pids) else len(text)
-        blocks.append(text[start:end])
-    return blocks
+    return "; ".join(n for n in names if n) or None
 
 
-class HennepinSheriffScraper(BaseScraper[dict[str, Any], SheriffSaleInsert]):
-    """Hennepin County sheriff sale PDFs."""
+class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
+    """Hennepin County sheriff foreclosure sales — clean JSON API source."""
 
     source_name: ClassVar[str] = "hennepin_sheriff"
     signal_type: ClassVar[str] = "sheriff_sale"
     county_code: ClassVar[str] = "hennepin"
 
-    # Index URL (overridden by subclasses for other counties)
-    index_url: ClassVar[str] = _INDEX_URL
-
-    @retry_on_transient(source="hennepin_sheriff")
-    async def _fetch_index(self, client: httpx.AsyncClient) -> list[str]:
-        """Fetch the notices index page and extract PDF URLs."""
-        try:
-            response = await client.get(self.index_url, follow_redirects=True)
-            response.raise_for_status()
-        except httpx.HTTPError as e:
-            raise SourceUnavailableError(
-                f"Index fetch failed: {e}", source=self.source_name
-            ) from e
-
-        soup = BeautifulSoup(response.text, "lxml")
-        pdf_urls: list[str] = []
-        for link in soup.find_all("a", href=True):
-            href = link["href"]
-            if href.lower().endswith(".pdf"):
-                # Resolve relative URLs
-                if href.startswith("/"):
-                    href = f"https://www.hennepinsheriff.org{href}"
-                pdf_urls.append(href)
-
-        # Dedup, preserve order
-        seen: set[str] = set()
-        result: list[str] = []
-        for url in pdf_urls:
-            if url not in seen:
-                seen.add(url)
-                result.append(url)
-        return result
-
-    @retry_on_transient(source="hennepin_sheriff")
-    async def _fetch_pdf(self, client: httpx.AsyncClient, url: str) -> bytes:
-        """Download a PDF file's bytes."""
-        try:
-            response = await client.get(url, follow_redirects=True)
-            response.raise_for_status()
-            return response.content
-        except httpx.HTTPError as e:
-            raise SourceUnavailableError(
-                f"PDF download failed: {e}",
-                source=self.source_name,
-                context={"url": url},
-            ) from e
-
-    def _extract_text(self, pdf_bytes: bytes) -> str:
-        """Extract all text from a PDF — tables-first, then prose fallback."""
-        text_parts: list[str] = []
-        try:
-            with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-                for page in pdf.pages:
-                    # Try tables first
-                    tables = page.extract_tables() or []
-                    for table in tables:
-                        for row in table:
-                            row_text = " ".join(
-                                str(cell) for cell in row if cell is not None
-                            )
-                            text_parts.append(row_text)
-                    # Always also extract prose text — tables may miss content
-                    prose = page.extract_text()
-                    if prose:
-                        text_parts.append(prose)
-        except Exception as e:
-            raise ParseError(
-                f"PDF parse failed: {e}", source=self.source_name
-            ) from e
-        return "\n".join(text_parts)
-
-    def _parse_block(self, block: str, source_url: str) -> SheriffSaleInsert | None:
-        """Parse a single per-parcel text block."""
-        pid_match = _PID_PATTERN.search(block)
-        if not pid_match:
-            return None
-
-        raw_pid = pid_match.group(1)
-        normalized_pid, err = safe_normalize_parcel_id(self.county_code, raw_pid)
-        if normalized_pid is None:
-            log_error(
-                run_id=None,
-                error_type="validation_error",
-                error_message=f"Bad PID in PDF: {err}",
-                raw_record={"block": block[:500]},
-            )
-            return None
-
-        sale_date = _parse_date(block)
-        if sale_date is None:
-            # Sale date is essential — skip if absent
-            return None
-
-        amount = _parse_amount(block)
-
-        # Try to extract plaintiff/defendant from "X vs Y" pattern
-        plaintiff: str | None = None
-        defendant: str | None = None
-        vs_match = re.search(r"(.{1,200})\s+v(?:s|\.)\s+(.{1,200})", block, re.IGNORECASE)
-        if vs_match:
-            plaintiff = vs_match.group(1).strip()[:500]
-            defendant = vs_match.group(2).strip()[:500]
-
-        return SheriffSaleInsert(
-            parcel_id=normalized_pid,
-            sale_date=sale_date,
-            sale_amount=amount,
-            plaintiff=plaintiff,
-            defendant=defendant,
-            source=self.source_name,
-            raw_data={"block": block, "source_url": source_url},
-            observed_at=datetime.now(timezone.utc),
-        )
+    # ---- Fetch (paginated JSON list + per-record detail) ----
 
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
-        """Download index page, then top N PDFs, return as raw blob list."""
+        timeout = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(
-            timeout=settings.scraper_request_timeout_seconds * 2,
-            headers={"User-Agent": "DistressProperties/1.0"},
+            timeout=timeout,
+            headers=_headers(),
+            follow_redirects=True,
         ) as client:
-            pdf_urls = await self._fetch_index(client)
+            # 1. First page — also tells us totalPages / totalRecords.
+            first = await self._post_search(client, active_page=1)
+            data = first.get("data") or []
+            pagination = first.get("pagination") or {}
+            total_pages = int(pagination.get("totalPages") or 1)
+            total_records = int(pagination.get("totalRecords") or len(data))
+
+            records: list[dict[str, Any]] = list(data)
+
             logger.info(
-                "Found sheriff sale PDFs",
+                "Hennepin list page fetched",
                 source=self.source_name,
-                count=len(pdf_urls),
+                page=1,
+                total_pages=total_pages,
+                total_records=total_records,
+                rows=len(data),
             )
 
-            # Only process the 3 most recent (avoid re-processing all history)
-            raw_blobs: list[dict[str, Any]] = []
-            for url in pdf_urls[:3]:
+            # 2. Remaining pages.
+            pages_to_fetch = min(total_pages, _MAX_PAGES)
+            for page in range(2, pages_to_fetch + 1):
+                await asyncio.sleep(_LIST_DELAY_SECONDS)
                 try:
-                    pdf_bytes = await self._fetch_pdf(client, url)
-                    raw_blobs.append({"url": url, "bytes": pdf_bytes})
-                except SourceUnavailableError as e:
+                    resp = await self._post_search(client, active_page=page)
+                except SourceUnavailableError:
+                    # One flaky page should not kill the whole run; log and
+                    # continue. We keep whatever we've gathered so far.
                     logger.warning(
-                        "Skipping PDF that failed to download",
-                        url=url,
-                        error=str(e),
+                        "Hennepin list page failed; continuing",
+                        source=self.source_name,
+                        page=page,
                     )
-            return raw_blobs
+                    continue
+                page_rows = resp.get("data") or []
+                records.extend(page_rows)
+                logger.info(
+                    "Hennepin list page fetched",
+                    source=self.source_name,
+                    page=page,
+                    rows=len(page_rows),
+                )
+
+            logger.info(
+                "Hennepin list collection complete",
+                source=self.source_name,
+                collected=len(records),
+                expected=total_records,
+            )
+
+            # 3. Detail enrichment per saleRecordNumber.
+            enriched = await self._enrich_details(client, records)
+
+        logger.info(
+            "Hennepin fetch complete",
+            source=self.source_name,
+            total_rows=len(enriched),
+        )
+        return enriched
+
+    async def _post_search(
+        self, client: httpx.AsyncClient, active_page: int
+    ) -> dict[str, Any]:
+        """POST the Search endpoint for one page, with light retries."""
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await client.post(
+                    _LIST_URL, json=_search_body(active_page)
+                )
+                if resp.status_code != 200:
+                    raise SourceUnavailableError(
+                        f"Hennepin Search page {active_page} returned "
+                        f"{resp.status_code}",
+                        source=self.source_name,
+                    )
+                return resp.json()
+            except (httpx.HTTPError, ValueError) as e:
+                last_err = e
+                logger.warning(
+                    "Hennepin Search POST attempt failed",
+                    source=self.source_name,
+                    page=active_page,
+                    attempt=attempt + 1,
+                    error_type=type(e).__name__,
+                    error_repr=repr(e),
+                )
+                await asyncio.sleep(2.0)
+        raise SourceUnavailableError(
+            f"Hennepin Search page {active_page} failed after retries: "
+            f"{type(last_err).__name__}: {last_err!r}",
+            source=self.source_name,
+        )
+
+    async def _enrich_details(
+        self,
+        client: httpx.AsyncClient,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """GET each record's detail endpoint and merge it onto the list row."""
+        detail_ok = 0
+        detail_errors = 0
+
+        for rec in records:
+            record_no = _safe_str(rec.get("saleRecordNumber"))
+            if not record_no:
+                continue
+            url = _DETAIL_URL.format(record=record_no)
+            try:
+                await asyncio.sleep(_DETAIL_DELAY_SECONDS)
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    detail_errors += 1
+                    logger.warning(
+                        "Hennepin detail non-200",
+                        source=self.source_name,
+                        record=record_no,
+                        status_code=resp.status_code,
+                    )
+                    continue
+                detail = resp.json()
+                if isinstance(detail, dict):
+                    # Detail is the authoritative record; merge it over the
+                    # list fields (which it fully supersets).
+                    rec.update(detail)
+                    detail_ok += 1
+            except (httpx.HTTPError, ValueError) as e:
+                detail_errors += 1
+                logger.warning(
+                    "Hennepin detail fetch error",
+                    source=self.source_name,
+                    record=record_no,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+
+        logger.info(
+            "Hennepin detail enrichment complete",
+            source=self.source_name,
+            detail_ok=detail_ok,
+            detail_errors=detail_errors,
+            total=len(records),
+        )
+        return records
+
+    # ---- Parse records → signals ----
 
     async def parse(
         self, raw_records: list[dict[str, Any]]
-    ) -> list[SheriffSaleInsert]:
-        """Parse the PDFs into SheriffSaleInsert rows."""
-        signals: list[SheriffSaleInsert] = []
-        for record in raw_records:
-            url = record["url"]
-            pdf_bytes = record["bytes"]
-            try:
-                text = self._extract_text(pdf_bytes)
-                blocks = _split_into_blocks(text)
-                for block in blocks:
-                    parsed = self._parse_block(block, url)
-                    if parsed is not None:
-                        signals.append(parsed)
-            except ParseError as e:
-                log_error(
-                    run_id=None,
-                    error_type="parse_error",
-                    error_message=str(e),
-                    raw_record={"url": url},
+    ) -> list[DistressEventInsert]:
+        signals: list[DistressEventInsert] = []
+        today = date.today()
+
+        for r in raw_records:
+            record_no = _safe_str(r.get("saleRecordNumber"))
+            if not record_no:
+                continue
+
+            sale_date = _parse_iso_date(r.get("dateOfSale"))
+            if sale_date is None:
+                # No usable sale date → cannot form a sheriff_sale event.
+                continue
+
+            parcel_id = f"HENNEPIN-FC-{record_no}"
+            redemption_date = _parse_iso_date(
+                r.get("redemptionExpirationDate")
+            )
+            owner = _mortgagor_names(r.get("mortgagors"))
+            address = _safe_str(r.get("address"))
+            city = _safe_str(r.get("city"))
+            final_bid = _safe_decimal(r.get("finalBidAmount"))
+
+            # Severity from the redemption window: an open (future) redemption
+            # period is the actionable window — the prior owner can still
+            # redeem and a buyer can engage. Expired/unknown is lower priority.
+            if redemption_date is not None and redemption_date >= today:
+                severity = "high"
+            elif redemption_date is not None and redemption_date < today:
+                severity = "low"
+            else:
+                severity = "medium"
+
+            title_bits = ["Sheriff foreclosure sale"]
+            if address:
+                title_bits.append(f"— {address}")
+            if city:
+                title_bits.append(f", {city}")
+            title = " ".join(title_bits)[:500]
+
+            desc_parts = [
+                f"Completed Hennepin County sheriff sale on "
+                f"{sale_date.isoformat()}."
+            ]
+            if owner:
+                desc_parts.append(f"Mortgagor: {owner}.")
+            if final_bid is not None:
+                desc_parts.append(f"Final bid: ${final_bid:,.0f}.")
+            if redemption_date is not None:
+                desc_parts.append(
+                    f"Redemption expires {redemption_date.isoformat()}."
                 )
+            if _safe_str(r.get("typeOfSale")):
+                desc_parts.append(f"Type: {r['typeOfSale']}.")
+            description = " ".join(desc_parts)[:2000]
+
+            signals.append(DistressEventInsert(
+                parcel_id=parcel_id,
+                event_type="sheriff_sale",
+                event_subtype="completed_sale",
+                event_date=sale_date,
+                event_value=final_bid,
+                source=self.source_name,
+                source_id=record_no,
+                severity=severity,  # type: ignore[arg-type]
+                title=title,
+                description=description,
+                raw_data={
+                    # Store the full detail record so the redemption-window
+                    # UI can read redemptionExpirationDate directly, and so
+                    # nothing the API returns is lost.
+                    "saleRecordNumber": record_no,
+                    "dateOfSale": r.get("dateOfSale"),
+                    "typeOfSale": r.get("typeOfSale"),
+                    "address": address,
+                    "city": city,
+                    "mortgagors": r.get("mortgagors"),
+                    "mortgagee": r.get("mortgagee"),
+                    "toWhomSold": r.get("toWhomSold"),
+                    "finalBidAmount": r.get("finalBidAmount"),
+                    "redemptionExpirationDate": r.get(
+                        "redemptionExpirationDate"
+                    ),
+                    "lawFirm": r.get("lawFirm"),
+                    "mortgageDocumentNumber": r.get(
+                        "mortgageDocumentNumber"
+                    ),
+                    "comments": r.get("comments"),
+                    "noticeOfIntent": r.get("noticeOfIntent"),
+                    "_source": self.source_name,
+                },
+                observed_at=datetime.now(timezone.utc),
+            ))
+
         return signals
 
-    async def write(self, signals: list[SheriffSaleInsert]) -> tuple[int, int, int]:
+    # ---- Write (mirror Anoka: resolve parcels + dedup events) ----
+
+    async def write(
+        self, signals: list[DistressEventInsert]
+    ) -> tuple[int, int, int]:
         if not signals:
             return 0, 0, 0
 
-        # Resolve unique parcels
-        unique_pids: dict[str, ParcelUpsert] = {}
-        for sig in signals:
-            if sig.parcel_id not in unique_pids:
-                unique_pids[sig.parcel_id] = ParcelUpsert(
-                    parcel_id=sig.parcel_id,
-                    county_code=self.county_code,
-                    data_sources=[self.source_name],
-                )
+        unique_parcels: dict[str, ParcelUpsert] = {}
+        for ev in signals:
+            if ev.parcel_id in unique_parcels:
+                continue
+            raw = ev.raw_data or {}
+            address = _safe_str(raw.get("address"))
+            city = _safe_str(raw.get("city"))
 
-        for parcel_payload in unique_pids.values():
-            resolve_parcel(parcel_payload)
+            unique_parcels[ev.parcel_id] = ParcelUpsert(
+                parcel_id=ev.parcel_id,
+                county_code=self.county_code,
+                state="MN",
+                address=address,
+                city=city,
+                zip=None,
+                raw_data={
+                    "hennepin_foreclosure": raw,
+                    "_source": self.source_name,
+                },
+                data_sources=[self.source_name],
+                last_observed_at=datetime.now(timezone.utc),
+            )
 
-        # Write typed sheriff_sales rows
-        signal_rows = [sig.model_dump(mode="json", exclude_none=True) for sig in signals]
-        new_typed, failed_typed = write_typed_signals_dedup(
-            "sheriff_sales",
-            signal_rows,
-            on_conflict="parcel_id,sale_date,source",
+        parcels_failed = 0
+        for payload in unique_parcels.values():
+            if resolve_parcel(payload) is None:
+                parcels_failed += 1
+
+        new_events, failed_events = write_events_dedup(signals)
+        logger.info(
+            "Hennepin write complete",
+            source=self.source_name,
+            parcels=len(unique_parcels),
+            events_new=new_events,
+            failed=failed_events + parcels_failed,
         )
-
-        # Write unified events
-        events = [sig.to_event() for sig in signals]
-        new_events, failed_events = write_events_dedup(events)
-
-        return new_typed, 0, failed_typed + failed_events
+        return new_events, 0, failed_events + parcels_failed
 
 
 __all__ = ["HennepinSheriffScraper"]
