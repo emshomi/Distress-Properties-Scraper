@@ -793,6 +793,39 @@ async def list_properties(
                     "raw_data->detail->>status", "null"
                 )
 
+        if redemption:
+            # Redemption-window filter, approximated via event_date so it
+            # works uniformly across all sheriff counties (Hennepin stores
+            # the exact date in raw_data; Anoka/Dakota don't store it at
+            # all). Redemption ≈ sale_date + ~6 months (182 days). The
+            # displayed date/pill still use the exact value where available;
+            # only this bucketing is approximate.
+            from datetime import date as _d, timedelta as _td
+
+            today = _d.today()
+            # Boundary sale dates:
+            #   sale + 182 = redemption end
+            #   "expiring soon" = redemption end within 90 days
+            #   => sale_date between (today-182) and (today-92)
+            #   "in redemption" = redemption end > 90 days out
+            #   => sale_date after (today-92)
+            #   "expired" = redemption end already passed
+            #   => sale_date before (today-182)
+            soon_start = (today - _td(days=182)).isoformat()
+            soon_end = (today - _td(days=92)).isoformat()
+            in_redemption_after = (today - _td(days=92)).isoformat()
+            expired_before = (today - _td(days=182)).isoformat()
+
+            if redemption == "in_redemption":
+                query = query.gt("event_date", in_redemption_after)
+            elif redemption == "expiring_soon":
+                query = query.gte("event_date", soon_start)
+                query = query.lte("event_date", soon_end)
+            elif redemption == "expired":
+                query = query.lt("event_date", expired_before)
+
+        
+
         if min_amount is not None:
             query = query.gte("event_value", min_amount)
 
