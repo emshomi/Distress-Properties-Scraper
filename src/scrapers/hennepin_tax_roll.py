@@ -149,72 +149,103 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
 
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         """
-        Cursor-paginate Hennepin parcels that are forfeited OR delinquent.
+        Read forfeited + delinquent Hennepin parcels via TWO separate queries.
 
-        We page by parcel_id cursor (WHERE parcel_id > last_seen) rather than
-        offset .range(), because the matching parcels are sparse (~4,251 of
-        448K) and offset pagination re-scans from the top every page, which
-        blows past the DB statement timeout. Cursor pagination never re-scans,
-        so each page picks up where the last ended.
+        We deliberately do NOT use a single OR query. EXPLAIN showed the OR
+        (plus the order-by) made the planner ignore our indexes and full-scan
+        448K rows (5s, timeout-prone). Split into two single-condition queries
+        and each uses its own index cleanly:
 
-        Relies on partial expression indexes on
-        (raw_data->>'FORFEIT_LAND_IND') and (raw_data->>'EARLIEST_DELQ_YR')
-        for Hennepin parcels to keep the OR filter cheap (see migration).
+          forfeited:  raw_data->>'FORFEIT_LAND_IND' = 'T'
+                      -> idx_parcels_hennepin_forfeit  (~8ms, 139 rows)
+          delinquent: raw_data->>'EARLIEST_DELQ_YR' is not null
+                      -> idx_parcels_hennepin_delq (partial)  (~73ms, 4112 rows)
+
+        Both result sets are small (~4,251 total), so we fetch each whole
+        (paged defensively) and combine in Python. parse() then classifies.
         """
         all_rows: list[dict[str, Any]] = []
 
-        # OR filter: forfeit flag == 'T'  OR  delinquency-year is not null.
-        or_filter = (
-            f"raw_data->>{_FORFEIT_FIELD}.eq.{_FORFEIT_TRUE},"
-            f"raw_data->>{_DELQ_YR_FIELD}.not.is.null"
+        # --- Query 1: forfeited land (equality on indexed expression) ---
+        forfeited = await self._read_filtered(
+            label="forfeited",
+            apply_filter=lambda q: q.eq(
+                f"raw_data->>{_FORFEIT_FIELD}", _FORFEIT_TRUE
+            ),
         )
+        all_rows.extend(forfeited)
 
-        last_parcel_id = ""  # cursor; parcel_ids sort lexicographically
+        # --- Query 2: delinquent (not-null, hits the partial index) ---
+        delinquent = await self._read_filtered(
+            label="delinquent",
+            apply_filter=lambda q: q.not_.is_(
+                f"raw_data->>{_DELQ_YR_FIELD}", "null"
+            ),
+        )
+        all_rows.extend(delinquent)
+
+        logger.info(
+            "Hennepin tax-roll fetch complete",
+            source=self.source_name,
+            forfeited=len(forfeited),
+            delinquent=len(delinquent),
+            candidate_parcels=len(all_rows),
+        )
+        return all_rows
+
+    async def _read_filtered(self, label, apply_filter) -> list[dict[str, Any]]:
+        """Cursor-paginate one single-condition parcel query by parcel_id.
+
+        `apply_filter` adds the specific WHERE condition to the base query so
+        each call hits its own index. Cursor pagination (parcel_id > last)
+        keeps every page cheap and avoids offset re-scans.
+        """
+        rows_out: list[dict[str, Any]] = []
+        last_parcel_id = ""
+
         for page in range(_MAX_PAGES):
             try:
-                resp = (
+                q = (
                     core_table("parcels")
                     .select("parcel_id, county_code, address, city, raw_data")
                     .eq("county_code", self.county_code)
-                    .or_(or_filter)
-                    .gt("parcel_id", last_parcel_id)
+                )
+                q = apply_filter(q)
+                resp = (
+                    q.gt("parcel_id", last_parcel_id)
                     .order("parcel_id")
                     .limit(_READ_PAGE_SIZE)
                     .execute()
                 )
             except Exception as e:
                 raise SourceUnavailableError(
-                    f"Reading core.parcels for tax-roll mining failed: "
-                    f"{type(e).__name__}: {e}",
+                    f"Reading core.parcels ({label}) for tax-roll mining "
+                    f"failed: {type(e).__name__}: {e}",
                     source=self.source_name,
-                    context={"page": page, "cursor": last_parcel_id},
+                    context={"label": label, "page": page,
+                             "cursor": last_parcel_id},
                 ) from e
 
             rows = resp.data or []
             if not rows:
                 break
 
-            all_rows.extend(rows)
-            last_parcel_id = rows[-1]["parcel_id"]  # advance cursor
+            rows_out.extend(rows)
+            last_parcel_id = rows[-1]["parcel_id"]
 
             logger.info(
-                "Hennepin tax-roll parcels page read",
+                "Hennepin tax-roll page read",
                 source=self.source_name,
+                set=label,
                 page=page + 1,
                 rows=len(rows),
-                cumulative=len(all_rows),
-                cursor=last_parcel_id,
+                cumulative=len(rows_out),
             )
 
             if len(rows) < _READ_PAGE_SIZE:
                 break
 
-        logger.info(
-            "Hennepin tax-roll fetch complete",
-            source=self.source_name,
-            candidate_parcels=len(all_rows),
-        )
-        return all_rows
+        return rows_out
 
     # ---- Parse: classify each parcel into forfeit or delinquent ----
 
