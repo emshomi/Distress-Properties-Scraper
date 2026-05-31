@@ -25,11 +25,17 @@ delinquency. It is surfaced and titled honestly as an assessment burden, not
 as a legal forfeit/delinquent status.
 
 === THE RULE (verified against live data) ===
-  Emit one event per parcel where BOTH:
+  Emit one event per parcel where ALL of:
     - SpecialAssessmentDue >= $2,000
     - absentee owner: taxpayer mailing street (TaxAddress1) differs from the
       site address (SiteAddress)
-  Verified subset: 1,673 of 163,880 Ramsey parcels.
+    - RESIDENTIAL land use (LandUseCode in the residential 1-unit / 2+-unit
+      set). This filter is essential: without it the rule catches large
+      downtown commercial buildings owned by LLCs (corporate mailing always
+      differs from the building, huge routine assessments) — not distress and
+      misleading to an investor.
+  Verified subset: 483 of 163,880 Ramsey parcels (value range $37K-$786K),
+  down from 1,672 before the residential filter removed the commercial noise.
   -> event_type = 'tax_assessment', subtype 'special_assessment_burden'
 
 === VERIFIED Ramsey raw_data field names (from live core.parcels rows) ===
@@ -88,6 +94,23 @@ _TOTAL_TAX_FIELD = "TotalTax"
 _MIN_ASSESSMENT = Decimal("2000")
 _SEVERITY_MEDIUM_AT = Decimal("5000")
 _SEVERITY_HIGH_AT = Decimal("10000")
+
+# Residential LandUseCode set. The signal is a RESIDENTIAL motivated-seller
+# indicator. Without this filter the rule also catches large downtown
+# commercial buildings owned by LLCs (whose corporate mailing address always
+# differs from the building, so they trip the "absentee" test and carry huge
+# routine assessments) — NOT distress, and misleading to an investor. Verified
+# against live data: adding this filter takes the qualifying set from 1,672
+# (commercial-polluted) to 483 genuine residential parcels ($37K-$786K value).
+# Codes are Ramsey's residential 1-unit (510/511) and residential 2+ unit block,
+# per the layer's documented LandUseCode renderer.
+_RESIDENTIAL_LAND_USE_CODES: frozenset[str] = frozenset({
+    "510", "511",                                    # Residential 1 unit
+    "495", "505", "515", "520", "521", "530", "531",  # Residential 2+ units
+    "540", "541", "545", "546", "550", "551", "552",
+    "553", "570", "573", "574", "575", "576", "578",
+})
+_LAND_USE_FIELD = "LandUseCode"
 
 # Stable event_date. The assessment signal has no natural date in the parcel
 # data, and event_date is part of the dedup key, so it MUST be constant across
@@ -251,6 +274,15 @@ class RamseyTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             mailing_street = _safe_str(raw.get(_MAIL_STREET_FIELD))
             if not _is_absentee(site_addr, mailing_street):
                 continue  # owner-occupied — not the signal we ship
+
+            # Residential only. Without this, large downtown commercial
+            # buildings owned by LLCs (corporate mailing != building address,
+            # huge routine assessments) flood the results — not distress and
+            # misleading to an investor. Verified: this filter takes the set
+            # from 1,672 commercial-polluted to 483 genuine residential.
+            land_use = _safe_str(raw.get(_LAND_USE_FIELD))
+            if land_use not in _RESIDENTIAL_LAND_USE_CODES:
+                continue  # non-residential — not the signal we ship
 
             # --- Qualifies. Build the enriched event. ---
             owner_name = _safe_str(raw.get(_OWNER_FIELD))
