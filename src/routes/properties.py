@@ -318,8 +318,9 @@ def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
         "owner_mailing": raw.get("owner_mailing"),
         "is_absentee": raw.get("is_absentee"),
         "annual_tax": annual_tax,
+        "special_assessment_due": raw.get("special_assessment_due"),
     }
-
+    
 def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
     """hennepin_sheriff — clean JSON API. raw_data holds the full detail
     record at the top level (not nested under list/detail). Mortgagors are
