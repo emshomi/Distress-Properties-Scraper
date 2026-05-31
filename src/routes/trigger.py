@@ -53,6 +53,7 @@ _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "mpls_311": MplsThreeOneOneScraper,
     "hennepin_sheriff": HennepinSheriffScraper,
     "hennepin_parcels": HennepinParcelsScraper,
+    "hennepin_tax_roll": HennepinTaxRollScraper,
     "dakota_sheriff": DakotaSheriffScraper,
     "anoka_sheriff": AnokaSheriffScraper,
     "ramsey_sheriff": RamseySheriffScraper,
