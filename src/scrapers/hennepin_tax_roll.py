@@ -279,11 +279,21 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     year=delq_year if delq_year is not None else "unknown"
                 )
 
+                # Stable, meaningful event_date: Jan 1 of the delinquency year.
+                # Same value every run (idempotent dedup) AND it represents
+                # when the delinquency began. Fallback to the sentinel only if
+                # the year somehow won't parse (verified: 0 such rows).
+                delq_event_date = (
+                    date(delq_year, 1, 1)
+                    if delq_year is not None
+                    else _FORFEIT_SENTINEL_DATE
+                )
+
                 signals.append(DistressEventInsert(
                     parcel_id=parcel_id,
                     event_type="tax_delinquent",
                     event_subtype="property_tax_delinquent",
-                    event_date=today,
+                    event_date=delq_event_date,
                     event_value=market_value,
                     source=self.source_name,
                     source_id=parcel_id,
