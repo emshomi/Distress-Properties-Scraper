@@ -165,6 +165,11 @@ def _extract_dakota(raw: dict, row: dict) -> dict[str, Any]:
         "earliest_delq_year": None,
         "dwelling_type": None,
         "ward": None,
+        # Generic foreclosure enrichment fields — null until Dakota
+        # enrichment is wired; keeps the foreclosure row shape uniform.
+        "owner_mailing": None,
+        "is_absentee": None,
+        "homestead": None,
     }
 
 
@@ -376,6 +381,11 @@ def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
         "earliest_delq_year": None,
         "dwelling_type": None,
         "ward": None,
+        # Generic foreclosure enrichment fields — null until Hennepin
+        # enrichment is wired; keeps the foreclosure row shape uniform.
+        "owner_mailing": None,
+        "is_absentee": None,
+        "homestead": None,
         # Hennepin publishes this; preserved for the redemption-window work.
         "redemption_ends_at": raw.get("redemptionExpirationDate"),
         "mortgagee": raw.get("mortgagee"),
@@ -412,6 +422,11 @@ def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
         "earliest_delq_year": None,
         "dwelling_type": None,
         "ward": None,
+        # Generic foreclosure enrichment fields — null until wired;
+        # keeps the foreclosure row shape uniform across all sources.
+        "owner_mailing": None,
+        "is_absentee": None,
+        "homestead": None,
     }
 
 
