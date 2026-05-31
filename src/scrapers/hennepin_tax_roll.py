@@ -1,48 +1,66 @@
 """
-Hennepin County Tax-Forfeited Land miner.
+Hennepin County Tax-Roll miner (delinquent + forfeited land).
 
 Source: NOT an external website — this is a DATABASE MINING job. It reads the
         Hennepin parcels already loaded in core.parcels (by the
-        hennepin_parcels scraper) and derives tax-forfeiture distress signals
-        from them. This is the "distress mining happens later via raw_data
-        queries" step the hennepin_parcels docstring refers to.
+        hennepin_parcels scraper) and derives tax-distress signals from them.
+        This is the "distress mining happens later via raw_data queries" step
+        the hennepin_parcels docstring refers to.
 
-=== WHY THIS EXISTS / HOW IT WAS DISCOVERED ===
-The hennepin_parcels scraper loads all ~448K parcels into core.parcels with
-their full Hennepin attribute set in raw_data, but writes NO distress signals.
-Hennepin's parcel attributes include `FORFEIT_LAND_IND` — a Y/N-style flag
-("T" = tax-forfeited land owned by the State). This miner selects those
-parcels and emits one `hennepin_tax_roll` distress event per forfeited parcel.
+=== THE TWO RULES (reverse-engineered + verified against the live data) ===
+Every Hennepin parcel falls into at most one tax-distress bucket. The rules
+were confirmed by reconciling against the original one-time load:
 
-The original one-time load (May 2026) produced these rows but left no
-repeatable job. This module makes the mining a first-class, schedulable
-scraper so the tax-forfeit signal stays current as parcels enter/leave
-forfeiture (a slow, multi-year process under the post-Tyler liquidation
-window — monthly re-mining is plenty).
+  1. TAX-FORFEIT (139 parcels):
+        raw_data->>'FORFEIT_LAND_IND' == 'T'
+     The redemption period expired; the parcel is forfeited to the State of
+     Minnesota, now owned by "HENNEPIN FORFEITED LAND", awaiting auction.
+     -> event_type = 'tax_forfeit', subtype 'state_forfeited_land'
 
-=== THE MINING RULE (verified from existing rows) ===
-A parcel is tax-forfeited when:
-    raw_data->>'FORFEIT_LAND_IND' == 'T'   (case-insensitive)
-    AND county_code == 'hennepin'
-Carried into the signal's raw_data: owner_name, market_value, municipality,
-plus _derived_from + forfeit_land_ind provenance markers (matching the shape
-the properties.py extractor already reads).
+  2. TAX-DELINQUENT (4,112 parcels):
+        raw_data->>'EARLIEST_DELQ_YR' present AND non-empty
+        AND NOT forfeited (the two sets are mutually exclusive — verified:
+        delq_not_forfeit == has_delq_yr == 4112, forfeit == 139, sum 4251)
+     The owner is behind on property taxes but the parcel has NOT yet
+     forfeited. Early-stage distress.
+     -> event_type = 'tax_delinquent', subtype 'property_tax_delinquent'
+
+Verified counts: 139 forfeit + 4,112 delinquent = 4,251 — matches the
+original load exactly, with zero overlap.
+
+=== VERIFIED FIELD NAMES (from live core.parcels rows) ===
+  FORFEIT_LAND_IND  'T' marks forfeited land
+  EARLIEST_DELQ_YR  two-digit delinquency year, e.g. '25' = 2025
+  OWNER_NM          owner name
+  MKT_VAL_TOT       total market value
+  MUNIC_NM          municipality
+
+=== raw_data SHAPES (match the original rows so re-mining dedups cleanly) ===
+  forfeit:    {owner_name, market_value, municipality,
+               _derived_from, forfeit_land_ind:'T'}
+  delinquent: {owner_name, market_value, municipality,
+               _derived_from, earliest_delq_year:<int>, earliest_delq_yr_raw}
 
 === ARCHITECTURE ===
 Unlike the web scrapers, fetch() queries the database instead of HTTP:
-  fetch():  page through core.parcels WHERE raw_data->>FORFEIT_LAND_IND='T'
-  parse():  one DistressEventInsert per forfeited parcel
-  write():  write_events_dedup (idempotent — re-mining is safe, dedups on
-            source + source_id, so unchanged parcels produce new=0)
+  fetch():  page through core.parcels for Hennepin, pulling any parcel that
+            is either forfeited OR has a delinquency year.
+  parse():  classify each parcel into tax_forfeit or tax_delinquent and emit
+            the matching DistressEventInsert.
+  write():  write_events_dedup (idempotent — re-mining is safe; unchanged
+            parcels produce new=0).
 
-Severity: forfeited land in the active liquidation window is a real
-acquisition opportunity → medium (it's not time-boxed like a redemption
-clock, so not high; not stale, so not low).
+Severity:
+  tax_forfeit                     -> medium (already seized; awaiting auction)
+  tax_delinquent, older year      -> higher distress (longer behind)
+    delinquent >= 3 years         -> high
+    delinquent 1-2 years          -> medium
+    delinquent current year       -> low
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
 
@@ -54,22 +72,28 @@ from src.utils.errors import SourceUnavailableError
 from src.utils.logger import logger
 
 
-# Hennepin parcel attribute that flags tax-forfeited (state-owned) land.
+# Verified Hennepin parcel attribute names.
 _FORFEIT_FIELD = "FORFEIT_LAND_IND"
 _FORFEIT_TRUE = "T"
+_DELQ_YR_FIELD = "EARLIEST_DELQ_YR"
+_OWNER_FIELD = "OWNER_NM"
+_MKT_VAL_FIELD = "MKT_VAL_TOT"
+_MUNIC_FIELD = "MUNIC_NM"
 
-# JSON-path filter key for the Supabase query (PostgREST ->> text accessor).
-_FORFEIT_JSONPATH = f"raw_data->>{_FORFEIT_FIELD}"
-
-# Page size for reading core.parcels. Forfeited parcels are a small subset
-# (~4K of 448K), but we page defensively.
+# Read paging. We pull the union of (forfeited OR has delinquency year),
+# which is ~4,251 of 448K — small, but page defensively.
 _READ_PAGE_SIZE = 1000
-_MAX_PAGES = 200  # 200K forfeited parcels would be absurd; safety ceiling.
+_MAX_PAGES = 200
 
-_TITLE = "Tax-forfeited land (state)"
-_DESCRIPTION = (
+_FORFEIT_TITLE = "Tax-forfeited land (state)"
+_FORFEIT_DESC = (
     "Parcel forfeited to the State of Minnesota for unpaid property taxes. "
     "Subject to county liquidation under the post-Tyler v. Hennepin reforms."
+)
+_DELQ_TITLE = "Tax-delinquent property"
+_DELQ_DESC = (
+    "Property is behind on Hennepin County property taxes (delinquent since "
+    "{year}). Unresolved delinquency can proceed toward tax forfeiture."
 )
 
 
@@ -94,40 +118,63 @@ def _safe_decimal(value: Any) -> Decimal | None:
         return None
 
 
+def _expand_delq_year(raw_yr: str | None) -> int | None:
+    """Convert Hennepin's 2-digit delinquency year ('25') to 2025.
+
+    All observed values are recent 2-digit years. We map '00'-'99' to
+    2000-2099, which is correct for the delinquency horizon this data covers.
+    """
+    s = _safe_str(raw_yr)
+    if s is None:
+        return None
+    digits = s.zfill(2)[-2:]
+    if not digits.isdigit():
+        return None
+    return 2000 + int(digits)
+
+
 class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
-    """Hennepin tax-forfeited land — derived from core.parcels (DB miner)."""
+    """Hennepin tax-roll miner: forfeited land + delinquent properties."""
 
     source_name: ClassVar[str] = "hennepin_tax_roll"
-    signal_type: ClassVar[str] = "tax_forfeit"
+    signal_type: ClassVar[str] = "tax_roll"
     county_code: ClassVar[str] = "hennepin"
 
-    # ---- Fetch: query core.parcels for forfeited-land parcels ----
+    # ---- Fetch: query core.parcels for forfeited OR delinquent parcels ----
 
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         """
-        Page through core.parcels where FORFEIT_LAND_IND = 'T' for Hennepin.
+        Page through Hennepin parcels that are either forfeited
+        (FORFEIT_LAND_IND='T') OR have a delinquency year (EARLIEST_DELQ_YR).
 
-        Returns the matching parcel rows (parcel_id + raw_data + a few cols),
-        which parse() turns into tax-forfeit signals.
+        PostgREST .or_() with JSON-path keys: a parcel qualifies if the
+        forfeit flag is 'T' OR the delinquency-year field is present.
+        We then classify precisely in parse().
         """
         all_rows: list[dict[str, Any]] = []
+
+        # OR filter: forfeit flag == 'T'  OR  delinquency-year is not null.
+        # (PostgREST 'not.is.null' tests presence.)
+        or_filter = (
+            f"raw_data->>{_FORFEIT_FIELD}.eq.{_FORFEIT_TRUE},"
+            f"raw_data->>{_DELQ_YR_FIELD}.not.is.null"
+        )
 
         for page in range(_MAX_PAGES):
             start = page * _READ_PAGE_SIZE
             end = start + _READ_PAGE_SIZE - 1
             try:
-                # Equality on the JSON text accessor. Hennepin stores 'T'.
                 resp = (
                     core_table("parcels")
                     .select("parcel_id, county_code, address, city, raw_data")
                     .eq("county_code", self.county_code)
-                    .eq(_FORFEIT_JSONPATH, _FORFEIT_TRUE)
+                    .or_(or_filter)
                     .range(start, end)
                     .execute()
                 )
             except Exception as e:
                 raise SourceUnavailableError(
-                    f"Reading core.parcels for forfeited land failed: "
+                    f"Reading core.parcels for tax-roll mining failed: "
                     f"{type(e).__name__}: {e}",
                     source=self.source_name,
                     context={"page": page, "start": start},
@@ -150,16 +197,19 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         logger.info(
             "Hennepin tax-roll fetch complete",
             source=self.source_name,
-            forfeited_parcels=len(all_rows),
+            candidate_parcels=len(all_rows),
         )
         return all_rows
 
-    # ---- Parse: one forfeited parcel → one tax_forfeit signal ----
+    # ---- Parse: classify each parcel into forfeit or delinquent ----
 
     async def parse(
         self, raw_records: list[dict[str, Any]]
     ) -> list[DistressEventInsert]:
         signals: list[DistressEventInsert] = []
+        today = date.today()
+        n_forfeit = 0
+        n_delq = 0
 
         for row in raw_records:
             parcel_id = _safe_str(row.get("parcel_id"))
@@ -167,50 +217,89 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 continue
 
             raw = row.get("raw_data") or {}
+            owner_name = _safe_str(raw.get(_OWNER_FIELD))
+            municipality = (
+                _safe_str(row.get("city")) or _safe_str(raw.get(_MUNIC_FIELD))
+            )
+            market_value = _safe_decimal(raw.get(_MKT_VAL_FIELD))
+            mv_str = str(market_value) if market_value is not None else "0"
 
-            # Defensive: confirm the flag really is 'T' (the query should
-            # guarantee it, but raw_data casing can vary across loads).
-            flag = _safe_str(raw.get(_FORFEIT_FIELD))
-            if flag is None or flag.upper() != _FORFEIT_TRUE:
+            forfeit_flag = _safe_str(raw.get(_FORFEIT_FIELD))
+            delq_raw = _safe_str(raw.get(_DELQ_YR_FIELD))
+
+            # --- Rule 1: forfeited (takes precedence; mutually exclusive) ---
+            if forfeit_flag is not None and forfeit_flag.upper() == _FORFEIT_TRUE:
+                signals.append(DistressEventInsert(
+                    parcel_id=parcel_id,
+                    event_type="tax_forfeit",
+                    event_subtype="state_forfeited_land",
+                    event_date=today,
+                    event_value=market_value,
+                    source=self.source_name,
+                    source_id=parcel_id,
+                    severity="medium",  # type: ignore[arg-type]
+                    title=_FORFEIT_TITLE,
+                    description=_FORFEIT_DESC,
+                    raw_data={
+                        "owner_name": owner_name or "HENNEPIN FORFEITED LAND",
+                        "market_value": mv_str,
+                        "municipality": municipality,
+                        "_derived_from": "hennepin_parcels.raw_data",
+                        "forfeit_land_ind": _FORFEIT_TRUE,
+                    },
+                    observed_at=datetime.now(timezone.utc),
+                ))
+                n_forfeit += 1
                 continue
 
-            owner_name = _safe_str(raw.get("OWNER_NM")) or "HENNEPIN FORFEITED LAND"
-            municipality = (
-                _safe_str(row.get("city"))
-                or _safe_str(raw.get("MUNIC_NM"))
-            )
-            market_value = _safe_decimal(raw.get("MKT_VAL_TOT"))
+            # --- Rule 2: delinquent (has a delinquency year, not forfeited) ---
+            if delq_raw is not None:
+                delq_year = _expand_delq_year(delq_raw)
+                # Severity scales with how long the parcel has been behind.
+                if delq_year is not None:
+                    years_behind = today.year - delq_year
+                else:
+                    years_behind = 0
+                if years_behind >= 3:
+                    severity = "high"
+                elif years_behind >= 1:
+                    severity = "medium"
+                else:
+                    severity = "low"
 
-            signals.append(DistressEventInsert(
-                parcel_id=parcel_id,
-                event_type="tax_forfeit",
-                event_subtype="forfeited_to_state",
-                # Forfeiture has no single "event date" in the parcel row;
-                # leave event_date null (consistent with the original rows,
-                # which had sale_date: null).
-                event_date=None,
-                event_value=market_value,
-                source=self.source_name,
-                source_id=parcel_id,
-                severity="medium",  # type: ignore[arg-type]
-                title=_TITLE,
-                description=_DESCRIPTION,
-                raw_data={
-                    "owner_name": owner_name,
-                    "market_value": (
-                        str(market_value) if market_value is not None else "0"
-                    ),
-                    "municipality": municipality,
-                    "_derived_from": "hennepin_parcels.raw_data",
-                    "forfeit_land_ind": _FORFEIT_TRUE,
-                },
-                observed_at=datetime.now(timezone.utc),
-            ))
+                desc = _DELQ_DESC.format(
+                    year=delq_year if delq_year is not None else "unknown"
+                )
+
+                signals.append(DistressEventInsert(
+                    parcel_id=parcel_id,
+                    event_type="tax_delinquent",
+                    event_subtype="property_tax_delinquent",
+                    event_date=today,
+                    event_value=market_value,
+                    source=self.source_name,
+                    source_id=parcel_id,
+                    severity=severity,  # type: ignore[arg-type]
+                    title=_DELQ_TITLE,
+                    description=desc,
+                    raw_data={
+                        "owner_name": owner_name,
+                        "market_value": mv_str,
+                        "municipality": municipality,
+                        "_derived_from": "hennepin_parcels.raw_data",
+                        "earliest_delq_year": delq_year,
+                        "earliest_delq_yr_raw": delq_raw,
+                    },
+                    observed_at=datetime.now(timezone.utc),
+                ))
+                n_delq += 1
 
         logger.info(
             "Hennepin tax-roll parse complete",
             source=self.source_name,
-            signals=len(signals),
+            tax_forfeit=n_forfeit,
+            tax_delinquent=n_delq,
+            total=len(signals),
         )
         return signals
 
