@@ -1,0 +1,72 @@
+name: Hennepin Foreclosure Enrichment
+# Manual + monthly. Enriches existing hennepin_sheriff foreclosure events with
+# owner / market value / taxpayer-mailing / homestead+absentee, matched by a
+# unique normalized address to the Hennepin parcel roll already in
+# core.parcels. PURE INTERNAL DB JOIN — no external HTTP source.
+#
+# Why monthly: assessor owner/value/homestead change slowly (annual revaluation
+# cadence), and new foreclosure listings get picked up here on the next monthly
+# pass. The job UPDATEs rows in place (the hennepin_sheriff writer is ON
+# CONFLICT DO NOTHING and cannot refresh existing rows), and it is idempotent —
+# re-running simply rewrites the same enrichment.
+on:
+  workflow_dispatch:
+  schedule:
+    # 2nd of the month, 14:00 UTC = 8:00am Central (standard) / 9:00am (DST).
+    # Offset a day after ramsey-tax (1st @ 13:30) and well clear of the daily
+    # sheriff jobs (12:00-12:20 UTC) so nothing overlaps.
+    - cron: '0 14 2 * *'
+jobs:
+  enrich:
+    name: Enrich Hennepin foreclosure rows from core.parcels
+    runs-on: ubuntu-latest
+    # Pure DB job, but it scans the full ~448K Hennepin parcel roll to build
+    # the address index, so give generous headroom.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Hennepin foreclosure enrichment
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (config may require these even though unused here) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: this is a standalone DB job, not a scraper, so
+          #     no scraper needs to be enabled. All left false. ---
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        run: |
+          echo "=== Hennepin foreclosure enrichment (internal address join) ==="
+          python -m scripts.run_hennepin_foreclosure_enrichment github_actions
