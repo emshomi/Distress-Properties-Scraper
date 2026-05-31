@@ -1,0 +1,69 @@
+name: Ramsey Tax Scraper
+# Manual + monthly. Ramsey's attributed parcel data (owner, value, special
+# assessments) refreshes slowly — monthly is plenty, and a daily poll of 163K
+# parcels would be wasteful. Two ORDERED steps in one job:
+#   1. ramsey_parcels   — streaming reload of the ~163K parcel spine
+#   2. ramsey_tax_roll  — mine that spine for special-assessment-burden events
+# Order matters: the miner reads the parcels the loader just refreshed, so they
+# run sequentially in the SAME job (a guaranteed order, not a timing guess).
+on:
+  workflow_dispatch:
+  schedule:
+    # 1st of the month, 13:30 UTC = 7:30am Central (standard) / 8:30am (DST).
+    # Offset from the daily sheriff jobs (12:00-12:20 UTC) so nothing overlaps.
+    - cron: '30 13 1 * *'
+jobs:
+  scrape:
+    name: Run Ramsey parcels + tax-roll
+    runs-on: ubuntu-latest
+    # Pure httpx + DB mining, no Playwright. But the parcels load streams ~163K
+    # records and the tax-roll scans all of them, so give generous headroom.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Ramsey parcels (spine) then tax-roll (signal)
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable ONLY the two Ramsey tax jobs ---
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'true'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'true'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        run: |
+          echo "=== Step 1/2: refresh Ramsey parcel spine ==="
+          python -m scripts.run_ramsey_parcels github_actions
+          echo "=== Step 2/2: mine special-assessment burdens ==="
+          python -m scripts.run_ramsey_tax_roll github_actions
