@@ -92,14 +92,26 @@ router = APIRouter(tags=["properties"])
 
 
 def _extract_anoka(raw: dict, row: dict) -> dict[str, Any]:
-    """anoka_sheriff (today's scraper) — {list, detail} shape."""
+    """anoka_sheriff — {list, detail} shape. Enriched (2026-05-31) with
+    owner / market value / homestead / absentee from Anoka's attributed
+    parcel layer via a verified PIN2 join. Those gis_* fields are present
+    only on rows whose tax_parcel_no matched a parcel (~66%); the rest stay
+    null and render as em-dash. We prefer the assessor owner-of-record
+    (gis_owner) over the notice mortgagor when available."""
     list_ = raw.get("list") or {}
     detail = raw.get("detail") or {}
+
+    gis_market = detail.get("gis_market_value")
+    try:
+        market_value = float(gis_market) if gis_market is not None else None
+    except (TypeError, ValueError):
+        market_value = None
+
     return {
         "address": list_.get("address") or detail.get("detail_address"),
         "city": list_.get("city"),
         "zip": list_.get("zip"),
-        "owner": detail.get("owner_name"),
+        "owner": detail.get("gis_owner") or detail.get("owner_name"),
         "sale_date": list_.get("scheduled_date") or row.get("event_date"),
         "sale_time": detail.get("sale_time"),
         "amount": row.get("event_value"),
@@ -111,10 +123,15 @@ def _extract_anoka(raw: dict, row: dict) -> dict[str, Any]:
         "lng": None,
         "neighborhood": None,
         "registered_date": None,
-        "market_value": None,
+        "market_value": market_value,
         "earliest_delq_year": None,
         "dwelling_type": None,
         "ward": None,
+        # Generic enrichment fields (any foreclosure source MAY populate;
+        # Anoka does now, Hennepin/Dakota can later).
+        "owner_mailing": detail.get("gis_owner_mailing"),
+        "is_absentee": detail.get("gis_is_absentee"),
+        "homestead": detail.get("gis_homestead"),
     }
 
 
