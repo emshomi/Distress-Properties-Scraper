@@ -31,6 +31,7 @@ from src.scrapers.hennepin_parcels import HennepinParcelsScraper
 from src.scrapers.hennepin_sheriff import HennepinSheriffScraper
 from src.scrapers.hennepin_tax_roll import HennepinTaxRollScraper
 from src.scrapers.mcro_probate import McroProbateScraper
+from src.scrapers.ramsey_parcels import RamseyParcelsScraper
 from src.scrapers.mpls_311 import MplsThreeOneOneScraper
 from src.scrapers.mpls_vbr import MplsVacantBuildingScraper
 from src.scrapers.ramsey_sheriff import RamseySheriffScraper
