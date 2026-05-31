@@ -124,9 +124,12 @@ def _extract_dakota(raw: dict, row: dict) -> dict[str, Any]:
         "address": attrs.get("GeoAddress"),
         "city": attrs.get("GeoCity") or attrs.get("CITYNAME"),
         "zip": None,
-        # Dakota's feed doesn't include the mortgagor name — the
-        # GIS service only exposes address, sale amount, and date.
-        "owner": None,
+        # Dakota's GIS feed has a Mortgagor field but populates it
+        # inconsistently (often blank; the service also mislabels some
+        # fields). Surface it where present, em-dash where blank. This
+        # auto-improves as Dakota fills the field in on future scrapes —
+        # the scraper already captures it into raw_data on every run.
+        "owner": (attrs.get("Mortgagor") or "").strip() or None,
         "sale_date": row.get("event_date"),
         "sale_time": None,
         "amount": attrs.get("SaleAmount") or row.get("event_value"),
