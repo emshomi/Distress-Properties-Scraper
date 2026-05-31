@@ -80,6 +80,11 @@ _OWNER_FIELD = "OWNER_NM"
 _MKT_VAL_FIELD = "MKT_VAL_TOT"
 _MUNIC_FIELD = "MUNIC_NM"
 
+# Stable event_date for forfeit rows (no date in the parcel data). The dedup
+# key includes event_date, so this MUST be constant across runs or re-mining
+# would insert duplicates every time. A fixed sentinel guarantees idempotency.
+_FORFEIT_SENTINEL_DATE = date(2000, 1, 1)
+
 # Read paging. We pull the union of (forfeited OR has delinquency year),
 # which is ~4,251 of 448K — small, but page defensively.
 _READ_PAGE_SIZE = 1000
