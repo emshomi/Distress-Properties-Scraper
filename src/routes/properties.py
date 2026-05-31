@@ -717,7 +717,7 @@ def _apply_category_filter(query: Any, category: str) -> Any:
 async def list_properties(
     category: Optional[str] = Query(
         default=None,
-        pattern="^(foreclosure|tax_forfeit|vacant|tax_delinquent)$",
+        pattern="^(foreclosure|tax_forfeit|vacant|tax_delinquent|tax_assessment)$",
         description=(
             "Restrict to one signal category. The frontend table "
             "renders different columns per category."
