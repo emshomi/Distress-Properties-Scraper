@@ -35,6 +35,7 @@ from src.scrapers.ramsey_parcels import RamseyParcelsScraper
 from src.scrapers.mpls_311 import MplsThreeOneOneScraper
 from src.scrapers.mpls_vbr import MplsVacantBuildingScraper
 from src.scrapers.ramsey_sheriff import RamseySheriffScraper
+from src.scrapers.ramsey_tax_roll import RamseyTaxRollScraper
 from src.scrapers.saint_paul_vacant import SaintPaulVacantBuildingScraper
 from src.scrapers.tax_forfeit import TaxForfeitScraper
 from src.scrapers.usps_vacancy import UspsVacancyScraper
