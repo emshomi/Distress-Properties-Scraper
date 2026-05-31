@@ -53,8 +53,8 @@ DistressEventType = Literal[
     "usps_vacancy",
     "tax_forfeit",
     "tax_delinquent",
+    "tax_assessment",
 ]
-
 DistressSeverity = Literal["low", "medium", "high", "critical"]
 
 
