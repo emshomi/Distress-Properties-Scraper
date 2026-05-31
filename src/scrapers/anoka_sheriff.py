@@ -374,12 +374,85 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 httpx_cookies, all_rows
             )
 
+        # 4. Parcel enrichment (owner / market value / homestead / absentee).
+        #    The sheriff notices give us tax_parcel_no but no owner-of-record,
+        #    market value, or homestead status. Anoka's attributed parcel layer
+        #    carries those and exposes the SAME dashed PIN in its PIN2 field, so
+        #    we join exactly (verified 2026-05-31). This is a SOFT step: any
+        #    failure leaves rows un-enriched but never breaks the sheriff data,
+        #    which is the core product. It runs OUTSIDE the httpx block above
+        #    because the enrichment helper opens its own client against the
+        #    (different, non-bot-resistant) county GIS server.
+        await self._enrich_rows_with_parcel_data(all_rows)
+
         logger.info(
             "Anoka fetch complete",
             source=self.source_name,
             total_rows=len(all_rows),
         )
         return all_rows
+
+    # ---- Parcel-data enrichment (owner / value / homestead via PIN2) ----
+
+    async def _enrich_rows_with_parcel_data(
+        self, all_rows: list[dict[str, Any]]
+    ) -> None:
+        """Attach owner / market value / homestead / absentee to each row by
+        matching the sheriff's tax_parcel_no against the Anoka parcel layer's
+        PIN2 field. Mutates rows in place, adding gis_* keys where matched.
+
+        Soft-fail by construction: fetch_parcel_enrichment never raises, and a
+        row with no tax_parcel_no (or no match) simply gets no gis_* fields.
+        """
+        # Local import keeps the dependency contained to this optional step.
+        from src.scrapers.anoka_parcel_enrichment import (
+            fetch_parcel_enrichment,
+            _norm as _norm_pin,
+        )
+
+        # Collect the parcel numbers we actually have.
+        pins = [
+            r.get("tax_parcel_no")
+            for r in all_rows
+            if r.get("tax_parcel_no")
+        ]
+        if not pins:
+            logger.info(
+                "Anoka enrichment skipped (no tax_parcel_no on any row)",
+                source=self.source_name,
+            )
+            return
+
+        try:
+            enrichment = await fetch_parcel_enrichment(pins)
+        except Exception as e:
+            # Defense in depth — the helper already soft-fails, but never let
+            # an unexpected error here kill the (already-fetched) sheriff data.
+            logger.warning(
+                "Anoka parcel enrichment raised; continuing un-enriched",
+                source=self.source_name,
+                error_type=type(e).__name__,
+                error_repr=repr(e),
+            )
+            return
+
+        matched = 0
+        for r in all_rows:
+            tp = r.get("tax_parcel_no")
+            if not tp:
+                continue
+            data = enrichment.get(_norm_pin(tp))
+            if not data:
+                continue
+            r.update(data)  # adds gis_owner, gis_market_value, etc.
+            matched += 1
+
+        logger.info(
+            "Anoka parcel enrichment applied",
+            source=self.source_name,
+            rows_with_pin=len(pins),
+            rows_matched=matched,
+        )
 
     # ---- httpx detail-page enrichment ----
 
@@ -991,6 +1064,16 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         "amount_due": r.get("amount_due"),
                         "original_principal": r.get("original_principal"),
                         "status": r.get("status"),
+                        # Parcel-layer enrichment (present only on rows whose
+                        # tax_parcel_no matched Anoka's PIN2; null otherwise).
+                        # gis_owner is the assessor owner-of-record, which is
+                        # usually cleaner/fuller than the notice's owner_name.
+                        "gis_owner": r.get("gis_owner"),
+                        "gis_owner_mailing": r.get("gis_owner_mailing"),
+                        "gis_is_absentee": r.get("gis_is_absentee"),
+                        "gis_market_value": r.get("gis_market_value"),
+                        "gis_homestead": r.get("gis_homestead"),
+                        "gis_site_address": r.get("gis_site_address"),
                     },
                     "_source": self.source_name,
                 },
