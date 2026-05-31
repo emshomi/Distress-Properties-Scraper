@@ -58,8 +58,10 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "hennepin_tax_roll", "event_type": "tax_delinquent"},
         {"source": "ramsey_tax_roll", "event_type": "tax_delinquent"},
     ],
+    "tax_assessment": [
+        {"source": "ramsey_tax_roll", "event_type": "tax_assessment"},
+    ],
 }
-
 _SOURCE_TO_COUNTY: dict[str, str] = {
     "anoka_sheriff": "Anoka",
     "dakota_sheriff": "Dakota",
