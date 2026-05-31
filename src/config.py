@@ -102,6 +102,7 @@ class Settings(BaseSettings):
     scraper_hennepin_parcels_enabled: bool = Field(default=True)
     scraper_dakota_sheriff_enabled: bool = Field(default=True)
     scraper_ramsey_parcels_enabled: bool = Field(default=True)
+    scraper_ramsey_tax_roll_enabled: bool = Field(default=True)
     scraper_anoka_sheriff_enabled: bool = Field(default=True)
     scraper_ramsey_sheriff_enabled: bool = Field(default=True)
     scraper_mpls_vbr_enabled: bool = Field(default=True)
