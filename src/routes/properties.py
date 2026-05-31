@@ -299,6 +299,8 @@ def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
         "status": (
             "Tax-forfeited"
             if row.get("event_type") == "tax_forfeit"
+            else "Special assessment"
+            if row.get("event_type") == "tax_assessment"
             else "Tax-delinquent"
         ),
         "tax_parcel_no": row.get("parcel_id"),
