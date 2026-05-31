@@ -149,33 +149,37 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
 
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         """
-        Page through Hennepin parcels that are either forfeited
-        (FORFEIT_LAND_IND='T') OR have a delinquency year (EARLIEST_DELQ_YR).
+        Cursor-paginate Hennepin parcels that are forfeited OR delinquent.
 
-        PostgREST .or_() with JSON-path keys: a parcel qualifies if the
-        forfeit flag is 'T' OR the delinquency-year field is present.
-        We then classify precisely in parse().
+        We page by parcel_id cursor (WHERE parcel_id > last_seen) rather than
+        offset .range(), because the matching parcels are sparse (~4,251 of
+        448K) and offset pagination re-scans from the top every page, which
+        blows past the DB statement timeout. Cursor pagination never re-scans,
+        so each page picks up where the last ended.
+
+        Relies on partial expression indexes on
+        (raw_data->>'FORFEIT_LAND_IND') and (raw_data->>'EARLIEST_DELQ_YR')
+        for Hennepin parcels to keep the OR filter cheap (see migration).
         """
         all_rows: list[dict[str, Any]] = []
 
         # OR filter: forfeit flag == 'T'  OR  delinquency-year is not null.
-        # (PostgREST 'not.is.null' tests presence.)
         or_filter = (
             f"raw_data->>{_FORFEIT_FIELD}.eq.{_FORFEIT_TRUE},"
             f"raw_data->>{_DELQ_YR_FIELD}.not.is.null"
         )
 
+        last_parcel_id = ""  # cursor; parcel_ids sort lexicographically
         for page in range(_MAX_PAGES):
-            start = page * _READ_PAGE_SIZE
-            end = start + _READ_PAGE_SIZE - 1
             try:
                 resp = (
                     core_table("parcels")
                     .select("parcel_id, county_code, address, city, raw_data")
                     .eq("county_code", self.county_code)
                     .or_(or_filter)
+                    .gt("parcel_id", last_parcel_id)
                     .order("parcel_id")
-                    .range(start, end)
+                    .limit(_READ_PAGE_SIZE)
                     .execute()
                 )
             except Exception as e:
@@ -183,11 +187,15 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     f"Reading core.parcels for tax-roll mining failed: "
                     f"{type(e).__name__}: {e}",
                     source=self.source_name,
-                    context={"page": page, "start": start},
+                    context={"page": page, "cursor": last_parcel_id},
                 ) from e
 
             rows = resp.data or []
+            if not rows:
+                break
+
             all_rows.extend(rows)
+            last_parcel_id = rows[-1]["parcel_id"]  # advance cursor
 
             logger.info(
                 "Hennepin tax-roll parcels page read",
@@ -195,6 +203,7 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 page=page + 1,
                 rows=len(rows),
                 cumulative=len(all_rows),
+                cursor=last_parcel_id,
             )
 
             if len(rows) < _READ_PAGE_SIZE:
