@@ -174,6 +174,7 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     .select("parcel_id, county_code, address, city, raw_data")
                     .eq("county_code", self.county_code)
                     .or_(or_filter)
+                    .order("parcel_id")
                     .range(start, end)
                     .execute()
                 )
