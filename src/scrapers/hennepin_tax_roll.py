@@ -238,7 +238,10 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     parcel_id=parcel_id,
                     event_type="tax_forfeit",
                     event_subtype="state_forfeited_land",
-                    event_date=today,
+                    # Stable sentinel — forfeiture has no date in parcel data,
+                    # and event_date is part of the dedup key, so it must be
+                    # constant across runs for re-mining to be idempotent.
+                    event_date=_FORFEIT_SENTINEL_DATE,
                     event_value=market_value,
                     source=self.source_name,
                     source_id=parcel_id,
