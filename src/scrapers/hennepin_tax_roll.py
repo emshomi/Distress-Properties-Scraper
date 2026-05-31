@@ -79,6 +79,20 @@ _DELQ_YR_FIELD = "EARLIEST_DELQ_YR"
 _OWNER_FIELD = "OWNER_NM"
 _MKT_VAL_FIELD = "MKT_VAL_TOT"
 _MUNIC_FIELD = "MUNIC_NM"
+_HOUSE_NO_FIELD = "HOUSE_NO"
+_STREET_FIELD = "STREET_NM"
+_ZIP_FIELD = "ZIP_CD"
+_TAX_TOT_FIELD = "TAX_TOT"
+# Owner mailing address lines (verified): TAXPAYER_NM_1 = street,
+# TAXPAYER_NM_2 = "CITY ST ZIP". TAXPAYER_NM is the taxpayer name.
+_MAIL_LINE1_FIELD = "TAXPAYER_NM_1"
+_MAIL_LINE2_FIELD = "TAXPAYER_NM_2"
+_TAXPAYER_NAME_FIELD = "TAXPAYER_NM"
+
+# Hennepin uses this literal when a parcel has no assigned street address
+# (common for vacant forfeited land). We surface it honestly rather than
+# pretending there's an address.
+_ADDR_UNASSIGNED = "ADDRESS UNASSIGNED"
 
 # Stable event_date for forfeit rows (no date in the parcel data). The dedup
 # key includes event_date, so this MUST be constant across runs or re-mining
@@ -136,6 +150,42 @@ def _expand_delq_year(raw_yr: str | None) -> int | None:
     if not digits.isdigit():
         return None
     return 2000 + int(digits)
+
+
+def _compose_property_address(raw: dict[str, Any]) -> str | None:
+    """Build the property street address from HOUSE_NO + STREET_NM.
+
+    Returns None when the street is genuinely unassigned (vacant land) so the
+    display can show an honest "Address unassigned" rather than a fake address.
+    """
+    street = _safe_str(raw.get(_STREET_FIELD))
+    if street is None or street.upper() == _ADDR_UNASSIGNED:
+        return None
+    house_no = _safe_str(raw.get(_HOUSE_NO_FIELD))
+    return f"{house_no} {street}".strip() if house_no else street
+
+
+def _compose_owner_mailing(raw: dict[str, Any]) -> str | None:
+    """Join the owner's mailing address lines (TAXPAYER_NM_1 + _2)."""
+    line1 = _safe_str(raw.get(_MAIL_LINE1_FIELD))
+    line2 = _safe_str(raw.get(_MAIL_LINE2_FIELD))
+    parts = [p for p in (line1, line2) if p]
+    return ", ".join(parts) if parts else None
+
+
+def _is_absentee(property_addr: str | None, mailing_line1: str | None) -> bool:
+    """Absentee owner = mailing street differs from the property street.
+
+    A strong motivated-seller signal. We compare the property street line to
+    the mailing street line (TAXPAYER_NM_1). Conservative: only True when we
+    have both and they clearly differ.
+    """
+    if not property_addr or not mailing_line1:
+        return False
+    # Normalize: uppercase, collapse whitespace.
+    p = " ".join(property_addr.upper().split())
+    m = " ".join(mailing_line1.upper().split())
+    return p != m
 
 
 class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
@@ -270,6 +320,21 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             market_value = _safe_decimal(raw.get(_MKT_VAL_FIELD))
             mv_str = str(market_value) if market_value is not None else "0"
 
+            # --- Enrichment: property identification + owner contact ---
+            # Prefer the row's own address column; fall back to composing it
+            # from the parcel raw_data (HOUSE_NO + STREET_NM).
+            prop_addr = (
+                _safe_str(row.get("address"))
+                or _compose_property_address(raw)
+            )
+            prop_zip = _safe_str(raw.get(_ZIP_FIELD))
+            if prop_zip in ("00000", "0"):
+                prop_zip = None  # Hennepin uses 00000 for "no zip"
+            annual_tax = _safe_decimal(raw.get(_TAX_TOT_FIELD))
+            tax_tot_str = str(annual_tax) if annual_tax is not None else None
+            owner_mailing = _compose_owner_mailing(raw)
+            absentee = _is_absentee(prop_addr, _safe_str(raw.get(_MAIL_LINE1_FIELD)))
+
             forfeit_flag = _safe_str(raw.get(_FORFEIT_FIELD))
             delq_raw = _safe_str(raw.get(_DELQ_YR_FIELD))
 
@@ -293,6 +358,16 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         "owner_name": owner_name or "HENNEPIN FORFEITED LAND",
                         "market_value": mv_str,
                         "municipality": municipality,
+                        # Property identification.
+                        "property_address": prop_addr,
+                        "property_city": municipality,
+                        "property_zip": prop_zip,
+                        # For forfeited land the "owner" is the State; the
+                        # action path is the county auction, not contacting an
+                        # owner. Mailing/absentee are not meaningful here.
+                        "owner_mailing": None,
+                        "is_absentee": False,
+                        "annual_tax": tax_tot_str,
                         "_derived_from": "hennepin_parcels.raw_data",
                         "forfeit_land_ind": _FORFEIT_TRUE,
                     },
@@ -345,6 +420,14 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         "owner_name": owner_name,
                         "market_value": mv_str,
                         "municipality": municipality,
+                        # Property identification.
+                        "property_address": prop_addr,
+                        "property_city": municipality,
+                        "property_zip": prop_zip,
+                        # Owner contact (mailing address) + absentee signal.
+                        "owner_mailing": owner_mailing,
+                        "is_absentee": absentee,
+                        "annual_tax": tax_tot_str,
                         "_derived_from": "hennepin_parcels.raw_data",
                         "earliest_delq_year": delq_year,
                         "earliest_delq_yr_raw": delq_raw,
