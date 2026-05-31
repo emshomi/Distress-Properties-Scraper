@@ -262,9 +262,10 @@ def _extract_saint_paul_vacant(raw: dict, row: dict) -> dict[str, Any]:
 
 
 def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
-    """hennepin_tax_roll — mined from parcels; no street address (only
-    municipality + owner). Tax delinquent vs forfeit distinguished by
-    event_type, not source."""
+    """hennepin_tax_roll — mined from core.parcels. Now enriched with
+    property address, owner name, owner mailing address, absentee flag,
+    real market value, and annual tax. Tax delinquent vs forfeit is
+    distinguished by event_type."""
     market_raw = raw.get("market_value")
     market_value: Optional[float]
     try:
@@ -272,15 +273,26 @@ def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
     except (TypeError, ValueError):
         market_value = None
 
+    tax_raw = raw.get("annual_tax")
+    annual_tax: Optional[float]
+    try:
+        annual_tax = float(tax_raw) if tax_raw is not None else None
+    except (TypeError, ValueError):
+        annual_tax = None
+
+    # Property address: the miner composes it from HOUSE_NO + STREET_NM and
+    # leaves it null for genuinely unassigned (vacant) parcels.
+    prop_addr = raw.get("property_address")
+
     return {
-        "address": None,
-        "city": raw.get("municipality"),
-        "zip": None,
+        "address": prop_addr,
+        "city": raw.get("property_city") or raw.get("municipality"),
+        "zip": raw.get("property_zip"),
         "owner": raw.get("owner_name"),
         "sale_date": None,
         "sale_time": None,
-        # event_value on tax rows is the market value — we surface it
-        # as amount as well so the frontend can show one column.
+        # event_value on tax rows is the market value — surfaced as amount
+        # so a single column can show it.
         "amount": market_value if market_value is not None else row.get("event_value"),
         "status": (
             "Tax-forfeited"
@@ -298,6 +310,10 @@ def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
         "earliest_delq_year": raw.get("earliest_delq_year"),
         "dwelling_type": None,
         "ward": None,
+        # --- Enriched tax-roll fields (property identification + owner) ---
+        "owner_mailing": raw.get("owner_mailing"),
+        "is_absentee": raw.get("is_absentee"),
+        "annual_tax": annual_tax,
     }
 
 def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
