@@ -34,7 +34,6 @@ from src.scrapers.mcro_probate import McroProbateScraper
 from src.scrapers.ramsey_parcels import RamseyParcelsScraper
 from src.scrapers.mpls_311 import MplsThreeOneOneScraper
 from src.scrapers.mpls_vbr import MplsVacantBuildingScraper
-from src.scrapers.ramsey_sheriff import RamseySheriffScraper
 from src.scrapers.ramsey_tax_roll import RamseyTaxRollScraper
 from src.scrapers.saint_paul_vacant import SaintPaulVacantBuildingScraper
 from src.scrapers.tax_forfeit import TaxForfeitScraper
@@ -58,7 +57,6 @@ _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "hennepin_tax_roll": HennepinTaxRollScraper,
     "dakota_sheriff": DakotaSheriffScraper,
     "anoka_sheriff": AnokaSheriffScraper,
-    "ramsey_sheriff": RamseySheriffScraper,
     "ramsey_parcels": RamseyParcelsScraper,
     "ramsey_tax_roll": RamseyTaxRollScraper,
     "mpls_vbr": MplsVacantBuildingScraper,
