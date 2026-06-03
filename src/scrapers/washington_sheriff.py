@@ -528,7 +528,7 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
 
             signals.append(DistressEventInsert(
                 parcel_id=parcel_id,
-                event_type="foreclosure",
+                event_type="sheriff_sale",
                 event_subtype=event_subtype,
                 event_date=sale_date,
                 event_value=sale_amount,
