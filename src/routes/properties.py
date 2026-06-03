@@ -136,40 +136,51 @@ def _extract_anoka(raw: dict, row: dict) -> dict[str, Any]:
 
 
 def _extract_dakota(raw: dict, row: dict) -> dict[str, Any]:
-    """dakota_sheriff — ArcGIS feature service shape: attributes + geometry."""
+    """dakota_sheriff — ArcGIS feature service shape: attributes + geometry.
+    Enriched (2026-06) with owner / market value / mailing / homestead from
+    Dakota's Tax Parcels layer (71) via a unique suffix-normalized address
+    match. Those gis_* fields live under raw_data.detail (same keys as Anoka /
+    Hennepin) and are present only on rows that matched exactly one parcel;
+    the rest stay null and render as em-dash. We prefer the assessor
+    owner-of-record (gis_owner) over the inconsistent GIS Mortgagor field."""
     attrs = raw.get("attributes") or {}
     geom = raw.get("geometry") or {}
+    detail = raw.get("detail") or {}
+
+    gis_market = detail.get("gis_market_value")
+    try:
+        market_value = float(gis_market) if gis_market is not None else None
+    except (TypeError, ValueError):
+        market_value = None
+
     return {
         "address": attrs.get("GeoAddress"),
         "city": attrs.get("GeoCity") or attrs.get("CITYNAME"),
         "zip": None,
-        # Dakota's GIS feed has a Mortgagor field but populates it
-        # inconsistently (often blank; the service also mislabels some
-        # fields). Surface it where present, em-dash where blank. This
-        # auto-improves as Dakota fills the field in on future scrapes —
-        # the scraper already captures it into raw_data on every run.
-        "owner": (attrs.get("Mortgagor") or "").strip() or None,
+        # Prefer the assessor owner-of-record (gis_owner) from enrichment;
+        # fall back to Dakota's inconsistently-populated Mortgagor field.
+        "owner": detail.get("gis_owner") or (attrs.get("Mortgagor") or "").strip() or None,
         "sale_date": row.get("event_date"),
         "sale_time": None,
         "amount": attrs.get("SaleAmount") or row.get("event_value"),
         # Dakota records are completed sales (already happened).
         "status": "Sold",
-        "tax_parcel_no": None,
+        "tax_parcel_no": detail.get("gis_pid"),
         "original_principal": None,
         "municipality": attrs.get("GeoCity"),
         "lat": geom.get("y"),
         "lng": geom.get("x"),
         "neighborhood": None,
         "registered_date": None,
-        "market_value": None,
+        "market_value": market_value,
         "earliest_delq_year": None,
         "dwelling_type": None,
         "ward": None,
-        # Generic foreclosure enrichment fields — null until Dakota
-        # enrichment is wired; keeps the foreclosure row shape uniform.
-        "owner_mailing": None,
-        "is_absentee": None,
-        "homestead": None,
+        # Generic foreclosure enrichment fields — populated by the Dakota
+        # foreclosure enrichment job; null (em-dash) on unmatched rows.
+        "owner_mailing": detail.get("gis_owner_mailing"),
+        "is_absentee": detail.get("gis_is_absentee"),
+        "homestead": detail.get("gis_homestead"),
     }
 
 
