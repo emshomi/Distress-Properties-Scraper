@@ -533,6 +533,21 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
     """Compute redemption_ends_at / days_left / redemption_state for a row.
 
     Returns all-null fields for non-foreclosure sources.
+
+    Two date sources, in priority order:
+      1. A county-published redemption date (Hennepin / Ramsey expose
+         redemptionExpirationDate). Authoritative — used as-is.
+      2. Otherwise, estimate sale_date + ~6 months (Anoka / Dakota and any
+         other sheriff source without a published date), tagged is_estimated.
+
+    PENDING-SALE GUARD: the estimate is only meaningful once the sale has
+    actually happened. Anoka publishes PENDING (future-dated) sales, so its
+    event_date is a *scheduled* sale, not a completed one — sale_date + 182d
+    would invent a redemption window for a sale that hasn't occurred. When the
+    effective sale date is in the future, there is no running redemption clock,
+    so we return all-null (renders as em-dash) rather than a fabricated window.
+    The published-date path is exempt: if a county published an exact date, we
+    trust it regardless.
     """
     null_result = {
         "redemption_ends_at": None,
@@ -546,15 +561,15 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
     ends_at: Optional[_date] = None
     is_estimated = False
 
-    # Hennepin: read the server-computed exact date.
+    # 1. County-published exact date (Hennepin / Ramsey). Authoritative.
     published = raw.get("redemptionExpirationDate")
     ends_at = _coerce_date(published)
 
-    # Anoka / Dakota (and any future sheriff source without a published
-    # date): estimate sale_date + 6 months.
+    # 2. Estimate from the sale date — but ONLY for sales that have actually
+    #    happened. A future (pending) sale has no redemption window yet.
     if ends_at is None:
         sale_date = _coerce_date(row.get("event_date"))
-        if sale_date is not None:
+        if sale_date is not None and sale_date <= _date.today():
             ends_at = sale_date + _timedelta(days=_REDEMPTION_DEFAULT_DAYS)
             is_estimated = True
 
@@ -575,7 +590,6 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
         "redemption_state": state,
         "redemption_is_estimated": is_estimated,
     }
-
 
 
 def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
