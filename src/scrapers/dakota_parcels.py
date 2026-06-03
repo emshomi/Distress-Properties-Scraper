@@ -47,6 +47,17 @@ Identical approach to ramsey_parcels / hennepin_parcels: override run() to strea
 fetch-page -> parse-page -> write-page -> discard, so we never hold the whole
 dataset in memory and each page is persisted as it is written.
 
+=== PAYLOAD NOTE (why no geometry, trimmed fields) ===
+Layer 71 is a POLYGON layer with 70+ fields (incl. a 2000-char Legal field).
+A query of returnGeometry=true + outFields=* + a large page failed server-side
+with "Error performing query operation" — the per-record payload (all fields +
+full parcel polygons) was too heavy to assemble. The enrichment join needs only
+owner / mailing / value / homestead / address, and needs NO geometry, so we
+request geometry=false and an explicit trimmed field list. This makes each
+record tiny and the query reliable. Consequence: parcels load with lat/lng=None
+(the geometry parse below is now inert but harmless). Map coordinates for Dakota,
+if ever wanted, are a separate future task.
+
 What it writes:
   - core.parcels rows + raw_data JSONB (all attributes preserved for mining)
 What it does NOT write:
@@ -176,10 +187,19 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     feature_service_url: ClassVar[str] = _FEATURE_SERVICE_URL
 
     where_clause: ClassVar[str] = "1=1"
-    # Reproject to WGS84 (base sends outSR=4326) so geometry.y/x give lat/lng.
-    return_geometry: ClassVar[bool] = True
-    page_size: ClassVar[int] = 10000   # layer 71 MaxRecordCount is 10000
-    max_pages: ClassVar[int] = 30      # ~150K parcels -> ~15 pages; headroom
+    # Explicit trimmed field list — only what enrichment needs. Avoids the
+    # outFields=* payload that (with geometry) overwhelmed the server. Every
+    # name here is verified present in the layer-71 schema.
+    out_fields: ClassVar[str] = (  # CHANGED (added; was inherited "*")
+        "PIN,SITEADDRESS,FULLNAME_PUBLIC,JOINT_OWNER_PUBLIC,"
+        "OWN_ADD_L1,OWN_ADD_L2,OWN_ADD_L3,TOTALVAL,HOMESTEAD,"
+        "MUNICIPALITY,YEAR_BUILT"
+    )
+    # Geometry OFF: the address join needs no coordinates, and polygon geometry
+    # was the main cause of the too-heavy payload. lat/lng will be None.
+    return_geometry: ClassVar[bool] = False   # CHANGED (was True)
+    page_size: ClassVar[int] = 2000   # CHANGED (was 10000); layer max is 10000
+    max_pages: ClassVar[int] = 90     # CHANGED (was 30); ~150K / 2000 = 75 pages + headroom
     progress_log_every: ClassVar[int] = 20000
 
     # ---- parse_feature: convert one ArcGIS feature into a parcel dict ----
@@ -198,11 +218,8 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         address = _safe_str(attributes.get("SITEADDRESS"))
         city = _title_case_city(_safe_str(attributes.get("MUNICIPALITY")))
 
-        # Geometry: prefer reprojected centroid (outSR=4326). Polygon features
-        # return rings, not a point; the base layer may not give a clean x/y.
-        # We only set lat/lng if a simple point-like geometry is present, and
-        # sanity-bound to Minnesota. (Address join doesn't need coordinates;
-        # this is best-effort for the map view later.)
+        # Geometry: with return_geometry=False this is always None now. Kept
+        # inert/harmless so re-enabling geometry later needs no code change.
         lat = None
         lng = None
         if geometry:
@@ -215,7 +232,8 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
         year_built = _safe_int(attributes.get("YEAR_BUILT"))
         # ParcelUpsert validates year_built as 1700..2100; null anything outside
-        # that range so one bad value can't fail the whole row.
+        # that range so one bad value can't fail the whole row. (Dakota has some
+        # 0 / null YEAR_BUILT values — those become None here.)
         if year_built is not None and not (1700 <= year_built <= 2100):
             year_built = None
 
