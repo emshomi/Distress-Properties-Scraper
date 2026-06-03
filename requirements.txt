@@ -28,6 +28,8 @@ lxml==5.3.0
 # ---- PDF parsing (Hennepin & Ramsey sheriff scrapers) ----
 pdfplumber==0.11.4
 pypdfium2==4.30.0
+# ---- Excel parsing (Washington sheriff monthly XLS files) ----
+openpyxl==3.1.5
 
 # ---- Browser automation fallback (Playwright) ----
 # Included for future scrapers that may need JS-rendered pages.
