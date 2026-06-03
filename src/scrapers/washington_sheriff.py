@@ -377,14 +377,21 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
 
     # ---- XLSX parsing: one monthly file → sale-row dicts ----
 
-    def _parse_xlsx(
+   def _parse_xlsx(
         self, content: bytes, year: int, month: int, label: str
     ) -> list[dict[str, Any]]:
         """Parse a monthly Report-of-Sheriff's-Sales workbook into row dicts.
 
-        Data starts at row 3 (rows 1-2 are banners/headers). We read by column
-        position (verified layout), tolerate the three instrument types, and
-        skip any row without a usable PID.
+        Washington's file layout is NOT consistent across months. Two known shapes:
+          * Some files put the data on the first sheet ("Sheet1") with the column
+            header on row 2 and data from row 3.
+          * Others carry an instructions sheet first ("Read for Information on
+            Content") and the real data on a SECOND sheet (with a stale tab name
+            like "January 31, 2017"), header on row 7, data from row 8.
+        Both share the same A-P column layout. So rather than hardcode a sheet
+        index and a start row, we DISCOVER the header: scan every sheet for the
+        row whose column A begins with "PID", then read data rows after it. This
+        is robust to both layouts and to future template tweaks.
         """
         # Local import: openpyxl is only needed by this scraper. Importing at
         # module top would make the whole scrapers package require it.
@@ -404,20 +411,52 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
             )
             return []
 
+        # Find the sheet + header row by locating column A == "PID...".
+        data_ws = None
+        header_row = None
         try:
-            ws = wb.worksheets[0]
-        except IndexError:
+            for ws in wb.worksheets:
+                # Only the first ~20 rows can plausibly hold the header banner.
+                for r, row in enumerate(
+                    ws.iter_rows(min_row=1, max_row=20, max_col=1, values_only=True),
+                    start=1,
+                ):
+                    a = row[0] if row else None
+                    if a is not None and str(a).strip().upper().startswith("PID"):
+                        data_ws = ws
+                        header_row = r
+                        break
+                if data_ws is not None:
+                    break
+        except Exception as e:
             logger.warning(
-                "Washington XLSX has no worksheets; skipping",
+                "Washington XLSX header scan failed; skipping month",
                 source=self.source_name,
                 label=label,
+                error_type=type(e).__name__,
             )
+            try:
+                wb.close()
+            except Exception:
+                pass
+            return []
+
+        if data_ws is None or header_row is None:
+            logger.warning(
+                "Washington XLSX: no PID header row found; skipping month",
+                source=self.source_name,
+                label=label,
+                sheets=wb.sheetnames,
+            )
+            try:
+                wb.close()
+            except Exception:
+                pass
             return []
 
         rows: list[dict[str, Any]] = []
-        # Column letters → 0-based index: A=0 … P=15.
-        # min_row=3 skips the two header rows.
-        for excel_row in ws.iter_rows(min_row=3, values_only=True):
+        # Data starts on the row AFTER the header. Columns A..P = index 0..15.
+        for excel_row in data_ws.iter_rows(min_row=header_row + 1, values_only=True):
             # Guard against short/empty rows.
             def col(i: int) -> Any:
                 return excel_row[i] if i < len(excel_row) else None
@@ -431,7 +470,7 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
             sale_date = _cell_date(col(3))     # D
             sale_amount = col(4)               # E (money string/number)
             purchaser = _safe_str(col(5))      # F
-            instrument_code = _safe_str(col(7))    # H (MTG/AL/IOD)
+            instrument_code = _safe_str(col(7))    # H (MTG/AL/IOD/CIC)
             instrument_desc = _safe_str(col(8))    # I (MORTGAGE/ASSESSMENT LIEN/...)
             mortgage_amount = col(9)               # J
             orig_lender = _safe_str(col(12))   # M (Grantee/Mortgagee/Orig Lender)
