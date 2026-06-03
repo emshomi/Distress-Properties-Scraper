@@ -27,8 +27,6 @@ _KNOWN_SCRAPERS: tuple[dict[str, str], ...] = (
      "schedule_hint": "Daily 06:00 CST", "signal_type": "code_violation"},
     {"name": "hennepin_sheriff", "display_name": "Hennepin County Sheriff Sales",
      "schedule_hint": "Daily 06:15 CST", "signal_type": "sheriff_sale"},
-    {"name": "ramsey_sheriff", "display_name": "Ramsey County Sheriff Sales",
-     "schedule_hint": "Daily 06:30 CST", "signal_type": "sheriff_sale"},
     {"name": "mpls_vbr", "display_name": "Minneapolis Vacant Building Registry",
      "schedule_hint": "Daily 07:00 CST", "signal_type": "vbr_listing"},
     {"name": "saint_paul_vacant", "display_name": "Saint Paul Vacant Buildings",
