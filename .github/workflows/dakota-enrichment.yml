@@ -1,0 +1,70 @@
+name: Dakota Parcels + Foreclosure Enrichment
+# Manual + monthly. Dakota's attributed Tax Parcels data (owner, market value,
+# homestead) refreshes slowly — monthly is plenty. Two ORDERED steps in one job:
+#   1. dakota_parcels                  — streaming load of the ~150K parcel spine
+#   2. dakota_foreclosure_enrichment   — address-join sheriff sales to parcels
+# Order matters: the enrichment reads the parcels the loader just refreshed, so
+# they run sequentially in the SAME job (guaranteed order, not a timing guess).
+on:
+  workflow_dispatch:
+  schedule:
+    # 2nd of the month, 14:00 UTC = 8:00am Central (standard) / 9:00am (DST).
+    # Offset from ramsey-tax (13:30) and the daily sheriff jobs (12:00-12:20 UTC)
+    # so nothing overlaps.
+    - cron: '0 14 2 * *'
+jobs:
+  scrape:
+    name: Run Dakota parcels + foreclosure enrichment
+    runs-on: ubuntu-latest
+    # Pure httpx + DB work, no Playwright. The parcel load streams ~150K records
+    # in ~15 pages of 10K; give generous headroom.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Dakota parcels (spine) then foreclosure enrichment (signal)
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable ONLY the Dakota parcels loader ---
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_PARCELS_ENABLED: 'true'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        run: |
+          echo "=== Step 1/2: load Dakota parcel spine (~150K) ==="
+          python -m scripts.run_dakota_parcels github_actions
+          echo "=== Step 2/2: enrich Dakota foreclosure rows by address join ==="
+          python -m scripts.run_dakota_foreclosure_enrichment github_actions
