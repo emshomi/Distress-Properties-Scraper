@@ -26,7 +26,6 @@ from src.scrapers.hennepin_sheriff import HennepinSheriffScraper
 from src.scrapers.mcro_probate import McroProbateScraper
 from src.scrapers.mpls_311 import MplsThreeOneOneScraper
 from src.scrapers.mpls_vbr import MplsVacantBuildingScraper
-from src.scrapers.ramsey_sheriff import RamseySheriffScraper
 from src.scrapers.saint_paul_vacant import SaintPaulVacantBuildingScraper
 from src.scrapers.tax_forfeit import TaxForfeitScraper
 from src.scrapers.usps_vacancy import UspsVacancyScraper
@@ -40,7 +39,6 @@ _SCRAPER_SCHEDULES: tuple[tuple[type[BaseScraper], dict[str, Any]], ...] = (
     # Daily scrapers, staggered 06:00–08:00 CST
     (MplsThreeOneOneScraper, {"hour": 6, "minute": 0}),
     (HennepinSheriffScraper, {"hour": 6, "minute": 15}),
-    (RamseySheriffScraper, {"hour": 6, "minute": 30}),
     (MplsVacantBuildingScraper, {"hour": 7, "minute": 0}),
     (SaintPaulVacantBuildingScraper, {"hour": 7, "minute": 15}),
     (McroProbateScraper, {"hour": 8, "minute": 0}),
