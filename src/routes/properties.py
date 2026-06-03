@@ -536,18 +536,20 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
 
     Two date sources, in priority order:
       1. A county-published redemption date (Hennepin / Ramsey expose
-         redemptionExpirationDate). Authoritative — used as-is.
-      2. Otherwise, estimate sale_date + ~6 months (Anoka / Dakota and any
-         other sheriff source without a published date), tagged is_estimated.
+         redemptionExpirationDate). Authoritative — used as-is, no guard.
+      2. Otherwise, estimate sale_date + ~6 months — but ONLY for sales that
+         have actually COMPLETED. A redemption clock only starts once the
+         sheriff sale happens; an upcoming or postponed sale has none.
 
-    PENDING-SALE GUARD: the estimate is only meaningful once the sale has
-    actually happened. Anoka publishes PENDING (future-dated) sales, so its
-    event_date is a *scheduled* sale, not a completed one — sale_date + 182d
-    would invent a redemption window for a sale that hasn't occurred. When the
-    effective sale date is in the future, there is no running redemption clock,
-    so we return all-null (renders as em-dash) rather than a fabricated window.
-    The published-date path is exempt: if a county published an exact date, we
-    trust it regardless.
+    COMPLETED-SALE GUARD (the estimate path only):
+      * Anoka publishes its PENDING sales list. Each row carries a status of
+        'Sold' (completed), 'Postponed' (rescheduled — did not happen), or
+        null (pending). Only 'Sold' has a redemption window; the rest get
+        all-null (em-dash), because estimating sale+182d for a sale that never
+        occurred invents data.
+      * Dakota's feed is completed sales by definition and carries no per-row
+        status, so it passes the guard and estimates as before.
+      * Hennepin/Ramsey never reach the estimate (they have a published date).
     """
     null_result = {
         "redemption_ends_at": None,
@@ -565,13 +567,27 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
     published = raw.get("redemptionExpirationDate")
     ends_at = _coerce_date(published)
 
-    # 2. Estimate from the sale date — but ONLY for sales that have actually
-    #    happened. A future (pending) sale has no redemption window yet.
+    # 2. Estimate from sale date — only for COMPLETED sales.
     if ends_at is None:
-        sale_date = _coerce_date(row.get("event_date"))
-        if sale_date is not None and sale_date <= _date.today():
-            ends_at = sale_date + _timedelta(days=_REDEMPTION_DEFAULT_DAYS)
-            is_estimated = True
+        # Determine whether this sale has actually happened. A status field
+        # (Anoka) that is anything other than 'Sold' means it has not — no
+        # redemption window. Sources without a per-row status (Dakota) are
+        # completed-sale feeds by definition and pass through.
+        detail = raw.get("detail") or {}
+        status_raw = detail.get("status")
+        sale_completed = True
+        if status_raw is not None:
+            sale_completed = str(status_raw).strip().lower() == "sold"
+        elif source == "anoka_sheriff":
+            # Anoka pulls a PENDING list; a null status means the sale has
+            # not been confirmed completed. No redemption window.
+            sale_completed = False
+
+        if sale_completed:
+            sale_date = _coerce_date(row.get("event_date"))
+            if sale_date is not None:
+                ends_at = sale_date + _timedelta(days=_REDEMPTION_DEFAULT_DAYS)
+                is_estimated = True
 
     if ends_at is None:
         return null_result
@@ -590,7 +606,6 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
         "redemption_state": state,
         "redemption_is_estimated": is_estimated,
     }
-
 
 def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
     """Dispatch to the right per-source extractor and merge common fields."""
