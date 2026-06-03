@@ -347,7 +347,14 @@ def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
     """hennepin_sheriff — clean JSON API. raw_data holds the full detail
     record at the top level (not nested under list/detail). Mortgagors are
     a list of {display} objects; redemptionExpirationDate is server-computed
-    by Hennepin so we surface it directly rather than recomputing it."""
+    by Hennepin so we surface it directly rather than recomputing it.
+
+    Enriched (2026-05-31) by the hennepin_foreclosure_enrichment job, which
+    matches each row's address to the Hennepin parcel roll in core.parcels and
+    writes owner / market value / mailing / homestead under raw_data.detail.gis_*
+    (same shape as Anoka). ~332 of 465 rows match uniquely; the rest stay blank
+    and render as em-dash. We prefer the assessor owner-of-record (gis_owner)
+    over the notice mortgagor when available."""
     mortgagors = raw.get("mortgagors") or []
     owner = None
     if isinstance(mortgagors, list):
@@ -358,11 +365,23 @@ def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
         ]
         owner = "; ".join(n for n in names if n) or None
 
+    # Enrichment lives under raw_data.detail.gis_* (written by the
+    # hennepin_foreclosure_enrichment job). Absent on unmatched rows.
+    detail = raw.get("detail") or {}
+
+    gis_market = detail.get("gis_market_value")
+    try:
+        market_value = float(gis_market) if gis_market is not None else None
+    except (TypeError, ValueError):
+        market_value = None
+
     return {
         "address": raw.get("address"),
         "city": raw.get("city"),
         "zip": None,
-        "owner": owner,
+        # Prefer the assessor owner-of-record where the enrichment matched;
+        # fall back to the foreclosure-notice mortgagor otherwise.
+        "owner": detail.get("gis_owner") or owner,
         "sale_date": raw.get("dateOfSale") or row.get("event_date"),
         "sale_time": None,
         "amount": raw.get("finalBidAmount") or row.get("event_value"),
@@ -377,15 +396,14 @@ def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
         "lng": None,
         "neighborhood": None,
         "registered_date": None,
-        "market_value": None,
+        "market_value": market_value,
         "earliest_delq_year": None,
         "dwelling_type": None,
         "ward": None,
-        # Generic foreclosure enrichment fields — null until Hennepin
-        # enrichment is wired; keeps the foreclosure row shape uniform.
-        "owner_mailing": None,
-        "is_absentee": None,
-        "homestead": None,
+        # Enrichment fields (populated on rows that matched a parcel).
+        "owner_mailing": detail.get("gis_owner_mailing"),
+        "is_absentee": detail.get("gis_is_absentee"),
+        "homestead": detail.get("gis_homestead"),
         # Hennepin publishes this; preserved for the redemption-window work.
         "redemption_ends_at": raw.get("redemptionExpirationDate"),
         "mortgagee": raw.get("mortgagee"),
