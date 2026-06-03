@@ -12,7 +12,6 @@ Eight scrapers feeding the platform's signal layer:
 |---|---|---|
 | `mpls_311` | Minneapolis 311 code violations | Daily 06:00 CST |
 | `hennepin_sheriff` | Hennepin County sheriff sales (PDF) | Daily 06:15 CST |
-| `ramsey_sheriff` | Ramsey County sheriff sales (PDF) | Daily 06:30 CST |
 | `mpls_vbr` | Minneapolis Vacant Building Registry + PVE | Daily 07:00 CST |
 | `saint_paul_vacant` | Saint Paul DSI vacant buildings | Daily 07:15 CST |
 | `mcro_probate` | MN Court Records Online probate filings | Daily 08:00 CST (disabled by default) |
