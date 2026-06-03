@@ -377,7 +377,7 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
 
     # ---- XLSX parsing: one monthly file → sale-row dicts ----
 
-   def _parse_xlsx(
+    def _parse_xlsx(
         self, content: bytes, year: int, month: int, label: str
     ) -> list[dict[str, Any]]:
         """Parse a monthly Report-of-Sheriff's-Sales workbook into row dicts.
