@@ -332,13 +332,50 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             written = len(result.data) if result.data else len(batch)
             return written, 0
         except Exception as e:
-            logger.warning(
-                "Batch upsert to core.parcels failed",
+            err = str(e)
+            # 57014 = Postgres "canceling statement due to statement timeout".
+            # The first upsert into the 150K-row table is the slowest (cold
+            # cache / index warmup) and can exceed the timeout. Retry the same
+            # rows in smaller sub-batches — each statement does less work and
+            # almost always clears. Only retry on timeout; other errors fail.
+            is_timeout = "57014" in err or "statement timeout" in err.lower()
+            if not is_timeout or len(batch) <= 100:
+                logger.warning(
+                    "Batch upsert to core.parcels failed",
+                    source=self.source_name,
+                    batch_size=len(batch),
+                    error=err[:500],
+                )
+                return 0, len(batch)
+
+            logger.info(
+                "Batch upsert timed out; retrying in smaller chunks",
                 source=self.source_name,
                 batch_size=len(batch),
-                error=str(e)[:500],
+                chunk_size=100,
             )
-            return 0, len(batch)
+            sub_written = 0
+            sub_failed = 0
+            for i in range(0, len(batch), 100):
+                chunk = batch[i : i + 100]
+                try:
+                    result = (
+                        core_table("parcels")
+                        .upsert(chunk, on_conflict="parcel_id")
+                        .execute()
+                    )
+                    sub_written += len(result.data) if result.data else len(chunk)
+                except Exception as e2:
+                    logger.warning(
+                        "Retry chunk upsert failed",
+                        source=self.source_name,
+                        chunk_size=len(chunk),
+                        error=str(e2)[:300],
+                    )
+                    sub_failed += len(chunk)
+            return sub_written, sub_failed
+
+        
 
     # ---- STREAMING run() override ----
 
