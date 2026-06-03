@@ -760,6 +760,84 @@ def _apply_category_filter(query: Any, category: str) -> Any:
     return query
 
 
+# ============================================================
+# COMPUTED SORTS (equity / redemption urgency)
+# ============================================================
+# These order on values that aren't plain DB columns, so they're applied in
+# Python after the rows are shaped (see list_properties). Both push rows that
+# can't be scored to the END regardless of asc/desc, so missing-data rows never
+# masquerade as the best or worst results — they're set aside, not hidden.
+
+def _equity_key(p: dict[str, Any]) -> float | None:
+    """Equity = market_value - amount_due. Returns None unless BOTH values are
+    present and numeric — a spread is only meaningful with both sides, so a row
+    missing either is unscoreable (sorts to the end) rather than faked as 0."""
+    mv = p.get("market_value")
+    amt = p.get("amount")
+    if mv is None or amt is None:
+        return None
+    try:
+        return float(mv) - float(amt)
+    except (TypeError, ValueError):
+        return None
+
+
+def _redemption_key(p: dict[str, Any]) -> int | None:
+    """Urgency key = days until redemption expires (smaller = more urgent).
+    Uses redemption_days_left, already computed per row. Returns None when
+    there's no redemption window (non-foreclosure / no date) so those sort to
+    the end."""
+    d = p.get("redemption_days_left")
+    if d is None:
+        return None
+    try:
+        return int(d)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sort_computed(
+    rows: list[dict[str, Any]], sort: str, descending: bool
+) -> list[dict[str, Any]]:
+    """Sort shaped rows by a computed key, always sending unscoreable rows
+    (key is None) to the end. `descending` applies only to the scored rows.
+
+    equity:              higher spread = better deal. Default view wants the
+                         biggest deals first, so 'desc' is the natural order.
+    redemption_urgency:  fewer days left = more urgent. 'asc' (soonest first)
+                         is the natural order; expired rows (negative days)
+                         would sort before in-redemption ones, so we also drop
+                         already-expired rows to the bottom of the scored set
+                         to keep 'act now' rows on top.
+    """
+    if sort == "equity":
+        keyed = [(_equity_key(p), p) for p in rows]
+        scored = [(k, p) for (k, p) in keyed if k is not None]
+        unscored = [p for (k, p) in keyed if k is None]
+        scored.sort(key=lambda kp: kp[0], reverse=descending)
+        return [p for (_k, p) in scored] + unscored
+
+    if sort == "redemption_urgency":
+        keyed = [(_redemption_key(p), p) for p in rows]
+        # Split: still-actionable (days >= 0) vs expired (days < 0) vs no-window.
+        actionable = [(k, p) for (k, p) in keyed if k is not None and k >= 0]
+        expired = [(k, p) for (k, p) in keyed if k is not None and k < 0]
+        no_window = [p for (k, p) in keyed if k is None]
+        # Soonest-expiring actionable rows first (ascending days-left). If the
+        # caller asked desc, reverse only the actionable ordering.
+        actionable.sort(key=lambda kp: kp[0], reverse=descending)
+        # Among expired, most-recently-expired first (closest to 0 = least
+        # stale), so if a user scrolls they see freshest expired next.
+        expired.sort(key=lambda kp: kp[0], reverse=True)
+        return (
+            [p for (_k, p) in actionable]
+            + [p for (_k, p) in expired]
+            + no_window
+        )
+
+    return rows
+
+
 @router.get(
     "/properties",
     status_code=http_status.HTTP_200_OK,
@@ -814,8 +892,15 @@ async def list_properties(
     ),
     sort: str = Query(
         default="event_date",
-        pattern="^(event_date|event_value|observed_at)$",
-        description="Sort field.",
+        pattern="^(event_date|event_value|observed_at|equity|redemption_urgency)$",
+        description=(
+            "Sort field. event_date/event_value/observed_at sort on real DB "
+            "columns (fast path). 'equity' (market value minus amount due, "
+            "biggest deal first) and 'redemption_urgency' (soonest redemption "
+            "deadline first) are computed per-row, so they take a Python-side "
+            "sort path that fetches all matching rows before paginating — fine "
+            "at this scale (hundreds of foreclosure rows)."
+        ),
     ),
     order: str = Query(
         default="asc",
@@ -923,6 +1008,42 @@ async def list_properties(
         if sale_date_to:
             query = query.lte("event_date", sale_date_to)
 
+        # --- Two sort paths ---
+        # Column sorts (event_date / event_value / observed_at) are real DB
+        # columns, so PostgREST sorts + paginates them server-side (fast).
+        #
+        # Computed sorts (equity, redemption_urgency) order on values that
+        # aren't plain columns — equity = market_value - amount_due (both
+        # nested in raw_data and one of them derived), and redemption urgency
+        # = the effective redemption date (published JSON date for Hennepin,
+        # estimated sale+182d otherwise). PostgREST can't ORDER BY those, so we
+        # fetch ALL matching rows, shape them (which computes those values),
+        # sort in Python, then slice the page. This is appropriate at our scale
+        # (foreclosure is a few hundred rows), not a workaround to feel bad
+        # about — sorting hundreds of dicts is instant.
+        computed_sorts = {"equity", "redemption_urgency"}
+
+        if sort in computed_sorts:
+            # Fetch all matching rows (generous cap), shape, sort, paginate.
+            _ALL_CAP = 2000
+            query = query.range(0, _ALL_CAP - 1)
+            result = query.execute()
+            rows = result.data or []
+            total = result.count or 0
+
+            shaped = [_shape_property_row(r) for r in rows]
+            descending = (order == "desc")
+            shaped = _sort_computed(shaped, sort, descending)
+
+            page = shaped[offset:offset + limit]
+            return success_envelope({
+                "properties": page,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            })
+
+        # Fast DB-level column sort + pagination.
         query = query.order(sort, desc=(order == "desc"))
         query = query.range(offset, offset + limit - 1)
 
