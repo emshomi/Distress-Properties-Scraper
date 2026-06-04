@@ -178,6 +178,7 @@ app.include_router(trigger.router)
 app.include_router(discover.router)
 app.include_router(properties.router)
 app.include_router(access.router)
+app.include_router(admin.router)
 
 
 # ============================================================
