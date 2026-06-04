@@ -133,5 +133,6 @@ __all__ = [
     "signals_table",
     "audit_table",
     "scoring_table",
+    "access_table",
     "ping_supabase",
 ]
