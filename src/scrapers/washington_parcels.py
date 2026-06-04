@@ -194,7 +194,7 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     return_geometry: ClassVar[bool] = False
     # Hosted ArcGIS Online feature services cap pages at 2000.
     page_size: ClassVar[int] = 1000
-    max_pages: ClassVar[int] = 90     # ~118K / 2000 = 60 pages + headroom
+    max_pages: ClassVar[int] = 150    # ~118K / 1000 = 118 pages + headroom
     progress_log_every: ClassVar[int] = 20000
 
     # ---- parse_feature: convert one ArcGIS feature into a parcel dict ----
