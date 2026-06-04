@@ -267,7 +267,7 @@ async def unexpected_exception_handler(
 @app.get("/", include_in_schema=False)
 async def root() -> dict[str, str]:
     """Root endpoint — friendly message and docs pointer."""
-   return {
+    return {
         "service": "distress-properties-scraper",
         "version": _API_VERSION,
         "status": "/status",
