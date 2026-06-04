@@ -986,6 +986,7 @@ def _sort_computed(
     summary="List distressed properties (filterable, paginated).",
 )
 async def list_properties(
+    _access_key: str = Depends(require_access_key),
     category: Optional[str] = Query(
         default=None,
         pattern="^(foreclosure|tax_forfeit|vacant|tax_delinquent|tax_assessment)$",
