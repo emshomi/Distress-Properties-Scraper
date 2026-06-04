@@ -79,7 +79,7 @@ from src.utils.logger import logger
 
 
 _FEATURE_SERVICE_URL = (
-    "https://services1.arcgis.com/3fjYPqJf7qa1QM1b/arcgis/rest/services"
+    "https://services1.arcgis.com/3fjYPqJf7qalQMlb/arcgis/rest/services"
     "/TaxParcel/FeatureServer/0"
 )
 
