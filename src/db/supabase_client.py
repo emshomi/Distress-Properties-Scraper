@@ -94,6 +94,10 @@ def scoring_table(table_name: str) -> Any:
     """Access a table in the `scoring` schema (models, parcel_features, parcel_scores)."""
     return get_client().schema("scoring").table(table_name)
 
+def access_table(table_name: str) -> Any:
+    """Access a table in the `access` schema (access_requests — the /data gate)."""
+    return get_client().schema("access").table(table_name)
+
 
 # ============================================================
 # CONNECTIVITY CHECK
