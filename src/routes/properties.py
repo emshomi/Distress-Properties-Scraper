@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status as http_status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status as http_status
 
 from src.db.supabase_client import core_table, signals_table
 from src.utils.errors import success_envelope
