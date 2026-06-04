@@ -44,15 +44,16 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class AccessRequestIn(BaseModel):
-    """Payload from the /data request form. Only email is required."""
+    """Payload from the /data request form. Email, name, role, and reason
+    are required; phone, company, and how_heard are optional."""
 
     email: str = Field(..., max_length=320)
-    name: Optional[str] = Field(default=None, max_length=200)
-    role: Optional[str] = Field(default=None, max_length=50)
+    name: str = Field(..., min_length=1, max_length=200)
+    role: str = Field(..., min_length=1, max_length=50)
+    reason: str = Field(..., min_length=1, max_length=2000)
     phone: Optional[str] = Field(default=None, max_length=50)
     company: Optional[str] = Field(default=None, max_length=200)
     how_heard: Optional[str] = Field(default=None, max_length=500)
-    reason: Optional[str] = Field(default=None, max_length=2000)
 
     @field_validator("email")
     @classmethod
@@ -60,6 +61,14 @@ class AccessRequestIn(BaseModel):
         v = (v or "").strip()
         if not _EMAIL_RE.match(v):
             raise ValueError("invalid email address")
+        return v
+
+    @field_validator("name", "role", "reason")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("this field is required")
         return v
 
 
