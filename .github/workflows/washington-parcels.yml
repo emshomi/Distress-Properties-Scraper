@@ -1,0 +1,58 @@
+name: Washington Parcels Loader
+# Manual + monthly. The full tax-parcel roll changes slowly; a monthly refresh
+# keeps owners/values current. Manual trigger always available via the UI.
+on:
+  workflow_dispatch:
+  schedule:
+    # 12:30 UTC = 6:30am Central (standard) / 7:30am (DST), 6th of the month.
+    # Day after the sheriff job (5th), offset so they never overlap.
+    - cron: '30 12 6 * *'
+jobs:
+  scrape:
+    name: Run Washington parcels loader
+    runs-on: ubuntu-latest
+    # ~118K records streamed in 2000-row pages + DB upserts. Generous timeout.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Washington parcels loader
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (not used by this loader, but config may require it) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable only Washington parcels, leave rest off ---
+          SCRAPER_WASHINGTON_PARCELS_ENABLED: 'true'
+          SCRAPER_WASHINGTON_SHERIFF_ENABLED: 'false'
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        run: |
+          python -m scripts.run_washington_parcels github_actions
