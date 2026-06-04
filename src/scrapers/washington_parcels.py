@@ -193,7 +193,7 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     # Geometry OFF: the PID join needs no coordinates. lat/lng will be None.
     return_geometry: ClassVar[bool] = False
     # Hosted ArcGIS Online feature services cap pages at 2000.
-    page_size: ClassVar[int] = 2000
+    page_size: ClassVar[int] = 1000
     max_pages: ClassVar[int] = 90     # ~118K / 2000 = 60 pages + headroom
     progress_log_every: ClassVar[int] = 20000
 
