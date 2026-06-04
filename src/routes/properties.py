@@ -423,6 +423,57 @@ def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+def _extract_washington(raw: dict, row: dict) -> dict[str, Any]:
+    """washington_sheriff — monthly Report-of-Sheriff's-Sales XLS shape:
+    raw_data holds a 'sale' sub-object (pid, sale_date, sale_amount, purchaser,
+    instrument, original_lender, notice owner). Enriched (2026-06) by the
+    washington_foreclosure_enrichment job, which PID-joins each row to the
+    Washington TaxParcel roll in core.parcels and writes owner / market value /
+    mailing / homestead / site address under raw_data.detail.gis_* (same keys as
+    Anoka / Dakota / Hennepin). 115 of 116 rows matched by exact PID; the one
+    unmatched row stays blank and renders as em-dash. We prefer the assessor
+    owner-of-record (gis_owner) over the foreclosure-notice owner when present.
+    Completed sales (post-auction) → status 'Sold'; the redemption window is
+    derived downstream from event_date (sale + ~6 months)."""
+    sale = raw.get("sale") or {}
+    detail = raw.get("detail") or {}
+
+    gis_market = detail.get("gis_market_value")
+    try:
+        market_value = float(gis_market) if gis_market is not None else None
+    except (TypeError, ValueError):
+        market_value = None
+
+    return {
+        "address": detail.get("gis_site_address"),
+        "city": detail.get("gis_city"),
+        "zip": detail.get("gis_zip"),
+        # Prefer the assessor owner-of-record from enrichment; fall back to the
+        # foreclosure-notice grantor/owner from the sheriff file.
+        "owner": detail.get("gis_owner") or sale.get("owner"),
+        "sale_date": sale.get("sale_date") or row.get("event_date"),
+        "sale_time": None,
+        "amount": row.get("event_value"),
+        # Washington publishes completed sales (post-auction).
+        "status": "Sold",
+        "tax_parcel_no": detail.get("gis_pid") or sale.get("pid"),
+        "original_principal": None,
+        "municipality": detail.get("gis_city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": None,
+        "market_value": market_value,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+        # Generic foreclosure enrichment fields — populated by the Washington
+        # foreclosure enrichment job; null (em-dash) on the unmatched row.
+        "owner_mailing": detail.get("gis_owner_mailing"),
+        "is_absentee": detail.get("gis_is_absentee"),
+        "homestead": detail.get("gis_homestead"),
+    }
+
 def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
     """Fallback extractor for unknown sources. Tries common keys."""
     return {
