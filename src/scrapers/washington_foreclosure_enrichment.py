@@ -67,20 +67,29 @@ _MAX_PAGES = 400  # ~118K parcels / 1000 = ~119 pages; headroom.
 
 
 def _absentee_from_homestead(homestead: Any) -> bool | None:
-    """Washington HOMESTEAD is free text. 'NON' -> non-homestead (absentee
-    True); 'HOMESTEAD' present without 'NON' -> homestead (absentee False);
+    """Map Washington's HOMESTEAD flag to an absentee boolean.
+
+    Washington uses single-letter codes: 'Y' = homestead, 'N' = non-homestead.
+    We also keep a word-based fallback ('NON' / 'HOMESTEAD') so the function
+    stays correct if the format ever changes or matches other counties.
+    'Y' / homestead -> absentee False; 'N' / non-homestead -> absentee True;
     blank/unknown -> None."""
     if homestead is None:
         return None
     text = str(homestead).strip().upper()
     if not text:
         return None
+    # Washington's single-letter codes.
+    if text == "Y":
+        return False  # homestead -> owner-occupied (not absentee)
+    if text == "N":
+        return True   # non-homestead -> absentee
+    # Word-based fallback (other formats).
     if "NON" in text:
         return True
     if "HOMESTEAD" in text:
         return False
     return None
-
 
 def _homestead_label(homestead: Any) -> str | None:
     """Surface the homestead flag as a compact code (H / N) matching the other
