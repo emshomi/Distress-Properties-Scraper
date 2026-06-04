@@ -275,4 +275,5 @@ async def root() -> dict[str, str]:
         "health": "/health",
     }
 
+# Access gate router registered above (access.router).
 __all__ = ["app"]
