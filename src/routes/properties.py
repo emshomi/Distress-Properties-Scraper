@@ -81,6 +81,56 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
 
 router = APIRouter(tags=["properties"])
 
+async def require_access_key(
+    x_access_key: Optional[str] = Header(default=None, alias="X-Access-Key"),
+) -> str:
+    """FastAPI dependency that gates an endpoint behind a valid access key.
+
+    The frontend sends the visitor's key in the 'X-Access-Key' header. We
+    look it up in access.access_requests; the key is valid only if it exists
+    AND its row status is 'approved'. Missing/unknown/blocked -> 401.
+    On success, stamps last_seen_at (best-effort) so the owner can see
+    activity."""
+    from src.db.supabase_client import access_table
+
+    if not x_access_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Access key required. Request access at govire.com/data.",
+        )
+
+    try:
+        result = (
+            access_table("access_requests")
+            .select("id, status")
+            .eq("access_key", x_access_key)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.exception(
+            "access key validation query failed",
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(status_code=503, detail="Access check unavailable.")
+
+    if not rows or rows[0].get("status") != "approved":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or unapproved access key.",
+        )
+
+    try:
+        from datetime import datetime, timezone
+        access_table("access_requests").update(
+            {"last_seen_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", rows[0]["id"]).execute()
+    except Exception as e:
+        logger.warning("last_seen_at stamp failed", error_type=type(e).__name__)
+
+    return x_access_key
+
 
 # ============================================================
 # PER-SOURCE RAW_DATA EXTRACTORS
