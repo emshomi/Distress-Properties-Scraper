@@ -123,11 +123,13 @@ app = FastAPI(
     description=_API_DESCRIPTION,
     version=_API_VERSION,
     lifespan=lifespan,
-    openapi_url="/openapi.json",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # Public API docs are disabled — the auto-generated schema would expose
+    # every endpoint, field, and data source. Set any of these back to a path
+    # string to re-enable (e.g. for local debugging).
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
 )
-
 
 # ============================================================
 # CORS
