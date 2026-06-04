@@ -1,0 +1,46 @@
+name: Washington Foreclosure Enrichment
+# Manual + monthly. Runs AFTER the parcel loader (6th of the month) so the roll
+# is fresh; this job PID-joins the sheriff events to that roll. Manual trigger
+# always available via the UI — run it manually now to enrich the existing rows.
+on:
+  workflow_dispatch:
+  schedule:
+    # 12:50 UTC = 6:50am Central (standard) / 7:50am (DST), 6th of the month.
+    # 20 min after the parcels loader (12:30) so the roll is loaded first.
+    - cron: '50 12 6 * *'
+jobs:
+  enrich:
+    name: Run Washington foreclosure enrichment
+    runs-on: ubuntu-latest
+    # Pure DB job: read events + parcel roll, UPDATE in place. No browser.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Washington foreclosure enrichment
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (not used by this job, but config may require it) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+        run: |
+          python -m scripts.run_washington_foreclosure_enrichment github_actions
