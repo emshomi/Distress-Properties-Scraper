@@ -1031,6 +1031,58 @@ async def stats_endpoint() -> dict[str, Any]:
         },
         "counties": counties_breakdown,
     })
+    
+# ============================================================
+# GET /stats/differentiators — live USP numbers for the /about page
+# ============================================================
+
+
+@router.get(
+    "/stats/differentiators",
+    status_code=http_status.HTTP_200_OK,
+    summary="Live cross-signal + owner-portfolio counts (the /about page USPs).",
+)
+async def differentiator_stats() -> dict[str, Any]:
+    """Live counts that prove govire's differentiation — the cross-signal
+    overlap and owner-portfolio patterns no single source reveals. All
+    queried live from the two views (no hardcoded numbers). Each count
+    degrades to None on failure so the page can hide that stat rather than
+    show a wrong/zero number."""
+
+    def _count_gte(table: str, column: str, threshold: int) -> Optional[int]:
+        try:
+            result = (
+                signals_table(table)
+                .select(column, count="exact")
+                .gte(column, threshold)
+                .limit(1)
+                .execute()
+            )
+            return result.count or 0
+        except Exception as e:
+            logger.warning(
+                "differentiator count failed",
+                table=table,
+                column=column,
+                error_type=type(e).__name__,
+            )
+            return None
+
+    multi_signal_parcels = _count_gte(
+        "parcel_distress_overlay", "distinct_signal_count", 2
+    )
+    triple_distress_parcels = _count_gte(
+        "parcel_distress_overlay", "distinct_signal_count", 3
+    )
+    multi_property_owners = _count_gte(
+        "owner_distress_summary", "parcel_count", 2
+    )
+
+    return success_envelope({
+        "multi_signal_parcels": multi_signal_parcels,
+        "triple_distress_parcels": triple_distress_parcels,
+        "multi_property_owners": multi_property_owners,
+    })
 
 
 # ============================================================
