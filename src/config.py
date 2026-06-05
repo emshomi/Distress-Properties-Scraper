@@ -66,13 +66,37 @@ class Settings(BaseSettings):
         description="Timezone for cron expressions",
     )
 
-   # ----- External service credentials -----
+    # ----- LLM (Anthropic Claude) -----
+
+    anthropic_api_key: SecretStr | None = Field(
+        default=None,
+        description="Anthropic API key for Claude (NL search, summaries, extraction)",
+    )
+
+    llm_model: str = Field(
+        default="claude-3-5-haiku-20241022",
+        description="Default Claude model for LLM features",
+    )
+
+    llm_max_tokens: int = Field(
+        default=1024,
+        ge=1,
+        le=8192,
+        description="Default max output tokens per LLM call",
+    )
+
+    llm_timeout_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=120,
+        description="Timeout per LLM API call",
+    )
+
+    # ----- External service credentials -----
 
     minneapolis_311_app_token: SecretStr | None = Field(
         default=None,
         description="Socrata app token for Minneapolis 311 dataset",
-    )
-    
     )
 
     mapbox_token: SecretStr | None = Field(
