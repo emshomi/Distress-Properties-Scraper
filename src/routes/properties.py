@@ -1265,8 +1265,11 @@ async def list_properties(
             rows = result.data or []
             total = result.count or 0
 
-            shaped = [_shape_property_row(r) for r in rows]
+            overlay_map = _load_overlay_map()
+            shaped = [_shape_property_row(r, overlay_map) for r in rows]
             descending = (order == "desc")
+
+            
             shaped = _sort_computed(shaped, sort, descending)
 
             page = shaped[offset:offset + limit]
