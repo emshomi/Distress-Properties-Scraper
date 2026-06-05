@@ -1355,9 +1355,11 @@ async def list_properties(
             total = result.count or 0
 
             overlay_map = _load_overlay_map()
-            shaped = [_shape_property_row(r, overlay_map) for r in rows]
+            owner_map = _load_owner_map()
+            shaped = [_shape_property_row(r, overlay_map, owner_map) for r in rows]
 
             # Apply the multi-signal filter (if requested) on the shaped rows,
+            
             # since signal counts come from the overlay attached during shaping.
             if multi_signal is not None:
                 shaped = [
