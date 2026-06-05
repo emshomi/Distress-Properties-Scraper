@@ -16,6 +16,8 @@ resend==2.4.0
 # ---- Database client ----
 supabase==2.10.0
 postgrest==0.18.0
+# ---- LLM (Anthropic Claude — NL search, summaries, extraction) ----
+anthropic==0.40.0
 # ---- HTTP client (used by all scrapers + geocoder) ----
 httpx==0.27.2
 # ---- HTML parsing ----
