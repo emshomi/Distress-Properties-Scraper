@@ -596,6 +596,20 @@ def _effective_parcel_id(source: str, raw: dict, row: dict) -> Optional[str]:
         return detail.get("gis_pid")
     return row.get("parcel_id")
 
+def _owner_key(raw: dict) -> Optional[str]:
+    """Compute the SAME owner key the owner-summary view groups on.
+
+    The view keys on upper(trim(gis_owner)). Only rows with an enriched
+    gis_owner are in the view, so we normalize that exact field — NOT the
+    display 'owner' (which may fall back to the mortgagor and wouldn't match).
+    Returns None when there's no gis_owner (no portfolio lookup possible).
+    """
+    detail = raw.get("detail") or {}
+    gis_owner = detail.get("gis_owner")
+    if not gis_owner or not str(gis_owner).strip():
+        return None
+    return str(gis_owner).strip().upper()
+
 
 def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
     """Fetch the whole overlay view once and index it by (county, parcel_id).
