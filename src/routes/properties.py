@@ -1465,4 +1465,152 @@ async def get_property(source: str, source_id: str) -> dict[str, Any]:
         )
 
 
+# ============================================================
+# GET /owners — list resolved owners (portfolio browse)
+# ============================================================
+
+
+@router.get(
+    "/owners",
+    status_code=http_status.HTTP_200_OK,
+    summary="List resolved owners with their distressed-property counts.",
+)
+async def list_owners(
+    _access_key: str = Depends(require_access_key),
+    owner_type: Optional[str] = Query(
+        default=None,
+        pattern="^(individual|llc_business|bank_lender|government)$",
+        description="Filter by owner type.",
+    ),
+    min_parcels: int = Query(
+        default=2,
+        ge=1,
+        le=100,
+        description="Only owners holding at least this many distinct properties.",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """Browse owners from signals.owner_distress_summary, biggest portfolios
+    first. Defaults to 2+ properties (the frequent-flyer signal); pass
+    min_parcels=1 to include single-property owners."""
+    try:
+        query = (
+            signals_table("owner_distress_summary")
+            .select(
+                "owner_norm, owner_type, parcel_count, event_count, "
+                "max_severity, any_absentee, owner_mailing, event_types, "
+                "sources, addresses",
+                count="exact",
+            )
+            .gte("parcel_count", min_parcels)
+        )
+        if owner_type:
+            query = query.eq("owner_type", owner_type)
+
+        query = query.order("parcel_count", desc=True)
+        query = query.range(offset, offset + limit - 1)
+
+        result = query.execute()
+        rows = result.data or []
+        total = result.count or 0
+
+        return success_envelope({
+            "owners": rows,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        })
+    except Exception as e:
+        logger.exception(
+            "owners list query failed",
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch owners: {type(e).__name__}",
+        )
+
+
+# ============================================================
+# GET /owners/{owner_norm}/properties — one owner's full holdings
+# ============================================================
+
+
+@router.get(
+    "/owners/{owner_norm}/properties",
+    status_code=http_status.HTTP_200_OK,
+    summary="List every distressed property tied to one owner.",
+)
+async def owner_properties(
+    owner_norm: str,
+    _access_key: str = Depends(require_access_key),
+) -> dict[str, Any]:
+    """Return all distress events whose normalized gis_owner matches
+    owner_norm, shaped like regular property rows so the frontend reuses its
+    rendering. owner_norm is the upper(trim(gis_owner)) key (URL-encoded by
+    the caller). Cross-county by nature — an owner's holdings can span
+    multiple counties, which is the whole point of resolving them."""
+    try:
+        key = owner_norm.strip().upper()
+
+        # Pull candidate rows. We can't filter on the computed gis_owner key in
+        # PostgREST directly, so we fetch foreclosure-source rows that HAVE a
+        # gis_owner and match in Python. The enriched set is small (~600 rows).
+        result = (
+            signals_table("distress_events")
+            .select(
+                "source_id, source, parcel_id, event_type, event_date, "
+                "event_value, severity, title, description, raw_data, "
+                "observed_at"
+            )
+            .not_.is_("raw_data->detail->>gis_owner", "null")
+            .range(0, 4999)
+            .execute()
+        )
+        rows = result.data or []
+
+        matched = [
+            r for r in rows
+            if (str((r.get("raw_data") or {}).get("detail", {}).get("gis_owner") or "")
+                .strip().upper()) == key
+        ]
+
+        if not matched:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No properties found for owner: {owner_norm}",
+            )
+
+        overlay_map = _load_overlay_map()
+        owner_map = _load_owner_map()
+        shaped = [
+            _shape_property_row(r, overlay_map, owner_map) for r in matched
+        ]
+
+        # The owner summary (type, count) comes from the first shaped row's
+        # attached owner_portfolio — identical across the set, so any row's is
+        # representative.
+        summary = shaped[0].get("owner_portfolio") if shaped else None
+
+        return success_envelope({
+            "owner_norm": key,
+            "summary": summary,
+            "properties": shaped,
+            "total": len(shaped),
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            "owner properties query failed",
+            owner_norm=owner_norm,
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch owner properties: {type(e).__name__}",
+        )
+
+
 __all__ = ["router"]
