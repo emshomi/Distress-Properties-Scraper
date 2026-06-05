@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     )
 
     llm_model: str = Field(
-        default="claude-3-5-haiku-20241022",
+        default="claude-haiku-4-5-20251001",
         description="Default Claude model for LLM features",
     )
 
