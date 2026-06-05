@@ -84,13 +84,13 @@ def _log_usage(feature: str, model: str, in_tok: int, out_tok: int, cost: float)
             "output_tokens": out_tok,
             "cost_usd": cost,
         }).execute()
-    except Exception as e:  # noqa: BLE001
+  except Exception as e:  # noqa: BLE001
         logger.warning(
             "usage_log write failed (call still succeeded)",
             feature=feature,
             error_type=type(e).__name__,
+            error_detail=str(e)[:500],
         )
-
 
 def call_claude(
     *,
