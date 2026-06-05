@@ -782,8 +782,16 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
         "redemption_is_estimated": is_estimated,
     }
 
-def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Dispatch to the right per-source extractor and merge common fields."""
+def _shape_property_row(
+    row: dict[str, Any],
+    overlay_map: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Dispatch to the right per-source extractor and merge common fields.
+
+    If an overlay_map is supplied, attach this parcel's cross-signal flags
+    under a nested 'overlay' key (None when the parcel has no resolvable id
+    or no overlay entry — the frontend shows no badge in that case).
+    """
     source = row.get("source") or ""
     raw = row.get("raw_data") or {}
     extractor = _EXTRACTORS.get(source, _extract_generic)
@@ -791,7 +799,7 @@ def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
 
     redemption = _redemption_fields(source, raw, row)
 
-    return {
+    shaped = {
         "source": source,
         "source_id": row.get("source_id"),
         "parcel_id": row.get("parcel_id"),
@@ -803,6 +811,16 @@ def _shape_property_row(row: dict[str, Any]) -> dict[str, Any]:
         **extracted,
         **redemption,
     }
+
+    overlay = None
+    if overlay_map is not None:
+        eff_pid = _effective_parcel_id(source, raw, row)
+        county = (_SOURCE_TO_COUNTY.get(source) or "").lower()
+        if eff_pid:
+            overlay = overlay_map.get((county, eff_pid))
+    shaped["overlay"] = overlay
+
+    return shaped
 
 # ============================================================
 # Helpers
