@@ -644,6 +644,50 @@ def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
             "has_special_assessment": r.get("has_special_assessment"),
         }
     return overlay_map
+def _load_owner_map() -> dict[str, dict[str, Any]]:
+    """Fetch signals.owner_distress_summary once and index it by owner_norm.
+
+    Mirrors _load_overlay_map: one fetch per request, indexed for O(1) lookup.
+    The key is the normalized owner name — upper(trim(gis_owner)) — the SAME
+    expression the view groups on, so a property row finds its owner's
+    portfolio by normalizing its own gis_owner identically.
+
+    Returns an empty map on failure so property listing still works (just
+    without the owner-portfolio badge) rather than 500-ing.
+    """
+    try:
+        result = (
+            signals_table("owner_distress_summary")
+            .select(
+                "owner_norm, owner_type, parcel_count, event_count, "
+                "max_severity, any_absentee, owner_mailing"
+            )
+            .range(0, 9999)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.warning(
+            "owner map load failed — rows will render without owner portfolio",
+            error_type=type(e).__name__,
+        )
+        return {}
+
+    owner_map: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        key = r.get("owner_norm")
+        if not key:
+            continue
+        owner_map[key] = {
+            "owner_type": r.get("owner_type"),
+            "parcel_count": r.get("parcel_count"),
+            "event_count": r.get("event_count"),
+            "max_severity": r.get("max_severity"),
+            "any_absentee": r.get("any_absentee"),
+            "owner_mailing": r.get("owner_mailing"),
+        }
+    return owner_map
+
 
 # ============================================================
 # REDEMPTION-WINDOW COMPUTATION
