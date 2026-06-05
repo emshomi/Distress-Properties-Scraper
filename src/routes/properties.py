@@ -1100,13 +1100,15 @@ async def list_properties(
         description="Filter by status: 'active' or 'postponed'.",
     ),
 
-    redemption: Optional[str] = Query(
+    multi_signal: Optional[int] = Query(
         default=None,
-        pattern="^(in_redemption|expiring_soon|expired)$",
+        ge=2,
+        le=5,
         description=(
-            "Filter foreclosure rows by redemption-window state. "
-            "Approximated via event_date (redemption ≈ sale + ~6 months) "
-            "so it works uniformly across all sheriff counties."
+            "Filter to parcels appearing on at least this many distinct "
+            "government signal families (2 = multi-signal, 3 = triple-distress). "
+            "Cross-references signals.parcel_distress_overlay, so it routes "
+            "through the fetch-all + Python-filter path like computed sorts."
         ),
     ),
 
