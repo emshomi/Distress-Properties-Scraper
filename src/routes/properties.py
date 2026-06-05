@@ -1393,8 +1393,9 @@ async def list_properties(
         total = result.count or 0
 
         overlay_map = _load_overlay_map()
+        owner_map = _load_owner_map()
         return success_envelope({
-            "properties": [_shape_property_row(r, overlay_map) for r in rows],
+            "properties": [_shape_property_row(r, overlay_map, owner_map) for r in rows],
             "total": total,
             "limit": limit,
             "offset": offset,
