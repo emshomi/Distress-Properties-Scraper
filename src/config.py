@@ -66,11 +66,13 @@ class Settings(BaseSettings):
         description="Timezone for cron expressions",
     )
 
-    # ----- External service credentials -----
+   # ----- External service credentials -----
 
     minneapolis_311_app_token: SecretStr | None = Field(
         default=None,
         description="Socrata app token for Minneapolis 311 dataset",
+    )
+    
     )
 
     mapbox_token: SecretStr | None = Field(
