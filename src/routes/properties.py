@@ -872,7 +872,7 @@ def _shape_property_row(
         **redemption,
     }
 
-   overlay = None
+    overlay = None
     if overlay_map is not None:
         eff_pid = _effective_parcel_id(source, raw, row)
         county = (_SOURCE_TO_COUNTY.get(source) or "").lower()
