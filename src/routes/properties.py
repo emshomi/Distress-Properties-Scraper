@@ -870,13 +870,24 @@ def _shape_property_row(
         **redemption,
     }
 
-    overlay = None
+   overlay = None
     if overlay_map is not None:
         eff_pid = _effective_parcel_id(source, raw, row)
         county = (_SOURCE_TO_COUNTY.get(source) or "").lower()
         if eff_pid:
             overlay = overlay_map.get((county, eff_pid))
     shaped["overlay"] = overlay
+
+    # Owner portfolio: how many distressed properties this row's owner holds,
+    # plus their classified type. Looked up by the normalized gis_owner key,
+    # matching signals.owner_distress_summary. None when the row has no
+    # gis_owner or no entry — frontend shows no owner badge in that case.
+    owner_portfolio = None
+    if owner_map is not None:
+        okey = _owner_key(raw)
+        if okey:
+            owner_portfolio = owner_map.get(okey)
+    shaped["owner_portfolio"] = owner_portfolio
 
     return shaped
 
