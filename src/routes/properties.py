@@ -1284,7 +1284,7 @@ async def list_properties(
         query = query.order(sort, desc=(order == "desc"))
         query = query.range(offset, offset + limit - 1)
 
-       result = query.execute()
+        result = query.execute()
         rows = result.data or []
         total = result.count or 0
 
