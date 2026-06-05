@@ -1284,12 +1284,13 @@ async def list_properties(
         query = query.order(sort, desc=(order == "desc"))
         query = query.range(offset, offset + limit - 1)
 
-        result = query.execute()
+       result = query.execute()
         rows = result.data or []
         total = result.count or 0
 
+        overlay_map = _load_overlay_map()
         return success_envelope({
-            "properties": [_shape_property_row(r) for r in rows],
+            "properties": [_shape_property_row(r, overlay_map) for r in rows],
             "total": total,
             "limit": limit,
             "offset": offset,
@@ -1298,6 +1299,8 @@ async def list_properties(
     except Exception as e:
         logger.exception(
             "properties list query failed",
+
+            
             error_type=type(e).__name__,
         )
         raise HTTPException(
