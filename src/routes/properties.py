@@ -843,7 +843,9 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
 def _shape_property_row(
     row: dict[str, Any],
     overlay_map: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
+    owner_map: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
+    
     """Dispatch to the right per-source extractor and merge common fields.
 
     If an overlay_map is supplied, attach this parcel's cross-signal flags
