@@ -1259,7 +1259,14 @@ async def list_properties(
         # about — sorting hundreds of dicts is instant.
         computed_sorts = {"equity", "redemption_urgency"}
 
-        if sort in computed_sorts:
+        # multi_signal requires the overlay map to filter, which only exists
+        # after shaping — so it forces the fetch-all path too, exactly like
+        # the computed sorts. Pagination then happens in Python on the
+        # filtered set.
+        needs_fetch_all = sort in computed_sorts or multi_signal is not None
+
+        if needs_fetch_all:
+            
             # Fetch all matching rows (generous cap), shape, sort, paginate.
             _ALL_CAP = 2000
             query = query.range(0, _ALL_CAP - 1)
