@@ -573,6 +573,79 @@ _EXTRACTORS: dict[str, Any] = {
 }
 
 # ============================================================
+# MULTI-SIGNAL OVERLAY (signals.parcel_distress_overlay)
+# ============================================================
+# The overlay view rolls every distress event up to the parcel level and
+# computes cross-signal flags (triple-distress, etc). It is keyed by
+# (county, effective_parcel_id) — where sheriff rows use the real gis_pid
+# pulled out of raw_data, not their synthetic case-number parcel_id.
+# We mirror that same effective-id logic here so a property row can find
+# its own overlay entry.
+
+
+def _effective_parcel_id(source: str, raw: dict, row: dict) -> Optional[str]:
+    """Compute the SAME parcel key the overlay view groups on.
+
+    Sheriff rows store a synthetic parcel_id (case number); their real
+    parcel id lives in raw_data.detail.gis_pid (present only on enriched
+    rows). Every other source's stored parcel_id is already the real one.
+    Returns None when no real parcel id is resolvable (honest em-dash).
+    """
+    if source in _FORECLOSURE_SOURCES:
+        detail = raw.get("detail") or {}
+        return detail.get("gis_pid")
+    return row.get("parcel_id")
+
+
+def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
+    """Fetch the whole overlay view once and index it by (county, parcel_id).
+
+    The view is small (a few thousand parcels), so one fetch per request is
+    far cheaper than a per-row lookup. County is lowercased on both sides to
+    avoid a case mismatch (the view emits 'hennepin'; _SOURCE_TO_COUNTY emits
+    'Hennepin'). Returns an empty map on failure so property listing still
+    works without the badge rather than 500-ing.
+    """
+    try:
+        result = (
+            signals_table("parcel_distress_overlay")
+            .select(
+                "county, parcel_id, distinct_signal_count, is_triple_distress, "
+                "signal_families, max_severity, has_foreclosure, "
+                "has_vacant_condemned, has_tax_delinquent, has_tax_forfeit, "
+                "has_special_assessment"
+            )
+            .range(0, 9999)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.warning(
+            "overlay map load failed — properties will render without badges",
+            error_type=type(e).__name__,
+        )
+        return {}
+
+    overlay_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        county = (r.get("county") or "").lower()
+        pid = r.get("parcel_id")
+        if not pid:
+            continue
+        overlay_map[(county, pid)] = {
+            "distinct_signal_count": r.get("distinct_signal_count"),
+            "is_triple_distress": r.get("is_triple_distress"),
+            "signal_families": r.get("signal_families"),
+            "max_severity": r.get("max_severity"),
+            "has_foreclosure": r.get("has_foreclosure"),
+            "has_vacant_condemned": r.get("has_vacant_condemned"),
+            "has_tax_delinquent": r.get("has_tax_delinquent"),
+            "has_tax_forfeit": r.get("has_tax_forfeit"),
+            "has_special_assessment": r.get("has_special_assessment"),
+        }
+    return overlay_map
+
+# ============================================================
 # REDEMPTION-WINDOW COMPUTATION
 # ============================================================
 # Minnesota sheriff sales carry a redemption period (typically 6 months)
