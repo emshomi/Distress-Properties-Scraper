@@ -1276,12 +1276,25 @@ async def list_properties(
 
             overlay_map = _load_overlay_map()
             shaped = [_shape_property_row(r, overlay_map) for r in rows]
-            descending = (order == "desc")
 
-            
+            # Apply the multi-signal filter (if requested) on the shaped rows,
+            # since signal counts come from the overlay attached during shaping.
+            if multi_signal is not None:
+                shaped = [
+                    s for s in shaped
+                    if s.get("overlay")
+                    and (s["overlay"].get("distinct_signal_count") or 0) >= multi_signal
+                ]
+
+            # 'sort' may be a normal column here (when multi_signal forced this
+            # path); _sort_computed passes those through unchanged, so the rows
+            # keep the DB order they arrived in. Computed sorts still sort.
+            descending = (order == "desc")
             shaped = _sort_computed(shaped, sort, descending)
 
+            total = len(shaped)  # filtered count, so pagination + "X of Y" stay honest
             page = shaped[offset:offset + limit]
+            
             return success_envelope({
                 "properties": page,
                 "total": total,
