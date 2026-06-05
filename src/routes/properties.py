@@ -1612,5 +1612,4 @@ async def owner_properties(
             detail=f"Failed to fetch owner properties: {type(e).__name__}",
         )
 
-
 __all__ = ["router"]
