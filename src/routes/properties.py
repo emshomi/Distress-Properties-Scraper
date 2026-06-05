@@ -1100,6 +1100,15 @@ async def list_properties(
         description="Filter by status: 'active' or 'postponed'.",
     ),
 
+    redemption: Optional[str] = Query(
+        default=None,
+        pattern="^(in_redemption|expiring_soon|expired)$",
+        description=(
+            "Filter foreclosure rows by redemption-window state. Uses the "
+            "county-published date where present, else the sale+~182d estimate."
+        ),
+    ),
+
     multi_signal: Optional[int] = Query(
         default=None,
         ge=2,
