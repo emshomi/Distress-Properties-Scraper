@@ -16,13 +16,13 @@ Design principles:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 from anthropic import Anthropic
-from loguru import logger
 
 from src.config import settings
 from src.db.supabase_client import get_client
+from src.utils.logger import logger
 
 
 # ------------------------------------------------------------
