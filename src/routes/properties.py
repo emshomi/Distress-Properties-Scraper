@@ -1182,6 +1182,73 @@ def _redemption_key(p: dict[str, Any]) -> int | None:
         return None
 
 
+# ============================================================
+# PARCEL DE-DUPLICATION (multi-signal path)
+# ============================================================
+# A multi-signal parcel has multiple event rows by definition (events from
+# different sources), and a single source can emit many rows for one parcel
+# (e.g. repeated condemned-building notices). When we filter to multi-signal
+# parcels we must collapse to ONE representative row per parcel, or the same
+# property appears many times and the count balloons. We keep the most
+# actionable row as the representative; the parcel's full cross-signal overlay
+# badge rides along on whichever row wins.
+
+# Source → actionability rank. Lower number = more actionable / time-sensitive.
+_SOURCE_ACTIONABILITY: dict[str, int] = {
+    "anoka_sheriff": 1,
+    "dakota_sheriff": 1,
+    "hennepin_sheriff": 1,
+    "ramsey_sheriff": 1,
+    "washington_sheriff": 1,
+    "scott_sheriff": 1,
+    "carver_sheriff": 1,
+    "hennepin_tax_roll": 3,   # tax_forfeit vs delinquent split in _actionability_rank
+    "ramsey_tax_roll": 3,
+    "mn_dor_red_book": 2,
+    "mpls_vbr": 4,
+    "saint_paul_vacant": 4,
+    "saint_paul_dsi": 4,
+}
+
+
+def _actionability_rank(row: dict[str, Any]) -> int:
+    """Lower = more actionable. Foreclosure sales rank highest (a redemption
+    clock is ticking); tax-forfeit outranks plain delinquency; vacant/condemned
+    sits mid; everything else last. Used to pick the representative row when a
+    parcel has many events."""
+    source = row.get("source") or ""
+    base = _SOURCE_ACTIONABILITY.get(source, 9)
+    # Within the tax roll, forfeiture is more actionable than delinquency.
+    if row.get("event_type") == "tax_forfeit":
+        return 2
+    return base
+
+
+def _dedupe_by_parcel(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse shaped rows to one per effective parcel key, keeping the
+    most-actionable representative. Rows without a resolvable parcel key
+    (_eff_key is None) are kept as-is (each is its own entry — we can't tell
+    if they're the same property). The private _eff_key field is removed from
+    every returned row so it never leaks into the API response."""
+    best_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    no_key: list[dict[str, Any]] = []
+
+    for r in rows:
+        key = r.get("_eff_key")
+        if not key:
+            no_key.append(r)
+            continue
+        existing = best_by_key.get(key)
+        if existing is None or _actionability_rank(r) < _actionability_rank(existing):
+            best_by_key[key] = r
+
+    result = list(best_by_key.values()) + no_key
+    # Strip the internal field before returning.
+    for r in result:
+        r.pop("_eff_key", None)
+    return result
+
+
 def _sort_computed(
     rows: list[dict[str, Any]], sort: str, descending: bool
 ) -> list[dict[str, Any]]:
@@ -1571,6 +1638,8 @@ async def get_property(source: str, source_id: str) -> dict[str, Any]:
         owner_map = _load_owner_map()
         shaped = _shape_property_row(rows[0], overlay_map, owner_map)
         shaped["raw"] = rows[0].get("raw_data") or {}
+        # Drop the internal de-dup key — single-property responses don't need it.
+        shaped.pop("_eff_key", None)
         
         return success_envelope(shaped)
 
@@ -1711,6 +1780,9 @@ async def owner_properties(
         shaped = [
             _shape_property_row(r, overlay_map, owner_map) for r in matched
         ]
+        # Drop the internal de-dup key before returning.
+        for s in shaped:
+            s.pop("_eff_key", None)
 
         # The owner summary (type, count) comes from the first shaped row's
         # attached owner_portfolio — identical across the set, so any row's is
