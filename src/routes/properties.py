@@ -704,23 +704,12 @@ def _load_owner_map() -> dict[str, dict[str, Any]]:
     Returns an empty map on failure so property listing still works (just
     without the owner-portfolio badge) rather than 500-ing.
     """
-    try:
-        result = (
-            signals_table("owner_distress_summary")
-            .select(
-                "owner_norm, owner_type, parcel_count, event_count, "
-                "max_severity, any_absentee, owner_mailing"
-            )
-            .range(0, 9999)
-            .execute()
-        )
-        rows = result.data or []
-    except Exception as e:
-        logger.warning(
-            "owner map load failed — rows will render without owner portfolio",
-            error_type=type(e).__name__,
-        )
-        return {}
+    rows = _fetch_all_rows(
+        "owner_distress_summary",
+        "owner_norm, owner_type, parcel_count, event_count, "
+        "max_severity, any_absentee, owner_mailing",
+    )
+    
 
     owner_map: dict[str, dict[str, Any]] = {}
     for r in rows:
