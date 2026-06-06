@@ -896,12 +896,18 @@ def _shape_property_row(
         **redemption,
     }
 
+    # Compute the effective parcel key (county_lower, real_parcel_id) — the
+    # SAME key the overlay groups on. Stashed under a private field so the
+    # multi_signal path can de-duplicate to one row per parcel (a parcel can
+    # have many event rows — e.g. 9 condemned-building notices). Stripped
+    # before the response is returned.
+    _eff_pid = _effective_parcel_id(source, raw, row)
+    _county_lower = (_SOURCE_TO_COUNTY.get(source) or "").lower()
+    shaped["_eff_key"] = (_county_lower, _eff_pid) if _eff_pid else None
+
     overlay = None
-    if overlay_map is not None:
-        eff_pid = _effective_parcel_id(source, raw, row)
-        county = (_SOURCE_TO_COUNTY.get(source) or "").lower()
-        if eff_pid:
-            overlay = overlay_map.get((county, eff_pid))
+    if overlay_map is not None and _eff_pid:
+        overlay = overlay_map.get((_county_lower, _eff_pid))
     shaped["overlay"] = overlay
 
     # Owner portfolio: how many distressed properties this row's owner holds,
