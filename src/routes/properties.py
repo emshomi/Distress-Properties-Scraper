@@ -611,34 +611,67 @@ def _owner_key(raw: dict) -> Optional[str]:
     return str(gis_owner).strip().upper()
 
 
-def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
-    """Fetch the whole overlay view once and index it by (county, parcel_id).
-
-    The view is small (a few thousand parcels), so one fetch per request is
-    far cheaper than a per-row lookup. County is lowercased on both sides to
-    avoid a case mismatch (the view emits 'hennepin'; _SOURCE_TO_COUNTY emits
-    'Hennepin'). Returns an empty map on failure so property listing still
-    works without the badge rather than 500-ing.
+def _fetch_all_rows(table_name: str, columns: str) -> list[dict[str, Any]]:
+    """Fetch EVERY row of a table/view, paging past PostgREST's per-response
+    row cap (default 1000). A single .range(0, 9999) does NOT override that
+    cap — PostgREST still returns only its configured maximum — so any view
+    larger than ~1000 rows was being silently truncated. We page in chunks
+    until a short page signals the end. Returns [] on failure.
     """
-    try:
-        result = (
-            signals_table("parcel_distress_overlay")
-            .select(
-                "county, parcel_id, distinct_signal_count, is_triple_distress, "
-                "signal_families, max_severity, has_foreclosure, "
-                "has_vacant_condemned, has_tax_delinquent, has_tax_forfeit, "
-                "has_special_assessment"
+    _PAGE = 1000
+    _MAX_PAGES = 1000  # safety stop (= up to 1M rows)
+    all_rows: list[dict[str, Any]] = []
+    page_idx = 0
+    while page_idx < _MAX_PAGES:
+        start = page_idx * _PAGE
+        end = start + _PAGE - 1
+        try:
+            result = (
+                signals_table(table_name)
+                .select(columns)
+                .range(start, end)
+                .execute()
             )
-            .range(0, 9999)
-            .execute()
-        )
-        rows = result.data or []
-    except Exception as e:
+        except Exception as e:
+            logger.warning(
+                "paged fetch failed",
+                table=table_name,
+                page=page_idx,
+                error_type=type(e).__name__,
+            )
+            break
+        page_rows = result.data or []
+        all_rows.extend(page_rows)
+        if len(page_rows) < _PAGE:
+            break  # last page reached
+        page_idx += 1
+    else:
         logger.warning(
-            "overlay map load failed — properties will render without badges",
-            error_type=type(e).__name__,
+            "paged fetch hit max pages — result may be incomplete",
+            table=table_name,
+            fetched=len(all_rows),
         )
-        return {}
+    return all_rows
+
+
+def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
+    """Fetch the whole overlay view and index it by (county, parcel_id).
+
+    Pages through the ENTIRE view (via _fetch_all_rows) — the previous single
+    .range(0, 9999) was silently capped at PostgREST's 1000-row maximum, so
+    every parcel past row 1000 lost its overlay and never matched (that's why
+    bare multi_signal searches under-counted). County is lowercased on both
+    sides to avoid a case mismatch (the view emits 'hennepin'; _SOURCE_TO_COUNTY
+    emits 'Hennepin'). Returns an empty map on failure so property listing
+    still works without the badge rather than 500-ing.
+    """
+    rows = _fetch_all_rows(
+        "parcel_distress_overlay",
+        "county, parcel_id, distinct_signal_count, is_triple_distress, "
+        "signal_families, max_severity, has_foreclosure, "
+        "has_vacant_condemned, has_tax_delinquent, has_tax_forfeit, "
+        "has_special_assessment",
+    )
 
     overlay_map: dict[tuple[str, str], dict[str, Any]] = {}
     for r in rows:
@@ -658,6 +691,8 @@ def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
             "has_special_assessment": r.get("has_special_assessment"),
         }
     return overlay_map
+
+
 def _load_owner_map() -> dict[str, dict[str, Any]]:
     """Fetch signals.owner_distress_summary once and index it by owner_norm.
 
