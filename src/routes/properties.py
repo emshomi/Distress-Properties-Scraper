@@ -1472,8 +1472,7 @@ async def list_properties(
 
             
 
-            # Apply the multi-signal filter (if requested) on the shaped rows,
-            
+           # Apply the multi-signal filter (if requested) on the shaped rows,
             # since signal counts come from the overlay attached during shaping.
             if multi_signal is not None:
                 shaped = [
@@ -1481,6 +1480,17 @@ async def list_properties(
                     if s.get("overlay")
                     and (s["overlay"].get("distinct_signal_count") or 0) >= multi_signal
                 ]
+
+                # De-duplicate to ONE row per parcel. A multi-signal parcel has
+                # multiple event rows by definition (that's WHY it's
+                # multi-signal — events from different sources), plus a single
+                # source can emit many rows for one parcel (e.g. repeated
+                # condemned-building notices). Without de-dup the same property
+                # appears many times and the count balloons (110 parcels -> 550+
+                # rows). We collapse by the effective parcel key and keep the
+                # most-actionable representative; the parcel's full cross-signal
+                # badge is preserved on whichever row represents it.
+                shaped = _dedupe_by_parcel(shaped)
 
             # 'sort' may be a normal column here (when multi_signal forced this
             # path); _sort_computed passes those through unchanged, so the rows
