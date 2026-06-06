@@ -167,5 +167,93 @@ async def ai_search(
         "offset": inner.get("offset", body.offset),
     })
 
+# ============================================================
+# POST /ai/summary — plain-English summary of one property
+# ============================================================
 
+
+class SummaryBody(BaseModel):
+    """Request body for a single-property summary. Identifies the property by
+    its natural key (source, source_id) — the same key /properties uses."""
+    source: str = Field(..., max_length=100)
+    source_id: str = Field(..., max_length=200)
+
+
+@router.post(
+    "/summary",
+    status_code=http_status.HTTP_200_OK,
+    summary="Plain-English summary of one property (fact-constrained).",
+)
+async def ai_summary(
+    body: SummaryBody,
+    _access_key: str = Depends(require_access_key),
+) -> dict[str, Any]:
+    """Fetch one property by (source, source_id), shape it through the same
+    path the table uses, then produce a plain-English summary that can only
+    restate facts present in the row (no fabrication — see property_summary).
+
+    Fails honestly: if the property isn't found we 404; if the LLM is
+    unavailable we return ok=False with an explanation rather than inventing
+    a summary."""
+    from src.routes.properties import (
+        _load_overlay_map,
+        _load_owner_map,
+        _shape_property_row,
+    )
+    from src.db.supabase_client import signals_table
+
+    # Fetch the single row by its natural key.
+    try:
+        result = (
+            signals_table("distress_events")
+            .select(
+                "source_id, source, parcel_id, event_type, event_date, "
+                "event_value, severity, title, description, raw_data, "
+                "observed_at"
+            )
+            .eq("source", body.source)
+            .eq("source_id", body.source_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.exception(
+            "ai_summary: property fetch failed",
+            error_type=type(e).__name__,
+        )
+        return _envelope({
+            "ok": False,
+            "error": "fetch_failed",
+            "summary": None,
+        })
+
+    if not rows:
+        return _envelope({
+            "ok": False,
+            "error": "not_found",
+            "summary": None,
+        })
+
+    # Shape it (attaches overlay + owner portfolio), then summarize.
+    overlay_map = _load_overlay_map()
+    owner_map = _load_owner_map()
+    shaped = _shape_property_row(rows[0], overlay_map, owner_map)
+    shaped.pop("_eff_key", None)
+
+    summary = summarize_property(shaped)
+
+    if not summary.ok:
+        return _envelope({
+            "ok": False,
+            "error": summary.error,
+            "summary": None,
+        })
+
+    return _envelope({
+        "ok": True,
+        "summary": summary.summary,
+        "source": body.source,
+        "source_id": body.source_id,
+    })
 __all__ = ["router"]
