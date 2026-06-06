@@ -1398,17 +1398,49 @@ async def list_properties(
         needs_fetch_all = sort in computed_sorts or multi_signal is not None
 
         if needs_fetch_all:
-            
-            # Fetch all matching rows (generous cap), shape, sort, paginate.
-            _ALL_CAP = 2000
-            query = query.range(0, _ALL_CAP - 1)
-            result = query.execute()
-            rows = result.data or []
-            total = result.count or 0
+
+            # Fetch EVERY matching row before shaping/filtering — never a
+            # single capped slice. The multi_signal filter and computed sorts
+            # operate on the shaped rows, so an incomplete fetch silently
+            # hides results (e.g. bare multi_signal=2 missing the multi-signal
+            # parcels because they fell outside a 2000-row window). We page
+            # through the full result set until exhausted, so the answer is
+            # complete now and stays complete as the data grows.
+            _PAGE = 1000          # rows per page request
+            _MAX_PAGES = 1000     # hard safety stop (= up to 1M rows) so a bug
+                                  # can never spin forever
+            rows: list[dict[str, Any]] = []
+            total = 0
+            page_idx = 0
+            while page_idx < _MAX_PAGES:
+                start = page_idx * _PAGE
+                end = start + _PAGE - 1
+                page_result = query.range(start, end).execute()
+                page_rows = page_result.data or []
+                # count is the same on every page (exact total of the filtered
+                # query); capture it once for the honest "X of Y".
+                if page_result.count is not None:
+                    total = page_result.count
+                rows.extend(page_rows)
+                # Last page reached when we got fewer rows than we asked for.
+                if len(page_rows) < _PAGE:
+                    break
+                page_idx += 1
+            else:
+                # Loop exhausted _MAX_PAGES without a short page — log it so a
+                # runaway dataset is visible rather than silently truncated.
+                logger.warning(
+                    "list_properties: fetch-all hit max pages — result may be "
+                    "incomplete",
+                    fetched=len(rows),
+                    max_pages=_MAX_PAGES,
+                )
 
             overlay_map = _load_overlay_map()
             owner_map = _load_owner_map()
             shaped = [_shape_property_row(r, overlay_map, owner_map) for r in rows]
+
+            
 
             # Apply the multi-signal filter (if requested) on the shaped rows,
             
