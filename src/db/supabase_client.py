@@ -139,5 +139,6 @@ __all__ = [
     "audit_table",
     "scoring_table",
     "access_table",
+    "ai_table",
     "ping_supabase",
 ]
