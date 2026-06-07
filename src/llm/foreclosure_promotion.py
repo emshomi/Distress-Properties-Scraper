@@ -167,11 +167,28 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
         "raw_data": raw_data,
     }
 
+    # core.parcels row — distress_events.parcel_id has a FK to core.parcels,
+    # so the synthetic parcel must exist there first (mirrors how the sheriff
+    # scraper inserts a parcels row before its distress_events row).
+    parcel_row = {
+        "parcel_id": synthetic_pid,
+        "state": "MN",
+        "county_code": county,
+        "address": address if address != "address not stated" else None,
+        "city": city or None,
+        "data_sources": ["startribune_legal"],
+        "raw_data": {
+            "gis_pid": real_pid,
+            "source_url": extracted.get("source_url"),
+            "extracted": True,
+        },
+    }
+
     return {
         "source_id": source_id,
+        "parcel_row": parcel_row,
         "distress_event": distress_event,
         "sheriff_sale": sheriff_sale,
     }
-
 
 __all__ = ["build_promotion_rows", "derive_source_id"]
