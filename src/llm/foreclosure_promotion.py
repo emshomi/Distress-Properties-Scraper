@@ -1,9 +1,10 @@
 """
 Promotion of an approved ai.extracted_foreclosures row into the live signals
-tables (signals.distress_events + signals.sheriff_sales).
+tables (signals.distress_events + signals.sheriff_sales), plus the core.parcels
+row their foreign keys depend on.
 
-This module does the TRANSFORMATION only — it builds the two target rows from
-an extracted-foreclosure record. The actual DB writes live in the endpoint, so
+This module does the TRANSFORMATION only — it builds the target rows from an
+extracted-foreclosure record. The actual DB writes live in the endpoint, so
 this logic stays pure and testable.
 
 Rows are written OVERLAY-READY: the real parcel PID goes to
@@ -15,6 +16,13 @@ county and participate in the multi-signal overlay).
 These notices are SCHEDULED (future) sheriff sales, not completed ones, so they
 are labeled event_subtype='scheduled' and worded accordingly — never presented
 as a sale that already happened.
+
+FK chain (why a parcel row is built first):
+  signals.distress_events.parcel_id -> core.parcels.parcel_id
+  core.parcels.county_code           -> core.counties.county_code  (lowercase slug)
+So promotion must (1) ensure the parcel exists with a valid county_code slug,
+then (2) insert distress_events. county_code uses the core.counties slug format
+('scott', 'st_louis', 'otter_tail'), NOT the title-case county name.
 """
 
 from __future__ import annotations
@@ -29,6 +37,19 @@ def _county_upper(county: Optional[str]) -> str:
 
 def _county_lower(county: Optional[str]) -> str:
     return (county or "unknown").strip().lower()
+
+
+def _county_slug(county: Optional[str]) -> Optional[str]:
+    """Convert a county name to the core.counties county_code slug: lowercase,
+    non-alphanumeric collapsed to a single underscore. Matches the seeded
+    values exactly: 'Scott' -> 'scott', 'St. Louis' -> 'st_louis',
+    'Otter Tail' -> 'otter_tail'. Returns None if no county given."""
+    if not county:
+        return None
+    s = str(county).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or None
 
 
 def _money_str(value: Any) -> str:
@@ -86,11 +107,12 @@ def derive_source_id(extracted: dict[str, Any]) -> str:
 
 
 def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
-    """Given an ai.extracted_foreclosures record (as a dict), build the two
-    target rows. Returns {'source_id', 'distress_event', 'sheriff_sale'}.
+    """Given an ai.extracted_foreclosures record (as a dict), build the target
+    rows. Returns {'source_id', 'parcel_row', 'distress_event', 'sheriff_sale'}.
     Pure — no DB access."""
     county = extracted.get("county")
     county_lo = _county_lower(county)
+    county_code = _county_slug(county)  # FK-valid slug for core.counties
     source_id = derive_source_id(extracted)
     real_pid = extracted.get("parcel_id")  # the real GIS PID, e.g. '220570230'
     synthetic_pid = _synthetic_pid(county, source_id)
@@ -163,17 +185,18 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
         "redemption_period_months": _parse_redemption_months(redemption),
         "sale_status": "scheduled",
         "postponement_count": 0,
-        "county_code": county,
+        "county_code": county_code,
         "raw_data": raw_data,
     }
 
     # core.parcels row — distress_events.parcel_id has a FK to core.parcels,
     # so the synthetic parcel must exist there first (mirrors how the sheriff
-    # scraper inserts a parcels row before its distress_events row).
+    # scraper inserts a parcels row before its distress_events row). county_code
+    # must be the core.counties slug, not the title-case name.
     parcel_row = {
         "parcel_id": synthetic_pid,
         "state": "MN",
-        "county_code": county,
+        "county_code": county_code,
         "address": address if address != "address not stated" else None,
         "city": city or None,
         "data_sources": ["startribune_legal"],
@@ -190,5 +213,6 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
         "distress_event": distress_event,
         "sheriff_sale": sheriff_sale,
     }
+
 
 __all__ = ["build_promotion_rows", "derive_source_id"]
