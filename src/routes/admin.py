@@ -58,8 +58,10 @@ async def list_requests() -> dict[str, Any]:
         )
         return success_envelope({"requests": result.data or []})
     except Exception as e:
-        logger.exception("admin approve extraction failed", error_type=type(e).__name__)
-        raise HTTPException(status_code=500, detail=f"approve failed: {e}")
+        logger.exception(
+            "admin list requests failed", error_type=type(e).__name__
+        )
+        raise HTTPException(status_code=500, detail="Failed to list requests.")
 
 # ============================================================
 # POST /admin/approve — approve a request + email the link
