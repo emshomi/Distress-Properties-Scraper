@@ -16,6 +16,7 @@ from src.llm.client import call_claude
 from src.llm.nl_search import compile_query
 from src.llm.property_summary import summarize_property
 from src.llm.foreclosure_extraction import extract_foreclosure_notice
+from src.llm.foreclosure_extraction import extract_foreclosure_notice
 from src.routes.properties import list_properties, require_access_key
 from src.utils.logger import logger
 
