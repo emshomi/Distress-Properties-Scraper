@@ -1,13 +1,17 @@
 """
-Admin endpoints for managing access requests to the gated /data page.
+Admin endpoints for managing access requests to the gated /data page, plus
+review/promotion of extracted foreclosure notices (Feature #5).
 
 All endpoints require the admin key (X-Admin-Key header), reusing the same
 AdminKeyRequired dependency as the trigger routes.
 
 Routes:
-    GET  /admin/requests   — list all access requests (pending/approved/blocked)
-    POST /admin/approve    — approve a request (generates key, emails the link)
-    POST /admin/decline    — block a request
+    GET  /admin/requests            — list all access requests
+    POST /admin/approve             — approve a request (generates key, emails)
+    POST /admin/decline             — block a request
+    GET  /admin/extractions         — list extracted foreclosure notices
+    POST /admin/extractions/approve — promote an extraction to live tables
+    POST /admin/extractions/reject  — reject an extraction
 """
 
 from __future__ import annotations
@@ -20,7 +24,12 @@ from fastapi import APIRouter, HTTPException, status as http_status
 from pydantic import BaseModel
 
 from src.middleware.auth import AdminKeyRequired
-from src.db.supabase_client import access_table, ai_table, signals_table
+from src.db.supabase_client import (
+    access_table,
+    ai_table,
+    signals_table,
+    core_table,
+)
 from src.llm.foreclosure_promotion import build_promotion_rows
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
@@ -62,6 +71,7 @@ async def list_requests() -> dict[str, Any]:
             "admin list requests failed", error_type=type(e).__name__
         )
         raise HTTPException(status_code=500, detail="Failed to list requests.")
+
 
 # ============================================================
 # POST /admin/approve — approve a request + email the link
@@ -151,7 +161,6 @@ async def approve_request(payload: AdminActionIn) -> dict[str, Any]:
             "id": row["id"],
             "status": row["status"],
             "email_sent": email_sent,
-            # Return the link so the admin UI can show/copy it even if email failed.
             "access_link": f"{_SITE_ORIGIN}/data?key={row['access_key']}"
             if row.get("access_key") else None,
         })
@@ -193,7 +202,8 @@ async def decline_request(payload: AdminActionIn) -> dict[str, Any]:
 # ============================================================
 # Admin-gated review of ai.extracted_foreclosures. Approving promotes the
 # extracted notice into the live signals tables (distress_events +
-# sheriff_sales); rejecting marks it and never promotes.
+# sheriff_sales) plus the core.parcels row their FKs depend on; rejecting
+# marks it and never promotes.
 
 
 @router.get(
@@ -235,10 +245,10 @@ async def list_extractions(status: str = "pending") -> dict[str, Any]:
     dependencies=[AdminKeyRequired],
 )
 async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
-    """Promote one approved extraction into signals.distress_events +
+    """Promote one extraction into core.parcels + signals.distress_events +
     signals.sheriff_sales, then stamp it approved/promoted. Idempotent: if a
     distress_events row with the same (source, source_id) already exists, we
-    skip the insert but still mark the extraction approved."""
+    skip the inserts but still mark the extraction approved."""
     try:
         row_result = (
             ai_table("extracted_foreclosures")
@@ -261,6 +271,7 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
         built = build_promotion_rows(extracted)
         source_id = built["source_id"]
 
+        # Idempotency guard: does the distress_events row already exist?
         existing = (
             signals_table("distress_events")
             .select("id")
@@ -270,17 +281,24 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
             .execute()
         )
         already = bool(existing.data)
-if not already:
-            # Insert the parcel first (distress_events.parcel_id FKs to
-            # core.parcels). Upsert so a re-run after a partial failure is safe.
-            from src.db.supabase_client import core_table
-            core_table("parcels").upsert(
-                built["parcel_row"],
-                on_conflict="parcel_id",
-                ignore_duplicates=True,
-            ).execute()
+
+        if not already:
+            # FK chain: distress_events.parcel_id -> core.parcels.parcel_id,
+            # and core.parcels.county_code -> core.counties.county_code. So the
+            # parcel must exist first. Check-then-insert (plain insert, so any
+            # error surfaces rather than silently no-op'ing).
+            pid = built["parcel_row"]["parcel_id"]
+            parcel_exists = (
+                core_table("parcels")
+                .select("parcel_id")
+                .eq("parcel_id", pid)
+                .limit(1)
+                .execute()
+            )
+            if not parcel_exists.data:
+                core_table("parcels").insert(built["parcel_row"]).execute()
+
             signals_table("distress_events").insert(built["distress_event"]).execute()
-            signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
             signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
 
         ts = datetime.now(timezone.utc).isoformat()
@@ -308,7 +326,10 @@ if not already:
         raise
     except Exception as e:
         logger.exception("admin approve extraction failed", error_type=type(e).__name__)
-        raise HTTPException(status_code=500, detail=f"approve failed: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"approve failed: {type(e).__name__}: {e}",
+        )
 
 
 @router.post(
