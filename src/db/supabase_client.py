@@ -98,6 +98,11 @@ def access_table(table_name: str) -> Any:
     """Access a table in the `access` schema (access_requests — the /data gate)."""
     return get_client().schema("access").table(table_name)
 
+def ai_table(table_name: str) -> Any:
+    """Access a table in the `ai` schema (extracted_foreclosures — the
+    document-extraction staging/review pipeline, owned by this service)."""
+    return get_client().schema("ai").table(table_name)
+
 
 # ============================================================
 # CONNECTIVITY CHECK
