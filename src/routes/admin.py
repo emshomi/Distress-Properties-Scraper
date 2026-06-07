@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from src.middleware.auth import AdminKeyRequired
 from src.db.supabase_client import access_table, ai_table, signals_table
+from src.llm.foreclosure_promotion import build_promotion_rows
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
 
