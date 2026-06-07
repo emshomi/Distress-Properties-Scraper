@@ -174,7 +174,7 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     }
 
     sheriff_sale = {
-        "parcel_id": real_pid,
+        "parcel_id": synthetic_pid,
         "sale_date": sale_date,
         "sale_time": _parse_sale_time(extracted.get("sale_time")),
         "sale_location": extracted.get("sale_location"),
