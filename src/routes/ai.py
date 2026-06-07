@@ -319,29 +319,51 @@ async def ai_extract(
     row["model"] = extraction.model
     # review_status defaults to 'pending' in the table; fetched_at defaults now().
 
+    # Pre-check for an existing row with this source_url (manual idempotency,
+    # rather than relying on upsert's ignore-duplicates returning data).
+    try:
+        existing = (
+            ai_table("extracted_foreclosures")
+            .select("id")
+            .eq("source_url", body.source_url)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return _envelope({
+                "ok": True,
+                "stored": False,
+                "duplicate": True,
+                "id": existing.data[0]["id"],
+                "data": extraction.data,
+                "model": extraction.model,
+            })
+    except Exception as e:
+        logger.exception("ai_extract: dup-check failed", error_type=type(e).__name__)
+        return _envelope({
+            "ok": True, "stored": False, "store_error": f"dup_check: {e}",
+            "data": extraction.data, "model": extraction.model,
+        })
+
+    # Plain insert. Surface the real error message so we can see failures.
     try:
         result = (
             ai_table("extracted_foreclosures")
-            .upsert(row, on_conflict="source_url", ignore_duplicates=True)
+            .insert(row)
             .execute()
         )
         inserted = bool(result.data)
         stored_id = result.data[0]["id"] if inserted else None
     except Exception as e:
-        logger.exception(
-            "ai_extract: insert failed",
-            error_type=type(e).__name__,
-        )
-        # Extraction succeeded; storage failed. Return the data so the work
-        # isn't lost, but be honest that it wasn't stored.
+        logger.exception("ai_extract: insert failed", error_type=type(e).__name__)
         return _envelope({
             "ok": True,
             "stored": False,
-            "store_error": "insert_failed",
+            "store_error": str(e),   # the ACTUAL error, visible to us
             "data": extraction.data,
             "model": extraction.model,
         })
-
+      
     return _envelope({
         "ok": True,
         "stored": inserted,
