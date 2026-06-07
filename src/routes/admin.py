@@ -270,9 +270,17 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
             .execute()
         )
         already = bool(existing.data)
-
-        if not already:
+if not already:
+            # Insert the parcel first (distress_events.parcel_id FKs to
+            # core.parcels). Upsert so a re-run after a partial failure is safe.
+            from src.db.supabase_client import core_table
+            core_table("parcels").upsert(
+                built["parcel_row"],
+                on_conflict="parcel_id",
+                ignore_duplicates=True,
+            ).execute()
             signals_table("distress_events").insert(built["distress_event"]).execute()
+            signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
             signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
 
         ts = datetime.now(timezone.utc).isoformat()
