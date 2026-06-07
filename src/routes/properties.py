@@ -43,6 +43,9 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "washington_sheriff"},
         {"source": "scott_sheriff"},
         {"source": "carver_sheriff"},
+        # Extracted legal-notice foreclosures (statewide, from published
+        # Notice-of-Sale documents via the LLM extraction pipeline).
+        {"source": "startribune_legal"},
     ],
     "tax_forfeit": [
         {"source": "hennepin_tax_roll", "event_type": "tax_forfeit"},
@@ -62,6 +65,10 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "ramsey_tax_roll", "event_type": "tax_assessment"},
     ],
 }
+
+# Fixed source -> county for sources whose county is one-to-one with the
+# source name. Statewide/extracted sources (see _PER_ROW_COUNTY_SOURCES)
+# are NOT listed here — their county is resolved per-row from the data.
 _SOURCE_TO_COUNTY: dict[str, str] = {
     "anoka_sheriff": "Anoka",
     "dakota_sheriff": "Dakota",
@@ -77,6 +84,55 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     "ramsey_tax_roll": "Ramsey",
     "mn_dor_red_book": "Statewide",
 }
+
+# Reverse of the county_code slug -> display name, covering the counties
+# seeded in core.counties. Used to render a statewide/extracted row's
+# county (stored as a slug in raw_data.detail.county) back to a name.
+_SLUG_TO_COUNTY_NAME: dict[str, str] = {
+    "anoka": "Anoka",
+    "carver": "Carver",
+    "cass": "Cass",
+    "chisago": "Chisago",
+    "dakota": "Dakota",
+    "hennepin": "Hennepin",
+    "olmsted": "Olmsted",
+    "otter_tail": "Otter Tail",
+    "ramsey": "Ramsey",
+    "scott": "Scott",
+    "st_louis": "St. Louis",
+    "stearns": "Stearns",
+    "washington": "Washington",
+    "wright": "Wright",
+}
+
+# Sources whose county is NOT one-to-one with the source name (statewide
+# feeds). For these we resolve county per-row from raw_data.detail.county
+# (a lowercase slug), mapped back to the display name. Everything else uses
+# the fixed _SOURCE_TO_COUNTY map.
+_PER_ROW_COUNTY_SOURCES = {"startribune_legal"}
+
+
+def _resolve_county(source: str, raw: dict) -> Optional[str]:
+    """County display name for a row.
+
+    Statewide/extracted sources carry their own county in
+    raw_data.detail.county (slug, e.g. 'scott'); we map that back to a display
+    name. All other sources use the fixed source->county map. Returns None
+    when no county is resolvable (honest em-dash)."""
+    if source in _PER_ROW_COUNTY_SOURCES:
+        detail = raw.get("detail") or {}
+        slug = (detail.get("county") or "").strip().lower()
+        if not slug:
+            return None
+        return _SLUG_TO_COUNTY_NAME.get(slug, slug.replace("_", " ").title())
+    return _SOURCE_TO_COUNTY.get(source)
+
+
+def _sources_for_county(county: str) -> list[str]:
+    """All fixed-mapping sources for a county name. Does NOT include
+    per-row-county sources (startribune_legal) — those can't be filtered by a
+    simple source IN-list, so the county filter handles them separately."""
+    return [src for src, c in _SOURCE_TO_COUNTY.items() if c == county]
 
 
 router = APIRouter(tags=["properties"])
@@ -403,7 +459,8 @@ def _extract_hennepin_tax(raw: dict, row: dict) -> dict[str, Any]:
         "annual_tax": annual_tax,
         "special_assessment_due": raw.get("special_assessment_due"),
     }
-    
+
+
 def _extract_hennepin_sheriff(raw: dict, row: dict) -> dict[str, Any]:
     """hennepin_sheriff — clean JSON API. raw_data holds the full detail
     record at the top level (not nested under list/detail). Mortgagors are
@@ -524,6 +581,56 @@ def _extract_washington(raw: dict, row: dict) -> dict[str, Any]:
         "homestead": detail.get("gis_homestead"),
     }
 
+
+def _extract_startribune_legal(raw: dict, row: dict) -> dict[str, Any]:
+    """startribune_legal — extracted legal foreclosure notices (Feature #5).
+    raw_data is the shape written by the promotion module: address/city at the
+    top level, mortgagee, mortgagors:[{display}], amount_due, redemption_period,
+    and a detail block carrying the real PID (gis_pid) + county slug. These are
+    SCHEDULED (future) sheriff sales, so status reflects that — never 'Sold'.
+    The real parcel PID is surfaced as tax_parcel_no; the owner is the notice
+    mortgagor (no assessor enrichment on these yet)."""
+    detail = raw.get("detail") or {}
+
+    mortgagors = raw.get("mortgagors") or []
+    owner = None
+    if isinstance(mortgagors, list):
+        names = [
+            (m.get("display") or "").strip()
+            for m in mortgagors
+            if isinstance(m, dict) and (m.get("display") or "").strip()
+        ]
+        owner = "; ".join(n for n in names if n) or None
+
+    return {
+        "address": raw.get("address"),
+        "city": raw.get("city"),
+        "zip": None,
+        "owner": owner,
+        "sale_date": raw.get("dateOfSale") or row.get("event_date"),
+        "sale_time": None,
+        "amount": raw.get("amount_due") or row.get("event_value"),
+        # Scheduled (upcoming) sale — not completed.
+        "status": "Scheduled sale",
+        "tax_parcel_no": detail.get("gis_pid"),
+        "original_principal": None,
+        "municipality": raw.get("city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": None,
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+        "owner_mailing": None,
+        "is_absentee": None,
+        "homestead": None,
+        "mortgagee": raw.get("mortgagee"),
+        "law_firm": raw.get("lawFirm"),
+    }
+
+
 def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
     """Fallback extractor for unknown sources. Tries common keys."""
     return {
@@ -565,6 +672,7 @@ _EXTRACTORS: dict[str, Any] = {
     "hennepin_sheriff": _extract_hennepin_sheriff,
     "dakota_sheriff": _extract_dakota,
     "washington_sheriff": _extract_washington,
+    "startribune_legal": _extract_startribune_legal,
     "mpls_vbr": _extract_mpls_vbr,
     "saint_paul_vacant": _extract_saint_paul_vacant,
     "saint_paul_dsi": _extract_saint_paul_vacant,
@@ -758,6 +866,7 @@ _FORECLOSURE_SOURCES = {
     "washington_sheriff",
     "scott_sheriff",
     "carver_sheriff",
+    "startribune_legal",
 }
 
 
@@ -807,6 +916,8 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
       * Dakota's feed is completed sales by definition and carries no per-row
         status, so it passes the guard and estimates as before.
       * Hennepin/Ramsey never reach the estimate (they have a published date).
+      * startribune_legal notices are SCHEDULED (future) sales — the sale has
+        not happened, so no redemption window yet (all-null).
     """
     null_result = {
         "redemption_ends_at": None,
@@ -838,6 +949,10 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
         elif source == "anoka_sheriff":
             # Anoka pulls a PENDING list; a null status means the sale has
             # not been confirmed completed. No redemption window.
+            sale_completed = False
+        elif source == "startribune_legal":
+            # Extracted notices are SCHEDULED future sales — not completed,
+            # so no redemption window until the sale actually occurs.
             sale_completed = False
 
         if sale_completed:
@@ -887,7 +1002,7 @@ def _shape_property_row(
         "source": source,
         "source_id": row.get("source_id"),
         "parcel_id": row.get("parcel_id"),
-        "county": _SOURCE_TO_COUNTY.get(source),
+        "county": _resolve_county(source, raw),
         "event_type": row.get("event_type"),
         "title": row.get("title"),
         "description": row.get("description"),
@@ -902,7 +1017,7 @@ def _shape_property_row(
     # have many event rows — e.g. 9 condemned-building notices). Stripped
     # before the response is returned.
     _eff_pid = _effective_parcel_id(source, raw, row)
-    _county_lower = (_SOURCE_TO_COUNTY.get(source) or "").lower()
+    _county_lower = (_resolve_county(source, raw) or "").lower()
     shaped["_eff_key"] = (_county_lower, _eff_pid) if _eff_pid else None
 
     overlay = None
@@ -989,8 +1104,10 @@ async def stats_endpoint() -> dict[str, Any]:
     total_signals = sum(c["count"] for c in categories if c["id"] != "parcels")
 
     # Probe each known source for presence (avoids the 1k-row response cap).
+    # Include the per-row-county sources too so they count toward data_sources.
+    _probe_sources = set(_SOURCE_TO_COUNTY.keys()) | _PER_ROW_COUNTY_SOURCES
     distinct_sources: set[str] = set()
-    for src in _SOURCE_TO_COUNTY.keys():
+    for src in _probe_sources:
         try:
             r = (
                 signals_table("distress_events")
@@ -1030,9 +1147,7 @@ async def stats_endpoint() -> dict[str, Any]:
 
     counties_breakdown: list[dict[str, Any]] = []
     for county in sorted(distinct_counties):
-        county_sources = [
-            src for src, c in _SOURCE_TO_COUNTY.items() if c == county
-        ]
+        county_sources = _sources_for_county(county)
         try:
             cresult = (
                 signals_table("distress_events")
@@ -1202,6 +1317,7 @@ _SOURCE_ACTIONABILITY: dict[str, int] = {
     "washington_sheriff": 1,
     "scott_sheriff": 1,
     "carver_sheriff": 1,
+    "startribune_legal": 1,
     "hennepin_tax_roll": 3,   # tax_forfeit vs delinquent split in _actionability_rank
     "ramsey_tax_roll": 3,
     "mn_dor_red_book": 2,
@@ -1394,17 +1510,40 @@ async def list_properties(
             query = query.eq("source", source)
 
         if county:
-            county_sources = [
-                src for src, c in _SOURCE_TO_COUNTY.items() if c == county
-            ]
-            if not county_sources:
+            # Sources whose county is fixed by name (IN-list filterable).
+            county_sources = _sources_for_county(county)
+            # Per-row-county sources (statewide/extracted) can't be filtered
+            # by a source IN-list — their county lives in raw_data.detail.county
+            # as a slug. We OR a JSON-path match on that slug so a county query
+            # finds them too. Build the slug from the requested county name.
+            slug = None
+            for s, name in _SLUG_TO_COUNTY_NAME.items():
+                if name == county:
+                    slug = s
+                    break
+
+            if county_sources and slug:
+                src_list = ",".join(county_sources)
+                # (source in fixed-list) OR (per-row source AND detail.county == slug)
+                query = query.or_(
+                    f"source.in.({src_list}),"
+                    f"and(source.in.({','.join(_PER_ROW_COUNTY_SOURCES)}),"
+                    f"raw_data->detail->>county.eq.{slug})"
+                )
+            elif county_sources:
+                query = query.in_("source", county_sources)
+            elif slug:
+                # Only resolvable via per-row county.
+                query = query.in_("source", list(_PER_ROW_COUNTY_SOURCES))
+                query = query.eq("raw_data->detail->>county", slug)
+            else:
+                # Unknown county — no rows.
                 return success_envelope({
                     "properties": [],
                     "total": 0,
                     "limit": limit,
                     "offset": offset,
                 })
-            query = query.in_("source", county_sources)
 
         if status_filter:
             sv = status_filter.strip().lower()
