@@ -188,4 +188,139 @@ async def decline_request(payload: AdminActionIn) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to decline request.")
 
 
+# ============================================================
+# Foreclosure-notice extraction review (Feature #5)
+# ============================================================
+# Admin-gated review of ai.extracted_foreclosures. Approving promotes the
+# extracted notice into the live signals tables (distress_events +
+# sheriff_sales); rejecting marks it and never promotes.
+
+
+@router.get(
+    "/extractions",
+    status_code=http_status.HTTP_200_OK,
+    summary="List extracted foreclosure notices for review.",
+    dependencies=[AdminKeyRequired],
+)
+async def list_extractions(status: str = "pending") -> dict[str, Any]:
+    """Return extracted foreclosure notices filtered by review_status
+    (default 'pending'), lowest-confidence first so the rows most needing a
+    human look surface at the top."""
+    try:
+        result = (
+            ai_table("extracted_foreclosures")
+            .select(
+                "id, source_url, source_name, fetched_at, mortgagor, mortgagee, "
+                "property_address, city, county, parcel_id, original_principal, "
+                "amount_due, sale_date, sale_time, sale_location, "
+                "redemption_period, vacate_date, attorney_firm, attorney_file_no, "
+                "confidence, extraction_notes, review_status, reviewed_at, "
+                "promoted_at, model"
+            )
+            .eq("review_status", status)
+            .order("confidence", desc=False)
+            .limit(500)
+            .execute()
+        )
+        return success_envelope({"extractions": result.data or []})
+    except Exception as e:
+        logger.exception("admin list extractions failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to list extractions.")
+
+
+@router.post(
+    "/extractions/approve",
+    status_code=http_status.HTTP_200_OK,
+    summary="Approve an extracted notice and promote it to the live tables.",
+    dependencies=[AdminKeyRequired],
+)
+async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
+    """Promote one approved extraction into signals.distress_events +
+    signals.sheriff_sales, then stamp it approved/promoted. Idempotent: if a
+    distress_events row with the same (source, source_id) already exists, we
+    skip the insert but still mark the extraction approved."""
+    try:
+        row_result = (
+            ai_table("extracted_foreclosures")
+            .select("*")
+            .eq("id", payload.id)
+            .limit(1)
+            .execute()
+        )
+        rows = row_result.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Extraction not found.")
+        extracted = rows[0]
+
+        if extracted.get("review_status") == "rejected":
+            raise HTTPException(
+                status_code=409,
+                detail="This extraction was rejected; cannot approve.",
+            )
+
+        built = build_promotion_rows(extracted)
+        source_id = built["source_id"]
+
+        existing = (
+            signals_table("distress_events")
+            .select("id")
+            .eq("source", "startribune_legal")
+            .eq("source_id", source_id)
+            .limit(1)
+            .execute()
+        )
+        already = bool(existing.data)
+
+        if not already:
+            signals_table("distress_events").insert(built["distress_event"]).execute()
+            signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
+
+        ts = datetime.now(timezone.utc).isoformat()
+        ai_table("extracted_foreclosures").update({
+            "review_status": "approved",
+            "reviewed_at": ts,
+            "promoted_at": ts,
+        }).eq("id", payload.id).execute()
+
+        logger.info(
+            "extraction approved + promoted",
+            extraction_id=payload.id,
+            source_id=source_id,
+            already_existed=already,
+        )
+        return success_envelope({
+            "id": payload.id,
+            "status": "approved",
+            "promoted": not already,
+            "duplicate": already,
+            "source_id": source_id,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("admin approve extraction failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to approve extraction.")
+
+
+@router.post(
+    "/extractions/reject",
+    status_code=http_status.HTTP_200_OK,
+    summary="Reject an extracted notice (never promoted).",
+    dependencies=[AdminKeyRequired],
+)
+async def reject_extraction(payload: AdminActionIn) -> dict[str, Any]:
+    """Mark an extraction rejected. It is never promoted to the live tables."""
+    try:
+        ai_table("extracted_foreclosures").update({
+            "review_status": "rejected",
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", payload.id).execute()
+        logger.info("extraction rejected", extraction_id=payload.id)
+        return success_envelope({"id": payload.id, "status": "rejected"})
+    except Exception as e:
+        logger.exception("admin reject extraction failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to reject extraction.")
+
+
 __all__ = ["router"]
