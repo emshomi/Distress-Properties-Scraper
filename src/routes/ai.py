@@ -259,68 +259,98 @@ async def ai_summary(
     })
 
 # ============================================================
-# POST /ai/extract-test — TEMPORARY: verify foreclosure-notice
-# extraction before building the full pipeline. Remove after testing.
+# POST /ai/extract — extract one foreclosure notice and store it
+# in ai.extracted_foreclosures (pending human review).
 # ============================================================
 
 
-class ExtractTestBody(BaseModel):
-    """Raw notice text to run the extraction prompt against."""
+class ExtractBody(BaseModel):
+    """A single foreclosure-notice to extract and stage for review."""
     notice_text: str = Field(..., max_length=20000)
+    source_url: str = Field(..., max_length=1000)
+    source_name: str = Field(default="manual", max_length=100)
+    store: bool = Field(
+        default=True,
+        description="If false, extract and return without writing to the DB "
+        "(dry run for testing).",
+    )
 
 
-_FORECLOSURE_EXTRACTION_SYSTEM = (
-    "You extract structured data from Minnesota mortgage foreclosure sale "
-    "notices (published 'Notice of Mortgage Foreclosure Sale' legal notices).\n\n"
-    "Return ONLY a single JSON object — no prose, no markdown, no code "
-    "fences — with EXACTLY these keys:\n"
-    '{"mortgagor","mortgagee","property_address","city","county",'
-    '"parcel_id","legal_description","original_principal","amount_due",'
-    '"sale_date","sale_time","sale_location","redemption_period",'
-    '"vacate_date","attorney_firm","attorney_file_no","confidence",'
-    '"extraction_notes"}\n\n'
-    "RULES:\n"
-    "- Use ONLY information explicitly stated. If a field is not present, use "
-    "null. NEVER guess, infer, or fabricate.\n"
-    "- mortgagor = the borrower being foreclosed on (labeled 'MORTGAGOR(S)').\n"
-    "- mortgagee = the CURRENT holder/assignee foreclosing now. If there is an "
-    "assignment chain, use the FINAL assignee and note the chain in "
-    "extraction_notes.\n"
-    "- Dates in YYYY-MM-DD. Partial/ambiguous date -> null, explain in notes.\n"
-    "- Money as plain numbers: 210895.10 (strip $, commas, words).\n"
-    "- redemption_period: copy the stated period as text, e.g. '6 months'.\n"
-    "- confidence: 0.0-1.0 for how cleanly this notice mapped to the fields. "
-    "Lower it for unusual notices (condo-association assessment lien rather "
-    "than a mortgage, missing address, ambiguous party).\n"
-    "- extraction_notes: briefly note anything a human reviewer should check "
-    "(assignment chain, lien type, missing fields). null if nothing notable.\n"
-    "- Output the JSON object and nothing else."
-)
-
-
-@router.post("/extract-test", status_code=http_status.HTTP_200_OK)
-async def ai_extract_test(
-    body: ExtractTestBody,
+@router.post("/extract", status_code=http_status.HTTP_200_OK)
+async def ai_extract(
+    body: ExtractBody,
     _access_key: str = Depends(require_access_key),
 ) -> dict[str, Any]:
-    """TEMPORARY verification endpoint. Runs the foreclosure-notice
-    extraction prompt against raw text and returns the raw model output so we
-    can hand-check accuracy before building the full pipeline."""
-    result = call_claude(
-        system=_FORECLOSURE_EXTRACTION_SYSTEM,
-        user=body.notice_text,
-        feature="foreclosure_extraction_test",
-        max_tokens=1000,
-    )
-    if not result.ok:
-        return _envelope({"ok": False, "error": result.error})
+    """Extract structured fields from one foreclosure notice and (by default)
+    insert the result into ai.extracted_foreclosures with review_status
+    'pending'. Nothing here reaches the live site until a human approves it.
+
+    Idempotent: the table's UNIQUE(source_url) plus ON CONFLICT DO NOTHING
+    means re-posting the same notice URL won't create a duplicate.
+
+    Fails honestly: if extraction fails we return ok=False with the raw model
+    output for debugging, and we do NOT write a half-baked row."""
+    extraction = extract_foreclosure_notice(body.notice_text)
+
+    if not extraction.ok:
+        return _envelope({
+            "ok": False,
+            "error": extraction.error,
+            "raw_output": extraction.raw_output,
+            "stored": False,
+        })
+
+    # Dry-run path: return the parsed result without storing.
+    if not body.store:
+        return _envelope({
+            "ok": True,
+            "stored": False,
+            "data": extraction.data,
+            "model": extraction.model,
+        })
+
+    # Build the row: extracted fields + provenance + audit.
+    from src.db.supabase_client import ai_table
+
+    row = dict(extraction.data)  # statutory + confidence + extraction_notes
+    row["source_url"] = body.source_url
+    row["source_name"] = body.source_name
+    row["raw_notice_text"] = body.notice_text
+    row["model"] = extraction.model
+    # review_status defaults to 'pending' in the table; fetched_at defaults now().
+
+    try:
+        result = (
+            ai_table("extracted_foreclosures")
+            .upsert(row, on_conflict="source_url", ignore_duplicates=True)
+            .execute()
+        )
+        inserted = bool(result.data)
+        stored_id = result.data[0]["id"] if inserted else None
+    except Exception as e:
+        logger.exception(
+            "ai_extract: insert failed",
+            error_type=type(e).__name__,
+        )
+        # Extraction succeeded; storage failed. Return the data so the work
+        # isn't lost, but be honest that it wasn't stored.
+        return _envelope({
+            "ok": True,
+            "stored": False,
+            "store_error": "insert_failed",
+            "data": extraction.data,
+            "model": extraction.model,
+        })
+
     return _envelope({
         "ok": True,
-        "raw_output": result.text,
-        "model": result.model,
-        "input_tokens": result.input_tokens,
-        "output_tokens": result.output_tokens,
-        "cost_usd": result.cost_usd,
+        "stored": inserted,
+        "duplicate": not inserted,  # already had this source_url
+        "id": stored_id,
+        "confidence": extraction.data.get("confidence"),
+        "review_status": "pending",
+        "data": extraction.data,
+        "model": extraction.model,
     })
-
+  
 __all__ = ["router"]
