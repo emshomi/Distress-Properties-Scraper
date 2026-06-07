@@ -298,9 +298,9 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
 
     except HTTPException:
         raise
-    except Exception as e:
+   except Exception as e:
         logger.exception("admin approve extraction failed", error_type=type(e).__name__)
-        raise HTTPException(status_code=500, detail="Failed to approve extraction.")
+        raise HTTPException(status_code=500, detail=f"approve failed: {type(e).__name__}: {e}")
 
 
 @router.post(
