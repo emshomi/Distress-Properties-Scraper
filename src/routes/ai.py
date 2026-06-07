@@ -256,4 +256,70 @@ async def ai_summary(
         "source": body.source,
         "source_id": body.source_id,
     })
+
+# ============================================================
+# POST /ai/extract-test — TEMPORARY: verify foreclosure-notice
+# extraction before building the full pipeline. Remove after testing.
+# ============================================================
+
+
+class ExtractTestBody(BaseModel):
+    """Raw notice text to run the extraction prompt against."""
+    notice_text: str = Field(..., max_length=20000)
+
+
+_FORECLOSURE_EXTRACTION_SYSTEM = (
+    "You extract structured data from Minnesota mortgage foreclosure sale "
+    "notices (published 'Notice of Mortgage Foreclosure Sale' legal notices).\n\n"
+    "Return ONLY a single JSON object — no prose, no markdown, no code "
+    "fences — with EXACTLY these keys:\n"
+    '{"mortgagor","mortgagee","property_address","city","county",'
+    '"parcel_id","legal_description","original_principal","amount_due",'
+    '"sale_date","sale_time","sale_location","redemption_period",'
+    '"vacate_date","attorney_firm","attorney_file_no","confidence",'
+    '"extraction_notes"}\n\n'
+    "RULES:\n"
+    "- Use ONLY information explicitly stated. If a field is not present, use "
+    "null. NEVER guess, infer, or fabricate.\n"
+    "- mortgagor = the borrower being foreclosed on (labeled 'MORTGAGOR(S)').\n"
+    "- mortgagee = the CURRENT holder/assignee foreclosing now. If there is an "
+    "assignment chain, use the FINAL assignee and note the chain in "
+    "extraction_notes.\n"
+    "- Dates in YYYY-MM-DD. Partial/ambiguous date -> null, explain in notes.\n"
+    "- Money as plain numbers: 210895.10 (strip $, commas, words).\n"
+    "- redemption_period: copy the stated period as text, e.g. '6 months'.\n"
+    "- confidence: 0.0-1.0 for how cleanly this notice mapped to the fields. "
+    "Lower it for unusual notices (condo-association assessment lien rather "
+    "than a mortgage, missing address, ambiguous party).\n"
+    "- extraction_notes: briefly note anything a human reviewer should check "
+    "(assignment chain, lien type, missing fields). null if nothing notable.\n"
+    "- Output the JSON object and nothing else."
+)
+
+
+@router.post("/extract-test", status_code=http_status.HTTP_200_OK)
+async def ai_extract_test(
+    body: ExtractTestBody,
+    _access_key: str = Depends(require_access_key),
+) -> dict[str, Any]:
+    """TEMPORARY verification endpoint. Runs the foreclosure-notice
+    extraction prompt against raw text and returns the raw model output so we
+    can hand-check accuracy before building the full pipeline."""
+    result = call_claude(
+        system=_FORECLOSURE_EXTRACTION_SYSTEM,
+        user=body.notice_text,
+        feature="foreclosure_extraction_test",
+        max_tokens=1000,
+    )
+    if not result.ok:
+        return _envelope({"ok": False, "error": result.error})
+    return _envelope({
+        "ok": True,
+        "raw_output": result.text,
+        "model": result.model,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "cost_usd": result.cost_usd,
+    })
+
 __all__ = ["router"]
