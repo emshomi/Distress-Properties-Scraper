@@ -249,8 +249,16 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                 P + "hdnCityScrollPosition": "-1",
                 P + "hdnPubScrollPosition": "-1",
                 P + "hdnField": "",
-                P + "btnGo": "GO",
+                # WebForms postback: trigger via __EVENTTARGET (the control's
+                # name), NOT by sending the button's value. The earlier attempt
+                # sent btnGo=GO, which the form ignored — the real trigger is
+                # __EVENTTARGET pointing at the button. We set it below, after
+                # the dict, so it overrides the empty default.
             }
+            post_data["__EVENTTARGET"] = P + "btnGo"
+            # __EVENTVALIDATION may be emitted; include it if the first GET had it.
+            if hidden.get("__EVENTVALIDATION"):
+                post_data["__EVENTVALIDATION"] = hidden["__EVENTVALIDATION"]
 
             post_headers = dict(_HEADERS)
             post_headers["Content-Type"] = "application/x-www-form-urlencoded"
