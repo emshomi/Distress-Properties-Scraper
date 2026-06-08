@@ -32,6 +32,7 @@ from src.db.supabase_client import (
 )
 from src.llm.foreclosure_promotion import build_promotion_rows
 from src.scrapers.startribune_legal import run_startribune_scrape
+from src.scrapers.mnpublicnotice_probe import probe_mnpublicnotice
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
 
