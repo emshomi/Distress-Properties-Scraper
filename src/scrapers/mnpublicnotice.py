@@ -178,11 +178,14 @@ def _harvest_form_fields(html: str) -> dict[str, str]:
 
 # Each notice's View button carries the notice ID in its onclick navigation:
 #   ...GridView1$ctlNN$btnView2" ... onclick="...Details.aspx?SID=..&amp;ID=12345..
-# We anchor on btnView2 + capture the ID, then read the publication/date from
-# the adjacent info cell and the teaser from the following colspan cell.
+# We anchor on btnView2, then match the FULL Details.aspx link so we capture the
+# real notice ID (the one after &ID=) and never a stray digit. The SID segment
+# is [A-Za-z0-9]+ and the &amp; may be HTML-escaped — same pattern as the proven
+# _DETAIL_ID_RE from the prior detail-fetch version.
 _ROW_ANCHOR_RE = re.compile(
-    r'GridView1\$ctl\d+\$btnView2"'      # the row's view button
-    r'[^>]*?onclick="[^"]*?ID=(\d+)',    # ...&ID=<noticeId> in the JS nav
+    r'GridView1\$ctl\d+\$btnView2"'              # the row's view button
+    r'[^>]*?onclick="[^"]*?'                     # ...into the JS nav...
+    r'Details\.aspx\?SID=[A-Za-z0-9]+&(?:amp;)?ID=(\d+)',  # the real notice ID
     re.IGNORECASE | re.DOTALL,
 )
 
