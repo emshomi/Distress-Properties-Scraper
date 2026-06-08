@@ -1,25 +1,29 @@
 """
-Diagnostic probe for mnpublicnotice.com (the MN Newspaper Association's
-statewide public-notice clearinghouse) — Step-4 source verification.
+Diagnostic probe for mnpublicnotice.com — full-form async search.
 
-NOT a scraper. A one-shot diagnostic run FROM the Railway server that reports
-exactly what our server receives when it tries to use the site. We build this
-BEFORE any scraper because the failure that broke the Star Tribune attempt was
-environment-specific. The only fetch environment that matters is our server —
-so we test there, first, and read the real result before building.
+NOT a scraper. Runs FROM the Railway server and reports what comes back.
 
-mnpublicnotice.com is ASP.NET WebForms with an AJAX UpdatePanel: the search
-runs as a partial async postback that updates a #searchResults panel in place
-(confirmed: results live at /Search.aspx#searchResults; plain full POSTs return
-the unchanged landing page). To replay the search server-side we need the real
-ScriptManager field name + UpdatePanel id, which this probe dumps.
+KEY INSIGHT (from DevTools capture of the working browser request):
+  The search is a POST to the session-stamped /Search.aspx with:
+    - header x-microsoftajax: Delta=true  (async partial postback)
+    - a ~88KB body = the COMPLETE form: full __VIEWSTATE + EVERY field
+      (all hidden inputs, every lstCounty/lstCity/lstPublication control,
+      the ScriptManager trigger), not a hand-picked subset.
+  Our earlier probes failed because we sent a minimal subset of fields.
+  The fix: harvest EVERY form field from the GET page and POST it back
+  complete, changing only the search inputs + the ScriptManager trigger.
+  The response is ~53KB text/plain delta containing the result rows.
 
-Writes NOTHING to the database — returns a diagnostic dict only.
+This probe reconstructs the full form automatically (so nothing needs to be
+hand-copied, and this is exactly what the real scraper must do each run since
+__VIEWSTATE is per-session), POSTs it, and reports whether real notices come
+back. Writes NOTHING to the DB.
 """
 
 from __future__ import annotations
 
 import re
+from html import unescape
 from typing import Any, Optional
 
 import httpx
@@ -36,372 +40,197 @@ _HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/125.0.0.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 }
 
-_HIDDEN_FIELD_RE = {
-    "__VIEWSTATE": re.compile(r'id="__VIEWSTATE"\s+value="([^"]*)"'),
-    "__VIEWSTATEGENERATOR": re.compile(r'id="__VIEWSTATEGENERATOR"\s+value="([^"]*)"'),
-    "__EVENTVALIDATION": re.compile(r'id="__EVENTVALIDATION"\s+value="([^"]*)"'),
-}
+# Field-name fragments (controls in the as1 advanced-search panel).
+_P = "ctl00$ContentPlaceHolder1$as1$"
+_SM_FIELD = "ctl00$ToolkitScriptManager1"
+_SEARCH_PANEL = "ctl00$ContentPlaceHolder1$as1$upSearch"
+_BTN_GO = _P + "btnGo"
 
 _RESULT_MARKERS = (
     "NOTICE OF MORTGAGE FORECLOSURE",
-    "Public Notice Detail",
-    "searchResults",
-    "ViewNotice",
-    "notice-detail",
+    "Details.aspx",
+    "VIEW",
+    "of 100 Pages",
+    "of ",  # "Page 1 of N Pages"
 )
 
 
-def _extract_hidden_fields(html: str) -> dict[str, Optional[str]]:
-    found: dict[str, Optional[str]] = {}
-    for name, rx in _HIDDEN_FIELD_RE.items():
-        m = rx.search(html)
-        found[name] = m.group(1) if m else None
-    return found
+def _harvest_form_fields(html: str) -> dict[str, str]:
+    """Extract EVERY form field (name -> value) from the page so we can POST
+    the complete form back, mirroring what the browser sends.
 
+    Covers:
+      - <input type=text/hidden/...>  -> name, value (value defaults to "")
+      - <input type=checkbox/radio>   -> ONLY if 'checked' (WebForms only
+        posts checked boxes); unchecked are omitted, like a real browser.
+      - <select>                       -> the selected <option> value (or the
+        first option if none marked selected).
+      - <textarea>                     -> inner text.
+    Values are HTML-unescaped. The giant __VIEWSTATE is captured intact.
+    """
+    fields: dict[str, str] = {}
 
-def _inventory_form_fields(html: str) -> dict[str, Any]:
-    """Dump every form input/select name so we see the REAL field names."""
-    input_rx = re.compile(r'<input\b[^>]*?>', re.IGNORECASE)
-    select_rx = re.compile(
-        r'<select\b[^>]*?name="([^"]+)"[^>]*?>(.*?)</select>',
-        re.IGNORECASE | re.DOTALL,
-    )
-    name_rx = re.compile(r'name="([^"]+)"')
-    type_rx = re.compile(r'type="([^"]+)"')
-    value_rx = re.compile(r'value="([^"]*)"')
-    option_rx = re.compile(r'<option[^>]*?value="([^"]*)"', re.IGNORECASE)
-
-    text_like: list[dict[str, str]] = []
-    buttons: list[dict[str, str]] = []
-    all_names: list[str] = []
-
-    for tag in input_rx.findall(html):
-        nm = name_rx.search(tag)
+    # --- inputs ---
+    for tag in re.findall(r"<input\b[^>]*>", html, re.IGNORECASE):
+        nm = re.search(r'name="([^"]+)"', tag)
         if not nm:
             continue
         name = nm.group(1)
-        all_names.append(name)
-        typ = (type_rx.search(tag).group(1) if type_rx.search(tag) else "text").lower()
-        val = value_rx.search(tag).group(1) if value_rx.search(tag) else ""
-        if name in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"):
+        typ_m = re.search(r'type="([^"]+)"', tag)
+        typ = (typ_m.group(1) if typ_m else "text").lower()
+        val_m = re.search(r'value="([^"]*)"', tag)
+        val = unescape(val_m.group(1)) if val_m else ""
+
+        if typ in ("checkbox", "radio"):
+            # Only posted if checked.
+            if re.search(r"\bchecked\b", tag, re.IGNORECASE):
+                # Radios share a name; checked one wins.
+                fields[name] = val or "on"
+            # else omit
+        elif typ in ("submit", "button", "image", "reset"):
+            # Don't auto-include buttons; we add the one trigger explicitly.
             continue
-        entry = {"name": name, "type": typ, "value": val[:40]}
-        if typ in ("submit", "button", "image"):
-            buttons.append(entry)
         else:
-            text_like.append(entry)
+            fields[name] = val
 
-    selects: list[dict[str, Any]] = []
-    for s_name, s_body in select_rx.findall(html):
-        all_names.append(s_name)
-        opts = option_rx.findall(s_body)[:8]
-        selects.append({"name": s_name, "option_values_sample": opts})
+    # --- selects ---
+    for sel in re.findall(r"<select\b[^>]*>.*?</select>", html, re.IGNORECASE | re.DOTALL):
+        nm = re.search(r'name="([^"]+)"', sel)
+        if not nm:
+            continue
+        name = nm.group(1)
+        # Find the selected <option>, tolerant of attribute order (selected
+        # may appear before OR after value=). Fall back to the first option.
+        chosen = None
+        for opt in re.findall(r"<option\b[^>]*>", sel, re.IGNORECASE):
+            if re.search(r"\bselected\b", opt, re.IGNORECASE):
+                vm = re.search(r'value="([^"]*)"', opt)
+                chosen = vm.group(1) if vm else ""
+                break
+        if chosen is None:
+            first = re.search(r'<option[^>]*value="([^"]*)"', sel, re.IGNORECASE)
+            chosen = first.group(1) if first else ""
+        fields[name] = unescape(chosen)
 
-    def _relevant(n: str) -> bool:
-        low = n.lower()
-        return any(k in low for k in ("search", "as1", "keyword", "btn", "txt", "ddl"))
+    # --- textareas ---
+    for ta in re.findall(r'<textarea\b[^>]*name="([^"]+)"[^>]*>(.*?)</textarea>',
+                         html, re.IGNORECASE | re.DOTALL):
+        fields[ta[0]] = unescape(ta[1]).strip()
 
-    relevant = sorted({n for n in all_names if _relevant(n)})
+    return fields
+
+
+def _count_result_rows(delta: str) -> dict[str, Any]:
+    """Inspect a search response for result evidence."""
+    page_of = re.search(r'Page\s+\d+\s+of\s+(\d+)\s+Pages', delta)
+    details = re.findall(r'Details\.aspx\?[A-Za-z0-9_&=%.-]+', delta)
+    foreclosure_hits = delta.count("FORECLOSURE") + delta.count("Foreclosure")
+    view_buttons = len(re.findall(r'>\s*VIEW\s*<', delta, re.IGNORECASE))
     return {
-        "text_inputs": text_like[:40],
-        "selects": selects[:20],
-        "buttons": buttons[:20],
-        "likely_search_fields": relevant,
-        "total_named_fields": len(set(all_names)),
+        "total_pages_label": page_of.group(0) if page_of else None,
+        "total_pages": int(page_of.group(1)) if page_of else None,
+        "details_links_found": len(set(details)),
+        "details_samples": sorted(set(details))[:8],
+        "foreclosure_hits": foreclosure_hits,
+        "view_buttons": view_buttons,
     }
 
 
-def _recon_ajax(page: str) -> dict[str, Any]:
-    """Dump the real ScriptManager + UpdatePanel identifiers and postback
-    wiring — exactly what an async (partial) postback needs."""
-    out: dict[str, Any] = {}
-
-    sm_ids = re.findall(r'(?:id|name)="([^"]*[Ss]cript[Mm]anager[^"]*)"', page)
-    out["scriptmanager_candidates"] = sorted(set(sm_ids))[:10]
-
-    up_ids = re.findall(r'(?:id|name)="([^"]*[Uu]p(?:date)?[Pp]anel[^"]*)"', page)
-    out["updatepanel_candidates"] = sorted(set(up_ids))[:10]
-
-    # __doPostBack targets (first arg), tolerant of single/double quotes.
-    q = chr(39)
-    dq = chr(34)
-    dopost_re = re.compile(r"__doPostBack\(\s*[" + q + dq + r"]([^" + q + dq + r"]+)")
-    out["dopostback_targets"] = sorted(set(dopost_re.findall(page)))[:15]
-
-    bidx = page.find("btnGo")
-    out["btngo_context"] = page[max(0, bidx - 120):bidx + 200] if bidx != -1 else None
-
-    up_tokens = re.findall(r'[A-Za-z0-9_]*[Uu]pdate[Pp]anel[A-Za-z0-9_]*', page)
-    out["updatepanel_tokens"] = sorted(set(up_tokens))[:10]
-
-    # PageRequestManager registration often lists panel ids; capture the script
-    # block that registers the async framework.
-    prm = re.search(r'Sys\.WebForms\.PageRequestManager[^<]{0,400}', page)
-    out["prm_snippet"] = prm.group(0)[:400] if prm else None
-
-    return out
-
-
-
-def _delta_hidden(delta: str, field: str) -> Optional[str]:
-    """Pull a hidden field's value out of an ASP.NET AJAX delta response.
-    Delta segments look like: <len>|hiddenField|<fieldName>|<value>| — so we
-    find the field marker and read the next pipe-delimited chunk."""
-    marker = "|hiddenField|" + field + "|"
-    idx = delta.find(marker)
-    if idx == -1:
-        return None
-    start = idx + len(marker)
-    end = delta.find("|", start)
-    if end == -1:
-        return None
-    return delta[start:end]
-
-
 def probe_mnpublicnotice() -> dict[str, Any]:
-    """Two-step WebForms probe + AJAX recon. Reports what our server receives."""
-    diag: dict[str, Any] = {"step1_get": {}, "step2_post": {}, "step3_recon": {}, "verdict": ""}
+    """GET the search page, harvest the FULL form, POST it complete with the
+    search criteria + async trigger, and report whether results come back."""
+    diag: dict[str, Any] = {"step1_get": {}, "step2_search": {}, "verdict": ""}
 
-    # ---- Step 1: GET the search page ----
     try:
-        with httpx.Client(timeout=30, headers=_HEADERS, follow_redirects=True) as client:
+        with httpx.Client(timeout=45, headers=_HEADERS, follow_redirects=True) as client:
+            # --- 1. GET the search page (fresh session + full form) ---
             r1 = client.get(_SEARCH_PAGE)
             html1 = r1.text or ""
-            hidden = _extract_hidden_fields(html1)
-            form_fields = _inventory_form_fields(html1)
+            base_url = str(r1.url)  # session-stamped /(S(...))/Search.aspx
 
+            fields = _harvest_form_fields(html1)
             diag["step1_get"] = {
                 "status": r1.status_code,
-                "final_url": str(r1.url),
+                "final_url": base_url,
                 "content_length": len(html1),
-                "has_viewstate": bool(hidden.get("__VIEWSTATE")),
-                "has_eventvalidation": bool(hidden.get("__EVENTVALIDATION")),
-                "has_viewstategenerator": bool(hidden.get("__VIEWSTATEGENERATOR")),
-                "mentions_foreclosure": "oreclosure" in html1,
-                "head_snippet": html1[:200],
-                "form_fields": form_fields,
+                "fields_harvested": len(fields),
+                "has_viewstate": "__VIEWSTATE" in fields,
+                "viewstate_len": len(fields.get("__VIEWSTATE", "")),
+                "has_scriptmanager_field": _SM_FIELD in fields,
             }
-
-            if r1.status_code != 200:
-                diag["verdict"] = f"Step 1 returned {r1.status_code} — cannot load search page."
-                return diag
-            if not hidden.get("__VIEWSTATE"):
-                diag["verdict"] = "Step 1 loaded but NO __VIEWSTATE — page may be JS-rendered."
+            if r1.status_code != 200 or "__VIEWSTATE" not in fields:
+                diag["verdict"] = "Could not load the search page / no viewstate."
                 return diag
 
-            # ---- Step 2: attempt the search postback (real field names) ----
-            P = "ctl00$ContentPlaceHolder1$as1$"
+            # --- 2. Build the COMPLETE form body, set search criteria ---
             from datetime import date, timedelta
             today = date.today()
-            d_from = (today - timedelta(days=14)).strftime("%m/%d/%Y")
+            d_from = (today - timedelta(days=30)).strftime("%m/%d/%Y")
             d_to = today.strftime("%m/%d/%Y")
-            post_data = {
-                "ctl00_ToolkitScriptManager1_HiddenField": "",
-                "__EVENTTARGET": P + "btnGo",
-                "__EVENTARGUMENT": "",
-                "__LASTFOCUS": "",
-                "__VIEWSTATE": hidden.get("__VIEWSTATE") or "",
-                "__VIEWSTATEGENERATOR": hidden.get("__VIEWSTATEGENERATOR") or "",
-                P + "txtSearch": "foreclosure",
-                P + "rdoType": "AND",
-                P + "txtExclude": "",
-                P + "txtDateFrom": d_from,
-                P + "txtDateTo": d_to,
-                P + "hdnLastScrollPos": "0",
-                P + "hdnCountyScrollPosition": "-1",
-                P + "hdnCityScrollPosition": "-1",
-                P + "hdnPubScrollPosition": "-1",
-                P + "hdnField": "",
-            }
-            if hidden.get("__EVENTVALIDATION"):
-                post_data["__EVENTVALIDATION"] = hidden["__EVENTVALIDATION"]
+
+            body = dict(fields)  # everything harvested from the page
+            # The async ScriptManager trigger: "panel|button"
+            body[_SM_FIELD] = _SEARCH_PANEL + "|" + _BTN_GO
+            body["__ASYNCPOST"] = "true"
+            body["__EVENTTARGET"] = ""
+            body["__EVENTARGUMENT"] = ""
+            # Search criteria
+            body[_P + "txtSearch"] = "foreclosure"
+            body[_P + "rdoType"] = "AND"
+            body[_P + "txtDateFrom"] = d_from
+            body[_P + "txtDateTo"] = d_to
+            # The trigger button value (browser includes the clicked button).
+            body[_BTN_GO] = "GO"
 
             post_headers = dict(_HEADERS)
-            post_headers["Content-Type"] = "application/x-www-form-urlencoded"
-            post_headers["Referer"] = str(r1.url)
-
-            # ASP.NET AJAX async postback. The PageRequestManager registration
-            # revealed the real UpdatePanel: ctl00$ContentPlaceHolder1$as1$upSearch.
-            # An async postback sets the ScriptManager field to
-            # "<UpdatePanelID>|<triggerButton>" and sends the X-MicrosoftAjax
-            # header — this is what makes the search actually execute (a plain
-            # full POST just re-renders the static landing page).
-            SM_FIELD = "ctl00$ToolkitScriptManager1"
-            UP_SEARCH = "ctl00$ContentPlaceHolder1$as1$upSearch"
-            BTN_GO = P + "btnGo"
-
-            # For async, the ScriptManager field carries "panel|trigger" and
-            # __EVENTTARGET is cleared (the trigger is in the SM field instead).
-            post_data[SM_FIELD] = UP_SEARCH + "|" + BTN_GO
-            post_data["__EVENTTARGET"] = ""
-            post_data["__ASYNCPOST"] = "true"
-            # btnGo must still be present as the clicked control for some forms.
-            post_data[BTN_GO] = "GO"
-
+            post_headers["Content-Type"] = (
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            )
             post_headers["X-MicrosoftAjax"] = "Delta=true"
             post_headers["X-Requested-With"] = "XMLHttpRequest"
             post_headers["Cache-Control"] = "no-cache"
+            post_headers["Origin"] = _BASE
+            post_headers["Referer"] = base_url
 
-            r2 = client.post(str(r1.url), data=post_data, headers=post_headers)
+            r2 = client.post(base_url, data=body, headers=post_headers)
             html2 = r2.text or ""
-            markers_hit = [m for m in _RESULT_MARKERS if m in html2]
-            count_hint = re.search(r'\b\d+\s*-\s*\d+\s+of\s+\d+\b', html2)
-            # Detail links: this site uses /Details.aspx?SID=... per notice.
-            detail_links = re.findall(
-                r'[A-Za-z0-9_./()-]*[Dd]etails?\.aspx\?[A-Za-z0-9_./?=&-]*', html2
-            )
-            # Async delta responses are pipe-delimited: "len|type|id|content|".
-            is_delta = html2[:20].count("|") >= 2 and html2.lstrip()[:1].isdigit()
 
-            # Parse the ASP.NET AJAX delta. Format is repeating segments:
-            #   length|type|id|content|  (type 'updatePanel' carries panel HTML)
-            # We list each segment's (type,id,length) so we can SEE which panels
-            # updated — crucially whether the results grid (updateWSGrid /
-            # WSExtendedGrid) is among them.
-            delta_segments = []
-            grid_present = False
-            grid_foreclosure_hits = 0
-            if is_delta:
-                parts = html2.split("|")
-                i = 0
-                while i + 3 < len(parts):
-                    seg_len = parts[i]
-                    seg_type = parts[i + 1]
-                    seg_id = parts[i + 2]
-                    # content is parts[i+3], but may itself contain pipes; we
-                    # only record the id/type map here for visibility.
-                    if seg_type in ("updatePanel", "hiddenField", "scriptBlock",
-                                    "asyncPostBackControlIDs", "pageTitle"):
-                        delta_segments.append({
-                            "type": seg_type, "id": seg_id, "len": seg_len,
-                        })
-                        if "Grid" in seg_id or "Result" in seg_id or "WSExt" in seg_id:
-                            grid_present = True
-                        i += 4
-                    else:
-                        i += 1
-                # Does the WHOLE response mention the results grid / any notices?
-                grid_foreclosure_hits = (
-                    html2.count("Details.aspx") + html2.lower().count("foreclosure")
-                )
+            # Approximate the body size we sent (sanity vs the browser's ~88KB).
+            approx_body_len = sum(len(k) + len(str(v)) + 2 for k, v in body.items())
 
-            diag["step2_post"] = {
+            results = _count_result_rows(html2)
+            diag["step2_search"] = {
                 "status": r2.status_code,
-                "final_url": str(r2.url),
-                "content_length": len(html2),
-                "is_async_delta": is_delta,
-                "delta_panels": delta_segments[:20],
-                "results_grid_panel_present": grid_present,
-                "result_markers_found": markers_hit,
-                "foreclosure_count_in_page": html2.count("FORECLOSURE") + html2.count("Foreclosure"),
-                "details_aspx_count": html2.count("Details.aspx"),
-                "result_count_label": count_hint.group(0) if count_hint else None,
-                "detail_link_count": len(set(detail_links)),
-                "detail_link_samples": sorted(set(detail_links))[:8],
-                "looks_like_results": bool(count_hint) or len(set(detail_links)) > 0,
+                "request_field_count": len(body),
+                "approx_request_body_len": approx_body_len,
+                "response_length": len(html2),
+                "is_delta": html2[:20].count("|") >= 2 and html2.lstrip()[:1].isdigit(),
+                **results,
                 "head_snippet": html2[:300],
             }
 
-            # ---- Step 2b: second async postback to load the results grid ----
-            # The search postback updated only the search-form panel and returned
-            # a FRESH __VIEWSTATE carrying the search criteria. The results render
-            # in a separate grid panel (WSExtendedGridNP1$updateWSGrid). So we
-            # fire a second async postback targeting that grid, carrying the new
-            # viewstate, to make the rows render.
-            try:
-                new_vs = _delta_hidden(html2, "__VIEWSTATE") or post_data["__VIEWSTATE"]
-                new_vsg = _delta_hidden(html2, "__VIEWSTATEGENERATOR") or post_data["__VIEWSTATEGENERATOR"]
-                GRID = "ctl00$ContentPlaceHolder1$WSExtendedGridNP1$updateWSGrid"
-                GRID_SM = "ctl00$ToolkitScriptManager1"
-
-                grid_data = dict(post_data)
-                grid_data["__VIEWSTATE"] = new_vs
-                grid_data["__VIEWSTATEGENERATOR"] = new_vsg
-                grid_data["__EVENTTARGET"] = ""
-                grid_data["__ASYNCPOST"] = "true"
-                # Target the grid panel. Some grids trigger via __EVENTTARGET on
-                # a paging control; first try the SM field = grid panel form.
-                grid_data[GRID_SM] = GRID + "|" + GRID
-                # Drop the search button trigger so we don't re-run the search.
-                grid_data.pop(P + "btnGo", None)
-
-                grid_headers = dict(post_headers)
-                grid_headers["X-MicrosoftAjax"] = "Delta=true"
-
-                r3 = client.post(str(r1.url), data=grid_data, headers=grid_headers)
-                html3 = r3.text or ""
-                gdetails = re.findall(
-                    r'[A-Za-z0-9_./()-]*[Dd]etails?\.aspx\?[A-Za-z0-9_./?=&-]*', html3
-                )
-                gcount = re.search(r'\b\d+\s*-\s*\d+\s+of\s+\d+\b', html3)
-                # list the grid delta's panels too
-                gpanels = []
-                if html3[:20].count("|") >= 2:
-                    gp = html3.split("|")
-                    j = 0
-                    while j + 3 < len(gp):
-                        if gp[j+1] in ("updatePanel","hiddenField","pageTitle",
-                                       "asyncPostBackControlIDs","scriptBlock"):
-                            gpanels.append({"type": gp[j+1], "id": gp[j+2], "len": gp[j]})
-                            j += 4
-                        else:
-                            j += 1
-
-                diag["step2b_grid"] = {
-                    "status": r3.status_code,
-                    "content_length": len(html3),
-                    "delta_panels": gpanels[:20],
-                    "details_aspx_count": html3.count("Details.aspx"),
-                    "detail_link_count": len(set(gdetails)),
-                    "detail_link_samples": sorted(set(gdetails))[:8],
-                    "result_count_label": gcount.group(0) if gcount else None,
-                    "foreclosure_hits": html3.count("FORECLOSURE") + html3.count("Foreclosure"),
-                    "head_snippet": html3[:300],
-                }
-            except Exception as ge:
-                diag["step2b_grid"] = {"error": f"{type(ge).__name__}: {ge}"}
-
-            # ---- Step 3: AJAX recon (dump the real identifiers) ----
-            g = client.get(_SEARCH_PAGE)
-            page = g.text or ""
-            diag["step3_recon"] = _recon_ajax(page)
-            diag["step3_recon"]["has_scriptmanager"] = (
-                "ToolkitScriptManager" in page or "Sys.WebForms" in page
-            )
-            diag["step3_recon"]["has_updatepanel"] = (
-                "__doPostBack" in page and "UpdatePanel" in page
-            )
-            results_links = re.findall(
-                r'(?:href|action)="([^"]*(?:Results|Search)\.aspx[^"]*)"', page
-            )
-            diag["step3_recon"]["results_or_search_links"] = sorted(set(results_links))[:10]
-
-            g2b = diag.get("step2b_grid", {})
-            if (g2b.get("detail_link_count", 0) or 0) > 0 or g2b.get("result_count_label"):
+            if (results["details_links_found"] or 0) > 0 or results["total_pages"]:
                 diag["verdict"] = (
-                    "SUCCESS: the grid postback (step2b) returned real notice "
-                    "detail links / a result count. Scraper is viable."
+                    "SUCCESS: full-form search returned results "
+                    f"({results.get('total_pages_label') or str(results['details_links_found']) + ' detail links'}). "
+                    "Scraper is viable — parse rows from this response."
                 )
-            elif count_hint:
-                diag["verdict"] = "SUCCESS: search postback returned a real result count."
             else:
                 diag["verdict"] = (
-                    "Search async postback works (valid delta) but the results "
-                    "grid did not yield notice links yet — see step2b_grid panels."
+                    "Full-form POST sent (field_count="
+                    f"{len(body)}, ~{approx_body_len} bytes) but no result rows "
+                    "detected. Check head_snippet — may need the exact ScriptManager "
+                    "trigger value or a missing field."
                 )
 
     except httpx.HTTPError as e:
         diag["verdict"] = f"Network error: {type(e).__name__}: {e}"
-        logger.exception("mnpublicnotice probe failed", error_type=type(e).__name__)
+        logger.exception("mnpublicnotice full-form probe failed", error_type=type(e).__name__)
 
     return diag
 
