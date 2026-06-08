@@ -31,6 +31,7 @@ from src.db.supabase_client import (
     core_table,
 )
 from src.llm.foreclosure_promotion import build_promotion_rows
+from src.scrapers.startribune_legal import run_startribune_scrape
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
 
