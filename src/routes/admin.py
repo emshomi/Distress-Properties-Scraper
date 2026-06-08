@@ -351,5 +351,57 @@ async def reject_extraction(payload: AdminActionIn) -> dict[str, Any]:
         logger.exception("admin reject extraction failed", error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Failed to reject extraction.")
 
+# ============================================================
+# POST /admin/scrape/startribune — pull new foreclosure notices now
+# ============================================================
+
+
+class ScrapeIn(BaseModel):
+    """Optional per-run cap on how many NEW notices to extract."""
+    max_new: int = 25
+
+
+@router.post(
+    "/scrape/startribune",
+    status_code=http_status.HTTP_200_OK,
+    summary="Fetch the Star Tribune foreclosures listing and stage new notices.",
+    dependencies=[AdminKeyRequired],
+)
+async def scrape_startribune(payload: ScrapeIn) -> dict[str, Any]:
+    """Run the Star Tribune foreclosure-notice scraper on demand. It fetches
+    the listing, extracts each NEW notice (not already staged), and inserts it
+    into ai.extracted_foreclosures as 'pending' for review on the Notice-review
+    tab. Returns a summary of what it found and staged.
+
+    The scraper is synchronous and network-bound (one listing fetch + up to
+    max_new detail fetches, paced ~1s apart), so a run can take a minute or two
+    for a full batch. That's fine for a manual admin trigger."""
+    try:
+        # run_startribune_scrape is synchronous (httpx.Client + time.sleep);
+        # run it in a worker thread so it doesn't block the event loop.
+        import anyio
+        result = await anyio.to_thread.run_sync(
+            lambda: run_startribune_scrape(max_new=payload.max_new)
+        )
+
+        return success_envelope({
+            "ok": result.ok,
+            "listing_urls_found": result.listing_urls_found,
+            "already_staged": result.already_staged,
+            "newly_extracted": result.newly_extracted,
+            "extraction_failed": result.extraction_failed,
+            "stored_ids": result.stored_ids,
+            "error": result.error,
+            "notes": result.notes,
+        })
+    except Exception as e:
+        logger.exception(
+            "admin startribune scrape failed", error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to run the Star Tribune scrape.",
+        )
+
 
 __all__ = ["router"]
