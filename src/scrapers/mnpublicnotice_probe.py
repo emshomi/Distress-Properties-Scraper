@@ -279,6 +279,77 @@ def probe_mnpublicnotice() -> dict[str, Any]:
         diag["verdict"] = f"Network error: {type(e).__name__}: {e}"
         logger.exception("mnpublicnotice full-form probe failed", error_type=type(e).__name__)
 
+    # ---- Step 3: results-text structure + detail-fetch test ----
+    # (Run a real search, then inspect how notice text is laid out in the
+    #  results page, and whether a Details.aspx fetch returns a usable body.)
+    try:
+        from urllib.parse import unquote as _unq
+        with httpx.Client(timeout=45, headers=_HEADERS, follow_redirects=True) as c:
+            g = c.get(_SEARCH_PAGE)
+            base = str(g.url)
+            flds = _harvest_form_fields(g.text or "")
+            from datetime import date as _d, timedelta as _td
+            t = _d.today()
+            b = dict(flds)
+            b["ctl00$ToolkitScriptManager1"] = (
+                "ctl00$ContentPlaceHolder1$as1$upSearch|"
+                "ctl00$ContentPlaceHolder1$as1$btnGo"
+            )
+            b["__ASYNCPOST"] = "true"; b["__EVENTTARGET"] = ""; b["__EVENTARGUMENT"] = ""
+            b["ctl00$ContentPlaceHolder1$as1$txtSearch"] = "foreclosure"
+            b["ctl00$ContentPlaceHolder1$as1$rdoType"] = "AND"
+            b["ctl00$ContentPlaceHolder1$as1$txtDateFrom"] = (t - _td(days=14)).strftime("%m/%d/%Y")
+            b["ctl00$ContentPlaceHolder1$as1$txtDateTo"] = t.strftime("%m/%d/%Y")
+            b["ctl00$ContentPlaceHolder1$as1$btnGo"] = "GO"
+            ph = dict(_HEADERS)
+            ph["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+            ph["X-MicrosoftAjax"] = "Delta=true"; ph["X-Requested-With"] = "XMLHttpRequest"
+            ph["Origin"] = _BASE; ph["Referer"] = base
+            pr = c.post(base, data=b, headers=ph)
+            rd = re.search(r"pageRedirect\|\|([^|]+)\|", pr.text or "")
+            results = ""
+            if rd:
+                ru = _unq(rd.group(1))
+                if ru.startswith("/"):
+                    ru = _BASE + ru
+                results = (c.get(ru, headers=_HEADERS).text or "")
+
+            recon = {"results_len": len(results)}
+            # (a) Find the first Details link + show 800 chars AROUND it so we
+            #     see whether the notice text is inline in the results list.
+            m = re.search(r'Details\.aspx\?SID=([A-Za-z0-9]+)&(?:amp;)?ID=(\d+)', results)
+            if m:
+                sid, nid = m.group(1), m.group(2)
+                recon["first_sid"] = sid
+                recon["first_id"] = nid
+                pos = m.start()
+                recon["results_context"] = results[max(0, pos-400):pos+400]
+                # (b) Try fetching that detail page a couple ways.
+                detail_attempts = []
+                urls = [
+                    f"{_BASE}/(S({sid}))/Details.aspx?SID={sid}&ID={nid}",
+                    f"{_BASE}/Details.aspx?SID={sid}&ID={nid}",
+                    f"{_BASE}/(S({sid}))/Details.aspx?ID={nid}",
+                ]
+                for u in urls:
+                    try:
+                        dr = c.get(u, headers=_HEADERS)
+                        body = dr.text or ""
+                        has_notice = any(k in body for k in (
+                            "NOTICE IS HEREBY GIVEN", "MORTGAGE FORECLOSURE",
+                            "YOU ARE NOTIFIED", "Minn. Stat."))
+                        detail_attempts.append({
+                            "url": u, "status": dr.status_code,
+                            "len": len(body), "has_notice_text": has_notice,
+                            "head": body[:160],
+                        })
+                    except Exception as de:
+                        detail_attempts.append({"url": u, "error": str(de)[:120]})
+                recon["detail_attempts"] = detail_attempts
+            diag["step3_results_recon"] = recon
+    except Exception as e:
+        diag["step3_results_recon"] = {"error": f"{type(e).__name__}: {e}"}
+
     return diag
 
 
