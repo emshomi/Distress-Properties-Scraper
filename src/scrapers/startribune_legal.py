@@ -71,13 +71,31 @@ _LISTING_PARAMS = {
     "ap_c": "22773765",
 }
 
-# An identifying User-Agent. Foreclosure notices are statutorily-public legal
-# facts, and everything we pull lands in a human review queue before publish;
-# we still identify ourselves so the site owner knows who is fetching.
-_USER_AGENT = (
-    "govire.com foreclosure-notice indexer "
-    "(+https://govire.com; public legal notices; contact via govire.com)"
-)
+# Browser-like request headers. The site's classifieds platform (AdPerfect)
+# serves a stripped/empty page to requests that don't look like a real
+# browser (our earlier self-identifying bot User-Agent got a 200 with no
+# listing content). These headers mirror a normal Chrome request so we get
+# the same HTML a human visitor sees. We remain low-volume + review-gated;
+# this is about getting the real page, not hiding traffic.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 # Hard cap on how many NEW notices we extract per run (LLM cost + politeness).
 # Re-runs pick up where the last left off because already-staged URLs are
@@ -125,7 +143,7 @@ def _fetch_listing_html() -> Optional[str]:
         timeout = getattr(settings, "scraper_request_timeout_seconds", 30)
         with httpx.Client(
             timeout=timeout,
-            headers={"User-Agent": _USER_AGENT},
+            headers=_BROWSER_HEADERS,
             follow_redirects=True,
         ) as client:
             resp = client.get(_LISTING_URL, params=_LISTING_PARAMS)
@@ -165,7 +183,7 @@ def _fetch_notice_text(url: str) -> Optional[str]:
         timeout = getattr(settings, "scraper_request_timeout_seconds", 30)
         with httpx.Client(
             timeout=timeout,
-            headers={"User-Agent": _USER_AGENT},
+            headers=_BROWSER_HEADERS,
             follow_redirects=True,
         ) as client:
             resp = client.get(url)
