@@ -220,14 +220,36 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             # comes back. This is a PROBE — if the field names are wrong, the
             # site returns the form again (no result markers), which is itself
             # useful information (tells us the exact field names to use).
+            # Real field names discovered from the form inventory:
+            #   keyword box  = ...as1$txtSearch
+            #   match type   = ...as1$rdoType  (AND | OR | EXACT)
+            #   date window  = ...as1$txtDateFrom / txtDateTo (MM/DD/YYYY)
+            #   search button= ...as1$btnGo
+            # ASP.NET WebForms also expects the hidden __EVENTTARGET/ARGUMENT
+            # fields present (empty) plus the ToolkitScriptManager hidden field.
+            P = "ctl00$ContentPlaceHolder1$as1$"
+            from datetime import date, timedelta
+            today = date.today()
+            d_from = (today - timedelta(days=14)).strftime("%m/%d/%Y")
+            d_to = today.strftime("%m/%d/%Y")
             post_data = {
+                "ctl00_ToolkitScriptManager1_HiddenField": "",
+                "__EVENTTARGET": "",
+                "__EVENTARGUMENT": "",
+                "__LASTFOCUS": "",
                 "__VIEWSTATE": hidden.get("__VIEWSTATE") or "",
                 "__VIEWSTATEGENERATOR": hidden.get("__VIEWSTATEGENERATOR") or "",
-                "__EVENTVALIDATION": hidden.get("__EVENTVALIDATION") or "",
-                # Common AdvancedSearch control names (best-effort):
-                "ctl00$ContentPlaceHolder1$as1$txtSearch": "foreclosure",
-                "ctl00$ContentPlaceHolder1$as1$ddlSearchType": "1",
-                "ctl00$ContentPlaceHolder1$as1$btnSearch": "Search",
+                P + "txtSearch": "foreclosure",
+                P + "rdoType": "AND",
+                P + "txtExclude": "",
+                P + "txtDateFrom": d_from,
+                P + "txtDateTo": d_to,
+                P + "hdnLastScrollPos": "0",
+                P + "hdnCountyScrollPosition": "-1",
+                P + "hdnCityScrollPosition": "-1",
+                P + "hdnPubScrollPosition": "-1",
+                P + "hdnField": "",
+                P + "btnGo": "GO",
             }
 
             post_headers = dict(_HEADERS)
@@ -242,13 +264,24 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             html2 = r2.text or ""
             markers_hit = [m for m in _RESULT_MARKERS if m in html2]
 
+            import re as _re
+            # Detail-link pattern on this site (best-effort): notice detail
+            # pages live under .../(S(session))/Details.aspx?SID=... or similar.
+            detail_links = _re.findall(
+                r'[A-Za-z0-9_./()-]*[Dd]etail[A-Za-z0-9_./?=&-]*', html2
+            )
+            # A "result count" label often appears, e.g. "1-25 of 312".
+            count_hint = _re.search(r'\b\d+\s*-\s*\d+\s+of\s+\d+\b', html2)
             diag["step2_post"] = {
                 "status": r2.status_code,
                 "final_url": str(r2.url),
                 "content_length": len(html2),
                 "result_markers_found": markers_hit,
-                "foreclosure_count_in_page": html2.count("FORECLOSURE"),
-                "looks_like_results": bool(markers_hit),
+                "foreclosure_count_in_page": html2.count("FORECLOSURE")
+                    + html2.count("Foreclosure"),
+                "result_count_label": count_hint.group(0) if count_hint else None,
+                "detail_link_samples": sorted(set(detail_links))[:8],
+                "looks_like_results": bool(markers_hit) or bool(count_hint),
                 "head_snippet": html2[:300],
             }
 
