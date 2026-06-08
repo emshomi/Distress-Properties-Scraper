@@ -213,22 +213,51 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             post_headers["Content-Type"] = "application/x-www-form-urlencoded"
             post_headers["Referer"] = str(r1.url)
 
+            # ASP.NET AJAX async postback. The PageRequestManager registration
+            # revealed the real UpdatePanel: ctl00$ContentPlaceHolder1$as1$upSearch.
+            # An async postback sets the ScriptManager field to
+            # "<UpdatePanelID>|<triggerButton>" and sends the X-MicrosoftAjax
+            # header — this is what makes the search actually execute (a plain
+            # full POST just re-renders the static landing page).
+            SM_FIELD = "ctl00$ToolkitScriptManager1"
+            UP_SEARCH = "ctl00$ContentPlaceHolder1$as1$upSearch"
+            BTN_GO = P + "btnGo"
+
+            # For async, the ScriptManager field carries "panel|trigger" and
+            # __EVENTTARGET is cleared (the trigger is in the SM field instead).
+            post_data[SM_FIELD] = UP_SEARCH + "|" + BTN_GO
+            post_data["__EVENTTARGET"] = ""
+            post_data["__ASYNCPOST"] = "true"
+            # btnGo must still be present as the clicked control for some forms.
+            post_data[BTN_GO] = "GO"
+
+            post_headers["X-MicrosoftAjax"] = "Delta=true"
+            post_headers["X-Requested-With"] = "XMLHttpRequest"
+            post_headers["Cache-Control"] = "no-cache"
+
             r2 = client.post(str(r1.url), data=post_data, headers=post_headers)
             html2 = r2.text or ""
             markers_hit = [m for m in _RESULT_MARKERS if m in html2]
             count_hint = re.search(r'\b\d+\s*-\s*\d+\s+of\s+\d+\b', html2)
-            detail_links = re.findall(r'[A-Za-z0-9_./()-]*[Dd]etails?\.aspx[A-Za-z0-9_./?=&-]*', html2)
+            # Detail links: this site uses /Details.aspx?SID=... per notice.
+            detail_links = re.findall(
+                r'[A-Za-z0-9_./()-]*[Dd]etails?\.aspx\?[A-Za-z0-9_./?=&-]*', html2
+            )
+            # Async delta responses are pipe-delimited: "len|type|id|content|".
+            is_delta = html2[:20].count("|") >= 2 and html2.lstrip()[:1].isdigit()
 
             diag["step2_post"] = {
                 "status": r2.status_code,
                 "final_url": str(r2.url),
                 "content_length": len(html2),
+                "is_async_delta": is_delta,
                 "result_markers_found": markers_hit,
                 "foreclosure_count_in_page": html2.count("FORECLOSURE") + html2.count("Foreclosure"),
                 "result_count_label": count_hint.group(0) if count_hint else None,
+                "detail_link_count": len(set(detail_links)),
                 "detail_link_samples": sorted(set(detail_links))[:8],
-                "looks_like_results": bool(count_hint),
-                "head_snippet": html2[:200],
+                "looks_like_results": bool(count_hint) or len(set(detail_links)) > 0,
+                "head_snippet": html2[:300],
             }
 
             # ---- Step 3: AJAX recon (dump the real identifiers) ----
