@@ -85,6 +85,75 @@ def _extract_hidden_fields(html: str) -> dict[str, Optional[str]]:
     return found
 
 
+
+def _inventory_form_fields(html: str) -> dict[str, Any]:
+    """Dump every form input/select/textarea name from the page so we can see
+    the REAL field names (instead of guessing). Returns:
+      - text_like:   names of text/search/hidden-ish inputs (+ their values
+                     when short, so we can spot defaults)
+      - selects:     select names + their option values
+      - buttons:     submit/button input names + values (the search trigger)
+      - all_names:   every name= seen (deduped)
+    We only need names whose control id/name suggests the SEARCH form (we keep
+    everything but flag the likely-relevant ones containing 'search', 'as1',
+    'keyword', 'btn').
+    """
+    # name="..." type="..." value="..." in any order — capture name + type + value.
+    input_rx = re.compile(
+        r'<input\b[^>]*?>', re.IGNORECASE
+    )
+    select_rx = re.compile(
+        r'<select\b[^>]*?name="([^"]+)"[^>]*?>(.*?)</select>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    name_rx = re.compile(r'name="([^"]+)"')
+    type_rx = re.compile(r'type="([^"]+)"')
+    value_rx = re.compile(r'value="([^"]*)"')
+    option_rx = re.compile(r'<option[^>]*?value="([^"]*)"', re.IGNORECASE)
+
+    text_like: list[dict[str, str]] = []
+    buttons: list[dict[str, str]] = []
+    all_names: list[str] = []
+
+    for tag in input_rx.findall(html):
+        nm = name_rx.search(tag)
+        if not nm:
+            continue
+        name = nm.group(1)
+        all_names.append(name)
+        typ = (type_rx.search(tag).group(1) if type_rx.search(tag) else "text").lower()
+        val = value_rx.search(tag).group(1) if value_rx.search(tag) else ""
+        # Skip the giant viewstate values in the dump.
+        if name in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"):
+            continue
+        entry = {"name": name, "type": typ, "value": val[:40]}
+        if typ in ("submit", "button", "image"):
+            buttons.append(entry)
+        else:
+            text_like.append(entry)
+
+    selects: list[dict[str, Any]] = []
+    for s_name, s_body in select_rx.findall(html):
+        all_names.append(s_name)
+        opts = option_rx.findall(s_body)[:8]  # first few option values
+        selects.append({"name": s_name, "option_values_sample": opts})
+
+    # Flag the names most likely tied to the keyword search form.
+    def _relevant(n: str) -> bool:
+        low = n.lower()
+        return any(k in low for k in ("search", "as1", "keyword", "btn", "txt", "ddl"))
+
+    relevant = sorted({n for n in all_names if _relevant(n)})
+
+    return {
+        "text_inputs": text_like[:40],
+        "selects": selects[:20],
+        "buttons": buttons[:20],
+        "likely_search_fields": relevant,
+        "total_named_fields": len(set(all_names)),
+    }
+
+
 def probe_mnpublicnotice() -> dict[str, Any]:
     """Run the two-step WebForms probe and return a diagnostic dict.
 
@@ -114,6 +183,7 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             html1 = r1.text or ""
             hidden = _extract_hidden_fields(html1)
 
+            form_fields = _inventory_form_fields(html1)
             diag["step1_get"] = {
                 "status": r1.status_code,
                 "final_url": str(r1.url),
@@ -125,6 +195,7 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                 "mentions_foreclosure": "oreclosure" in html1,
                 # First 300 chars so we can eyeball a block/challenge page.
                 "head_snippet": html1[:300],
+                "form_fields": form_fields,
             }
 
             if r1.status_code != 200:
