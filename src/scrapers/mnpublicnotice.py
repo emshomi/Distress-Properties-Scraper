@@ -26,25 +26,35 @@ The site is ASP.NET WebForms with an AJAX UpdatePanel. A search is multi-step:
   3. The response is an AJAX delta containing a `pageRedirect` directive:
         ...|pageRedirect||<url-encoded /(S(...))/Search.aspx>|...
      The results are NOT in this delta — they render on the redirect target.
-  4. GET the redirect URL  -> the RESULTS page (~394KB) listing 10 notices,
-     each with a detail link:  Details.aspx?SID=<session>&ID=<noticeId>
-     and the notice text rendered inline on the results page.
-  5. GET each Details.aspx?SID=..&ID=..  -> the full notice text to extract.
+  4. GET the redirect URL  -> the RESULTS page (~394KB) listing 10 notices.
+
+=== WHY TEASER-LEVEL EXTRACTION (Path A) ===
+Recon proved the Details.aspx full-text page is session/captcha-gated and
+cannot be fetched server-side (a cold GET returns ~13.6KB of page chrome, no
+notice body). The full untruncated notice lives only in a session-stamped PDF
+behind that gated page. BUT the results page itself renders, inline per notice,
+a teaser: notice type + mortgagor + the opening statutory text, truncated to a
+few hundred chars and capped with "click 'view' to open the full text."
+
+So this scraper extracts what is reliably available WITHOUT the detail page:
+the notice ID (dedup key), publication, publish date, and the teaser body. The
+teaser is fed to the existing LLM extractor (whose anti-fabrication guard means
+it stores null for any field the teaser doesn't contain, rather than guessing).
+Publication + date are folded into raw_notice_text as a header (the staging
+table has no column for them), so the reviewer sees full provenance.
+
+These land as `pending` for human review like every other Feature #5 row. Full
+PDF enrichment (sale date, address, PID, amount due) is a separate later effort
+gated on solving the Details.aspx session/captcha wall.
 
 Dedup key: the notice ID (stable across sessions; the SID is per-session and
 must NOT be part of the dedup key or source_url). source_url is normalized to
 a SID-less canonical form so re-runs in new sessions still dedup correctly.
-
-=== POLITENESS ===
-Recent-window search (default last 14 days) keeps results to ~1-3 pages, so we
-avoid crawling 100 pages of history. Real browser headers, small delays between
-detail fetches, a per-run cap on new extractions (LLM cost).
 """
 
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from html import unescape
@@ -82,8 +92,10 @@ _BROWSER_HEADERS = {
 # Defaults
 _DEFAULT_WINDOW_DAYS = 14      # recent notices only (avoids 100-page history)
 _DEFAULT_MAX_NEW = 25          # per-run cap on NEW extractions (LLM cost)
-_DETAIL_DELAY_SECONDS = 1.0    # politeness between detail fetches
-_MAX_RESULT_PAGES = 5          # safety cap on pagination within the window
+_MAX_RESULT_PAGES = 5          # safety cap (reserved; pagination not yet used)
+
+# A teaser shorter than this almost certainly lacks anything extractable.
+_MIN_TEASER_CHARS = 40
 
 
 @dataclass
@@ -97,6 +109,15 @@ class ScrapeResult:
     stored_ids: list[int] = field(default_factory=list)
     error: Optional[str] = None
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NoticeRow:
+    """One parsed notice from the results page (teaser-level)."""
+    notice_id: str
+    publication: Optional[str]
+    pub_date: Optional[str]
+    teaser: str
 
 
 # ============================================================
@@ -152,48 +173,22 @@ def _harvest_form_fields(html: str) -> dict[str, str]:
 
 
 # ============================================================
-# Notice ID + detail-link parsing
+# Results-page row parsing (teaser-level — verified against captured HTML)
 # ============================================================
 
-# Detail links look like: Details.aspx?SID=<session>&ID=<noticeId>
-# (the captured HTML had a trailing JS artifact like  ';return  — we ignore it).
-_DETAIL_ID_RE = re.compile(r'Details\.aspx\?SID=([A-Za-z0-9]+)&(?:amp;)?ID=(\d+)')
-
-
-def _extract_notice_ids(results_html: str) -> list[str]:
-    """Return the distinct notice IDs on a results page, order preserved."""
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for m in _DETAIL_ID_RE.finditer(results_html):
-        notice_id = m.group(2)
-        if notice_id not in seen:
-            seen.add(notice_id)
-            ordered.append(notice_id)
-    return ordered
-
-
-def _canonical_source_url(notice_id: str) -> str:
-    """SID-less canonical URL used as the dedup key / source_url. The SID is
-    per-session, so we must NOT include it — only the stable notice ID."""
-    return f"{_BASE}/Details.aspx?ID={notice_id}"
-
-
-# ============================================================
-# Notice text extraction from a Details page
-# ============================================================
-
-_NOTICE_START_MARKERS = (
-    "THE RIGHT TO VERIFICATION OF THE DEBT",
-    "NOTICE IS HEREBY GIVEN",
-    "NOTICE OF MORTGAGE FORECLOSURE",
-    "Minn. Stat.",
-    "YOU ARE NOTIFIED",
+# Each notice's View button carries the notice ID in its onclick navigation:
+#   ...GridView1$ctlNN$btnView2" ... onclick="...Details.aspx?SID=..&amp;ID=12345..
+# We anchor on btnView2 + capture the ID, then read the publication/date from
+# the adjacent info cell and the teaser from the following colspan cell.
+_ROW_ANCHOR_RE = re.compile(
+    r'GridView1\$ctl\d+\$btnView2"'      # the row's view button
+    r'[^>]*?onclick="[^"]*?ID=(\d+)',    # ...&ID=<noticeId> in the JS nav
+    re.IGNORECASE | re.DOTALL,
 )
 
 
 def _strip_tags(html: str) -> str:
-    """Crude tag strip for isolating notice body text from a detail page."""
-    # Drop scripts/styles entirely first.
+    """Crude tag strip for isolating readable text from a fragment."""
     html = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html,
                   flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<[^>]+>", " ", html)
@@ -203,20 +198,80 @@ def _strip_tags(html: str) -> str:
     return text.strip()
 
 
-def _slice_notice_text(detail_html: str) -> Optional[str]:
-    """Isolate the statutory notice body from a Details page. Returns None if
-    no recognizable notice opener is present (so we never feed junk to the LLM)."""
-    if not detail_html:
-        return None
-    text = _strip_tags(detail_html)
-    earliest = None
-    for marker in _NOTICE_START_MARKERS:
-        idx = text.find(marker)
-        if idx != -1 and (earliest is None or idx < earliest):
-            earliest = idx
-    if earliest is None:
-        return None
-    return text[earliest:][:20000].strip()
+def _parse_notice_rows(results_html: str) -> list[NoticeRow]:
+    """Parse the results page into one NoticeRow per notice, deduped by ID and
+    order-preserved. Pulls notice ID, publication, publish date, and the teaser
+    body (with the trailing "click 'view'..." prompt stripped off)."""
+    rows: list[NoticeRow] = []
+    seen: set[str] = set()
+
+    for am in _ROW_ANCHOR_RE.finditer(results_html):
+        notice_id = am.group(1)
+        if notice_id in seen:
+            continue
+        seen.add(notice_id)
+
+        start = am.start()
+        window = results_html[start:start + 4000]
+
+        # Publication + date live in the first <div class="left"> after the
+        # button: <div class="left"><strong>Publication</strong><br/>Date</div>
+        publication: Optional[str] = None
+        pub_date: Optional[str] = None
+        info_m = re.search(r'<div class="left">(.*?)</div>', window,
+                           re.IGNORECASE | re.DOTALL)
+        if info_m:
+            info_html = info_m.group(1)
+            strong = re.search(r'<strong>(.*?)</strong>', info_html,
+                               re.IGNORECASE | re.DOTALL)
+            if strong:
+                publication = _strip_tags(strong.group(1)) or None
+            after = re.sub(r'<strong>.*?</strong>', '', info_html,
+                           flags=re.IGNORECASE | re.DOTALL)
+            date_txt = _strip_tags(after)
+            pub_date = date_txt or None
+
+        # Teaser body: the next <td colspan="..."> cell after the button.
+        teaser = ""
+        teaser_m = re.search(r'<td colspan="\d+"[^>]*>(.*?)</td>', window,
+                             re.IGNORECASE | re.DOTALL)
+        if teaser_m:
+            raw = teaser_m.group(1)
+            # Drop the trailing "...click 'view' to open the full text." prompt.
+            raw = re.split(r"<em[^>]*>\s*click", raw, flags=re.IGNORECASE)[0]
+            teaser = _strip_tags(raw)
+            # Also strip a bare trailing "..." left from the truncation.
+            teaser = re.sub(r"\s*\.\.\.\s*$", "", teaser).strip()
+
+        rows.append(NoticeRow(
+            notice_id=notice_id,
+            publication=publication,
+            pub_date=pub_date,
+            teaser=teaser,
+        ))
+
+    return rows
+
+
+def _canonical_source_url(notice_id: str) -> str:
+    """SID-less canonical URL used as the dedup key / source_url. The SID is
+    per-session, so we must NOT include it — only the stable notice ID."""
+    return f"{_BASE}/Details.aspx?ID={notice_id}"
+
+
+def _build_notice_text(row: NoticeRow) -> str:
+    """Compose the text we hand the LLM + store as raw_notice_text. The staging
+    table has no publication/date columns, so we fold them in as a header. The
+    header also makes clear to the reviewer that this is a teaser, not the full
+    notice — honest labeling, matching the platform's data-accuracy stance."""
+    header_bits = ["[mnpublicnotice teaser — partial notice text]"]
+    if row.publication:
+        header_bits.append(f"Publication: {row.publication}")
+    if row.pub_date:
+        header_bits.append(f"Published: {row.pub_date}")
+    header_bits.append(f"Notice ID: {row.notice_id}")
+    header = "\n".join(header_bits)
+    return f"{header}\n\n{row.teaser}"
 
 
 # ============================================================
@@ -340,27 +395,6 @@ def _run_search(client: httpx.Client, window_days: int) -> Optional[str]:
     return r3.text or ""
 
 
-def _fetch_detail_text(client: httpx.Client, results_url_session: str,
-                       notice_id: str) -> Optional[str]:
-    """GET one notice's Details page (within the current session) and slice its
-    text. We reuse the session by reading the SID off the client's last URL."""
-    # The session id lives in the path /(S(<sid>))/. Build the detail URL with
-    # the same session segment so it resolves to our active search session.
-    sid_m = re.search(r"/\(S\(([^)]+)\)\)/", results_url_session)
-    if sid_m:
-        sid = sid_m.group(1)
-        url = f"{_BASE}/(S({sid}))/Details.aspx?SID={sid}&ID={notice_id}"
-    else:
-        url = f"{_BASE}/Details.aspx?ID={notice_id}"
-    try:
-        r = client.get(url, headers=_BROWSER_HEADERS)
-        if r.status_code != 200:
-            return None
-        return _slice_notice_text(r.text or "")
-    except httpx.HTTPError:
-        return None
-
-
 # ============================================================
 # Public entry point
 # ============================================================
@@ -371,7 +405,8 @@ def run_mnpublicnotice_scrape(
     window_days: int = _DEFAULT_WINDOW_DAYS,
 ) -> ScrapeResult:
     """Search mnpublicnotice for recent foreclosure notices, extract each NEW
-    one (dedup by notice ID), store as pending for review. Returns a summary."""
+    one from its results-page teaser (dedup by notice ID), store as pending for
+    review. Returns a summary."""
     result = ScrapeResult(ok=False)
 
     try:
@@ -383,46 +418,41 @@ def run_mnpublicnotice_scrape(
                 result.error = "Search flow failed (see logs)."
                 return result
 
-            # Remember the session-stamped results URL for detail fetches.
-            results_session_url = str(client.base_url) if False else None
-            # httpx doesn't retain last URL on the client; capture from a marker
-            # in the results HTML instead (the page embeds its own SID links).
-            sid_m = re.search(r'Details\.aspx\?SID=([A-Za-z0-9]+)&', results_html)
-            session_marker = (
-                f"/(S({sid_m.group(1)}))/" if sid_m else ""
-            )
-
-            notice_ids = _extract_notice_ids(results_html)
-            result.notices_on_results = len(notice_ids)
-            if not notice_ids:
+            notice_rows = _parse_notice_rows(results_html)
+            result.notices_on_results = len(notice_rows)
+            if not notice_rows:
                 result.ok = True
                 result.notes.append(
-                    "Results page fetched but no notice IDs parsed — the "
+                    "Results page fetched but no notice rows parsed — the "
                     "results markup may have changed."
                 )
                 return result
 
             new_count = 0
-            for notice_id in notice_ids:
+            for row in notice_rows:
                 if new_count >= max_new:
                     result.notes.append(
                         f"Stopped at per-run cap ({max_new}). Re-run to continue."
                     )
                     break
 
-                source_url = _canonical_source_url(notice_id)
+                source_url = _canonical_source_url(row.notice_id)
                 if _already_staged(source_url):
                     result.already_staged += 1
                     continue
                 result.new_ids += 1
 
-                time.sleep(_DETAIL_DELAY_SECONDS)
-                notice_text = _fetch_detail_text(client, session_marker, notice_id)
-                if not notice_text:
+                # Teaser must have enough text to be worth an LLM call.
+                if not row.teaser or len(row.teaser) < _MIN_TEASER_CHARS:
                     result.extraction_failed += 1
-                    logger.info("mnpublicnotice: no notice body", notice_id=notice_id)
+                    logger.info(
+                        "mnpublicnotice: teaser too short to extract",
+                        notice_id=row.notice_id,
+                        teaser_len=len(row.teaser or ""),
+                    )
                     continue
 
+                notice_text = _build_notice_text(row)
                 stored_id = _store_extraction(notice_text, source_url)
                 if stored_id is not None:
                     result.newly_extracted += 1
@@ -448,4 +478,4 @@ def run_mnpublicnotice_scrape(
         return result
 
 
-__all__ = ["run_mnpublicnotice_scrape", "ScrapeResult"]
+__all__ = ["run_mnpublicnotice_scrape", "ScrapeResult", "NoticeRow"]
