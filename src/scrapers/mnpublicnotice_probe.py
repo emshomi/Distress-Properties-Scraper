@@ -246,13 +246,48 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             # Async delta responses are pipe-delimited: "len|type|id|content|".
             is_delta = html2[:20].count("|") >= 2 and html2.lstrip()[:1].isdigit()
 
+            # Parse the ASP.NET AJAX delta. Format is repeating segments:
+            #   length|type|id|content|  (type 'updatePanel' carries panel HTML)
+            # We list each segment's (type,id,length) so we can SEE which panels
+            # updated — crucially whether the results grid (updateWSGrid /
+            # WSExtendedGrid) is among them.
+            delta_segments = []
+            grid_present = False
+            grid_foreclosure_hits = 0
+            if is_delta:
+                parts = html2.split("|")
+                i = 0
+                while i + 3 < len(parts):
+                    seg_len = parts[i]
+                    seg_type = parts[i + 1]
+                    seg_id = parts[i + 2]
+                    # content is parts[i+3], but may itself contain pipes; we
+                    # only record the id/type map here for visibility.
+                    if seg_type in ("updatePanel", "hiddenField", "scriptBlock",
+                                    "asyncPostBackControlIDs", "pageTitle"):
+                        delta_segments.append({
+                            "type": seg_type, "id": seg_id, "len": seg_len,
+                        })
+                        if "Grid" in seg_id or "Result" in seg_id or "WSExt" in seg_id:
+                            grid_present = True
+                        i += 4
+                    else:
+                        i += 1
+                # Does the WHOLE response mention the results grid / any notices?
+                grid_foreclosure_hits = (
+                    html2.count("Details.aspx") + html2.lower().count("foreclosure")
+                )
+
             diag["step2_post"] = {
                 "status": r2.status_code,
                 "final_url": str(r2.url),
                 "content_length": len(html2),
                 "is_async_delta": is_delta,
+                "delta_panels": delta_segments[:20],
+                "results_grid_panel_present": grid_present,
                 "result_markers_found": markers_hit,
                 "foreclosure_count_in_page": html2.count("FORECLOSURE") + html2.count("Foreclosure"),
+                "details_aspx_count": html2.count("Details.aspx"),
                 "result_count_label": count_hint.group(0) if count_hint else None,
                 "detail_link_count": len(set(detail_links)),
                 "detail_link_samples": sorted(set(detail_links))[:8],
