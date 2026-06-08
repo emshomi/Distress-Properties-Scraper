@@ -572,6 +572,67 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                 except Exception as xe:
                     recon["pdf_download_test"] = {"url": pdf_url, "error": str(xe)[:160]}
 
+            # (j) DECISIVE DETAIL-WALL DIAGNOSTIC. We need the full PDF, which
+            #     lives behind Details.aspx. Fetch it SAME-SESSION and dissect
+            #     the 13.6KB chrome to learn WHICH wall blocks us:
+            #       - reCAPTCHA token wall (hard)
+            #       - session-state wall (View-click sets state a GET misses)
+            #       - or the PDF link is right there in the chrome (cheap win)
+            if m:
+                sid, nid = m.group(1), m.group(2)
+                results_url = ru if rd else base
+                durl = f"{_BASE}/(S({sid}))/Details.aspx?SID={sid}&ID={nid}"
+                dh = dict(_HEADERS)
+                dh["Referer"] = results_url
+                try:
+                    dr = c.get(durl, headers=dh)
+                    dbody = dr.text or ""
+                    low = dbody.lower()
+                    # Pull title + any visible headers.
+                    title_m = re.search(r"<title>(.*?)</title>", dbody, re.I | re.S)
+                    headers_found = re.findall(r"<h[12][^>]*>(.*?)</h[12]>", dbody, re.I | re.S)
+                    headers_clean = [re.sub(r"<[^>]+>", " ", h).strip()[:80] for h in headers_found[:5]]
+                    # Does the chrome carry the PDF link already?
+                    pdf_in_chrome = re.findall(r'PDFDocument\.aspx\?[^"\'<>\s]+', dbody)
+                    fname_in_chrome = re.findall(r'FileName=([^"\'&<>\s]+\.pdf)', dbody, re.I)
+                    # New viewstate? (would mean detail page wants its own postback)
+                    dvs = re.search(r'id="__VIEWSTATE"[^>]*value="([^"]*)"', dbody)
+                    diag["detail_wall_diagnostic"] = {
+                        "url": durl,
+                        "status": dr.status_code,
+                        "len": len(dbody),
+                        "title": (re.sub(r"<[^>]+>", " ", title_m.group(1)).strip()
+                                  if title_m else None),
+                        "visible_headers": headers_clean,
+                        # Wall signals
+                        "has_recaptcha": any(k in low for k in (
+                            "recaptcha", "g-recaptcha", "grecaptcha")),
+                        "has_captcha_word": "captcha" in low,
+                        "mentions_expired": "expired" in low,
+                        "mentions_session": "session" in low,
+                        "mentions_search_again": ("search again" in low or
+                                                  "return to search" in low),
+                        "mentions_no_record": ("no record" in low or
+                                               "not found" in low or
+                                               "no results" in low),
+                        "has_login_wall": ("sign in" in low or "log in" in low or
+                                           "login" in low),
+                        "has_notice_marker": ("notice is hereby given" in low or
+                                              "mortgage foreclosure" in low),
+                        # Cheap-win signals
+                        "pdf_link_in_chrome": len(set(pdf_in_chrome)),
+                        "pdf_link_sample": sorted(set(pdf_in_chrome))[:3],
+                        "filename_in_chrome": sorted(set(fname_in_chrome))[:3],
+                        "has_new_viewstate": bool(dvs),
+                        "new_viewstate_len": len(dvs.group(1)) if dvs else 0,
+                        # Raw body so we can read what the chrome literally says
+                        "body_text_sample": re.sub(
+                            r"\s+", " ",
+                            re.sub(r"<[^>]+>", " ", dbody))[:1500],
+                    }
+                except Exception as je:
+                    diag["detail_wall_diagnostic"] = {"error": str(je)[:200]}
+
             diag["step3_results_recon"] = recon
     except Exception as e:
         diag["step3_results_recon"] = {"error": f"{type(e).__name__}: {e}"}
