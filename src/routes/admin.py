@@ -34,6 +34,7 @@ from src.llm.foreclosure_promotion import build_promotion_rows
 from src.scrapers.startribune_legal import run_startribune_scrape
 from src.scrapers.mnpublicnotice_probe import probe_mnpublicnotice
 from src.scrapers.hennepin_sheriff_probe import probe_hennepin_sheriff
+from src.scrapers.mnpublicnotice import run_mnpublicnotice_scrape
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
 
@@ -445,5 +446,48 @@ async def probe_hennepin_sheriff_route() -> dict[str, Any]:
     except Exception as e:
         logger.exception("admin hennepin sheriff probe failed", error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Probe failed to run.")
+
+# ============================================================
+# POST /admin/scrape/mnpublicnotice — statewide foreclosure notices
+# ============================================================
+
+
+class MnNoticeScrapeIn(BaseModel):
+    """Optional per-run cap + recent-window size for the mnpublicnotice scrape."""
+    max_new: int = 25
+    window_days: int = 14
+
+
+@router.post(
+    "/scrape/mnpublicnotice",
+    status_code=http_status.HTTP_200_OK,
+    summary="Search mnpublicnotice.com for recent foreclosure notices and stage new ones.",
+    dependencies=[AdminKeyRequired],
+)
+async def scrape_mnpublicnotice(payload: MnNoticeScrapeIn) -> dict[str, Any]:
+    """Run the statewide mnpublicnotice foreclosure-notice scraper on demand.
+    Searches the recent window, extracts each NEW notice (dedup by notice ID),
+    and stages it in ai.extracted_foreclosures as 'pending' for review."""
+    try:
+        import anyio
+        result = await anyio.to_thread.run_sync(
+            lambda: run_mnpublicnotice_scrape(
+                max_new=payload.max_new, window_days=payload.window_days
+            )
+        )
+        return success_envelope({
+            "ok": result.ok,
+            "notices_on_results": result.notices_on_results,
+            "new_ids": result.new_ids,
+            "already_staged": result.already_staged,
+            "newly_extracted": result.newly_extracted,
+            "extraction_failed": result.extraction_failed,
+            "stored_ids": result.stored_ids,
+            "error": result.error,
+            "notes": result.notes,
+        })
+    except Exception as e:
+        logger.exception("admin mnpublicnotice scrape failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to run the mnpublicnotice scrape.")
 
 __all__ = ["router"]
