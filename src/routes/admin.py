@@ -429,4 +429,21 @@ async def probe_mnpublicnotice_route() -> dict[str, Any]:
         logger.exception("admin mnpublicnotice probe failed", error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Probe failed to run.")
 
+@router.post(
+    "/probe/hennepin-sheriff",
+    status_code=http_status.HTTP_200_OK,
+    summary="Diagnostic: does the Hennepin Sheriff foreclosure API work from this server?",
+    dependencies=[AdminKeyRequired],
+)
+async def probe_hennepin_sheriff_route() -> dict[str, Any]:
+    """Run the Hennepin Sheriff API probe from this server. Confirms the Search
+    API works here + tries to discover a detail endpoint. Writes nothing."""
+    try:
+        import anyio
+        diag = await anyio.to_thread.run_sync(probe_hennepin_sheriff)
+        return success_envelope(diag)
+    except Exception as e:
+        logger.exception("admin hennepin sheriff probe failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Probe failed to run.")
+
 __all__ = ["router"]
