@@ -328,9 +328,8 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
         logger.exception("admin approve extraction failed", error_type=type(e).__name__)
         raise HTTPException(
             status_code=500,
-            detail=f"approve failed: {type(e).__name__}: {e}",
+            detail="Failed to approve extraction.",
         )
-
 
 @router.post(
     "/extractions/reject",
