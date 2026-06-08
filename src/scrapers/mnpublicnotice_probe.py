@@ -387,6 +387,53 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                 recon["notice_body_marker"] = None
                 recon["notice_body_context"] = None
 
+            # (f) SAME-SESSION detail fetch. The results page proved the body
+            #     is truncated ("click 'view' to open the full text."), so we
+            #     MUST hit Details.aspx. The earlier cold fetches failed
+            #     because they used fresh requests; the browser's View click
+            #     reuses the live session. Replicate: same client `c` (cookie
+            #     jar intact), Referer = the results URL we just GET'd.
+            if m:
+                sid, nid = m.group(1), m.group(2)
+                results_url = ru if rd else base
+                detail_urls = [
+                    f"{_BASE}/(S({sid}))/Details.aspx?SID={sid}&ID={nid}",
+                    f"{_BASE}/(S({sid}))/Details.aspx?ID={nid}",
+                    f"{_BASE}/Details.aspx?SID={sid}&ID={nid}",
+                ]
+                dh = dict(_HEADERS)
+                dh["Referer"] = results_url
+                same_session_attempts = []
+                for u in detail_urls:
+                    try:
+                        dr = c.get(u, headers=dh)
+                        dbody = dr.text or ""
+                        # Full text = the part the results page truncated.
+                        has_full = ("NOTICE IS HEREBY GIVEN" in dbody and
+                                    len(dbody) > 20000)
+                        # Find the notice marker inside the detail page.
+                        dn = re.search(
+                            r'(NOTICE IS HEREBY GIVEN|MORTGAGE FORECLOSURE)',
+                            dbody, re.IGNORECASE)
+                        same_session_attempts.append({
+                            "url": u,
+                            "status": dr.status_code,
+                            "len": len(dbody),
+                            "has_notice_marker": bool(dn),
+                            "looks_full": has_full,
+                            "body_context": (
+                                dbody[max(0, dn.start() - 100):dn.start() + 1400]
+                                if dn else None
+                            ),
+                        })
+                        # Stop at the first one that returns full text.
+                        if has_full:
+                            break
+                    except Exception as de:
+                        same_session_attempts.append(
+                            {"url": u, "error": str(de)[:160]})
+                recon["same_session_detail"] = same_session_attempts
+
             diag["step3_results_recon"] = recon
     except Exception as e:
         diag["step3_results_recon"] = {"error": f"{type(e).__name__}: {e}"}
