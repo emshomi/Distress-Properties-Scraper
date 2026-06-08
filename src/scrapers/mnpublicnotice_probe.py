@@ -151,6 +151,22 @@ def _recon_ajax(page: str) -> dict[str, Any]:
     return out
 
 
+
+def _delta_hidden(delta: str, field: str) -> Optional[str]:
+    """Pull a hidden field's value out of an ASP.NET AJAX delta response.
+    Delta segments look like: <len>|hiddenField|<fieldName>|<value>| — so we
+    find the field marker and read the next pipe-delimited chunk."""
+    marker = "|hiddenField|" + field + "|"
+    idx = delta.find(marker)
+    if idx == -1:
+        return None
+    start = idx + len(marker)
+    end = delta.find("|", start)
+    if end == -1:
+        return None
+    return delta[start:end]
+
+
 def probe_mnpublicnotice() -> dict[str, Any]:
     """Two-step WebForms probe + AJAX recon. Reports what our server receives."""
     diag: dict[str, Any] = {"step1_get": {}, "step2_post": {}, "step3_recon": {}, "verdict": ""}
@@ -295,6 +311,65 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                 "head_snippet": html2[:300],
             }
 
+            # ---- Step 2b: second async postback to load the results grid ----
+            # The search postback updated only the search-form panel and returned
+            # a FRESH __VIEWSTATE carrying the search criteria. The results render
+            # in a separate grid panel (WSExtendedGridNP1$updateWSGrid). So we
+            # fire a second async postback targeting that grid, carrying the new
+            # viewstate, to make the rows render.
+            try:
+                new_vs = _delta_hidden(html2, "__VIEWSTATE") or post_data["__VIEWSTATE"]
+                new_vsg = _delta_hidden(html2, "__VIEWSTATEGENERATOR") or post_data["__VIEWSTATEGENERATOR"]
+                GRID = "ctl00$ContentPlaceHolder1$WSExtendedGridNP1$updateWSGrid"
+                GRID_SM = "ctl00$ToolkitScriptManager1"
+
+                grid_data = dict(post_data)
+                grid_data["__VIEWSTATE"] = new_vs
+                grid_data["__VIEWSTATEGENERATOR"] = new_vsg
+                grid_data["__EVENTTARGET"] = ""
+                grid_data["__ASYNCPOST"] = "true"
+                # Target the grid panel. Some grids trigger via __EVENTTARGET on
+                # a paging control; first try the SM field = grid panel form.
+                grid_data[GRID_SM] = GRID + "|" + GRID
+                # Drop the search button trigger so we don't re-run the search.
+                grid_data.pop(P + "btnGo", None)
+
+                grid_headers = dict(post_headers)
+                grid_headers["X-MicrosoftAjax"] = "Delta=true"
+
+                r3 = client.post(str(r1.url), data=grid_data, headers=grid_headers)
+                html3 = r3.text or ""
+                gdetails = re.findall(
+                    r'[A-Za-z0-9_./()-]*[Dd]etails?\.aspx\?[A-Za-z0-9_./?=&-]*', html3
+                )
+                gcount = re.search(r'\b\d+\s*-\s*\d+\s+of\s+\d+\b', html3)
+                # list the grid delta's panels too
+                gpanels = []
+                if html3[:20].count("|") >= 2:
+                    gp = html3.split("|")
+                    j = 0
+                    while j + 3 < len(gp):
+                        if gp[j+1] in ("updatePanel","hiddenField","pageTitle",
+                                       "asyncPostBackControlIDs","scriptBlock"):
+                            gpanels.append({"type": gp[j+1], "id": gp[j+2], "len": gp[j]})
+                            j += 4
+                        else:
+                            j += 1
+
+                diag["step2b_grid"] = {
+                    "status": r3.status_code,
+                    "content_length": len(html3),
+                    "delta_panels": gpanels[:20],
+                    "details_aspx_count": html3.count("Details.aspx"),
+                    "detail_link_count": len(set(gdetails)),
+                    "detail_link_samples": sorted(set(gdetails))[:8],
+                    "result_count_label": gcount.group(0) if gcount else None,
+                    "foreclosure_hits": html3.count("FORECLOSURE") + html3.count("Foreclosure"),
+                    "head_snippet": html3[:300],
+                }
+            except Exception as ge:
+                diag["step2b_grid"] = {"error": f"{type(ge).__name__}: {ge}"}
+
             # ---- Step 3: AJAX recon (dump the real identifiers) ----
             g = client.get(_SEARCH_PAGE)
             page = g.text or ""
@@ -310,13 +385,18 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             )
             diag["step3_recon"]["results_or_search_links"] = sorted(set(results_links))[:10]
 
-            if count_hint:
+            g2b = diag.get("step2b_grid", {})
+            if (g2b.get("detail_link_count", 0) or 0) > 0 or g2b.get("result_count_label"):
+                diag["verdict"] = (
+                    "SUCCESS: the grid postback (step2b) returned real notice "
+                    "detail links / a result count. Scraper is viable."
+                )
+            elif count_hint:
                 diag["verdict"] = "SUCCESS: search postback returned a real result count."
             else:
                 diag["verdict"] = (
-                    "Search postback still returns the landing page (no count). "
-                    "It's an AJAX UpdatePanel — see step3_recon for the real "
-                    "ScriptManager/UpdatePanel ids needed for an async postback."
+                    "Search async postback works (valid delta) but the results "
+                    "grid did not yield notice links yet — see step2b_grid panels."
                 )
 
     except httpx.HTTPError as e:
