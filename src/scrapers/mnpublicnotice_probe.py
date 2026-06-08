@@ -279,9 +279,11 @@ def probe_mnpublicnotice() -> dict[str, Any]:
         diag["verdict"] = f"Network error: {type(e).__name__}: {e}"
         logger.exception("mnpublicnotice full-form probe failed", error_type=type(e).__name__)
 
-    # ---- Step 3: results-text structure + detail-fetch test ----
-    # (Run a real search, then inspect how notice text is laid out in the
-    #  results page, and whether a Details.aspx fetch returns a usable body.)
+    # ---- Step 3: results-text structure recon ----
+    # GOAL: prove the notice body is INLINE in the results GridView (so the
+    # scraper can parse text from rows and skip the broken detail fetch).
+    # We capture the full first GridView ROW, the chunk AFTER each btnView2
+    # button, the <td> class fingerprint, and counts to confirm 10 full rows.
     try:
         from urllib.parse import unquote as _unq
         with httpx.Client(timeout=45, headers=_HEADERS, follow_redirects=True) as c:
@@ -314,38 +316,77 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                     ru = _BASE + ru
                 results = (c.get(ru, headers=_HEADERS).text or "")
 
-            recon = {"results_len": len(results)}
-            # (a) Find the first Details link + show 800 chars AROUND it so we
-            #     see whether the notice text is inline in the results list.
+            recon: dict[str, Any] = {"results_len": len(results)}
+
+            # First Details link -> sid/id anchor.
             m = re.search(r'Details\.aspx\?SID=([A-Za-z0-9]+)&(?:amp;)?ID=(\d+)', results)
             if m:
                 sid, nid = m.group(1), m.group(2)
                 recon["first_sid"] = sid
                 recon["first_id"] = nid
-                pos = m.start()
-                recon["results_context"] = results[max(0, pos-400):pos+400]
-                # (b) Try fetching that detail page a couple ways.
-                detail_attempts = []
-                urls = [
-                    f"{_BASE}/(S({sid}))/Details.aspx?SID={sid}&ID={nid}",
-                    f"{_BASE}/Details.aspx?SID={sid}&ID={nid}",
-                    f"{_BASE}/(S({sid}))/Details.aspx?ID={nid}",
-                ]
-                for u in urls:
-                    try:
-                        dr = c.get(u, headers=_HEADERS)
-                        body = dr.text or ""
-                        has_notice = any(k in body for k in (
-                            "NOTICE IS HEREBY GIVEN", "MORTGAGE FORECLOSURE",
-                            "YOU ARE NOTIFIED", "Minn. Stat."))
-                        detail_attempts.append({
-                            "url": u, "status": dr.status_code,
-                            "len": len(body), "has_notice_text": has_notice,
-                            "head": body[:160],
-                        })
-                    except Exception as de:
-                        detail_attempts.append({"url": u, "error": str(de)[:120]})
-                recon["detail_attempts"] = detail_attempts
+
+            # (a) Count the structural anchors so we know how many full rows
+            #     are inline. btnView2 = one per notice row.
+            recon["btnview2_count"] = len(re.findall(r'\$btnView2', results))
+            recon["btnview_count"] = len(re.findall(r'\$btnView\b', results))
+            recon["details_link_count"] = len(re.findall(r'Details\.aspx\?', results))
+            recon["gridview_row_ctl_count"] = len(
+                set(re.findall(r'GridView1\$ctl(\d+)\$btnView2', results))
+            )
+
+            # (b) Capture the chunk AFTER the FIRST btnView2 button — this is
+            #     where the adjacent text cell(s) live. 2500 chars forward.
+            bm = re.search(r'GridView1\$ctl\d+\$btnView2"', results)
+            if bm:
+                start = bm.start()
+                recon["results_context_after"] = results[start:start + 2500]
+            else:
+                recon["results_context_after"] = None
+
+            # (c) Capture the ENTIRE first GridView data row, button cell to
+            #     row close. Anchor on the row's first <tr> before btnView2.
+            if bm:
+                # Walk back to the <tr that opens this row.
+                pre = results[:bm.start()]
+                tr_open = pre.rfind("<tr")
+                # Walk forward to the matching </tr> after the button.
+                tr_close = results.find("</tr>", bm.start())
+                if tr_open != -1 and tr_close != -1:
+                    recon["first_full_row"] = results[tr_open:tr_close + 5][:4000]
+                else:
+                    recon["first_full_row"] = None
+            else:
+                recon["first_full_row"] = None
+
+            # (d) <td> class fingerprint across the results — which cell holds
+            #     the notice text? Sample distinct class strings.
+            td_classes = re.findall(r'<td[^>]*class="([^"]+)"', results)
+            seen: list[str] = []
+            for cls in td_classes:
+                if cls not in seen:
+                    seen.append(cls)
+                if len(seen) >= 25:
+                    break
+            recon["td_class_samples"] = seen
+            recon["has_noticeText_class"] = bool(
+                re.search(r'class="[^"]*notice[^"]*"', results, re.IGNORECASE)
+            )
+
+            # (e) Where the real notice body sits: find the first occurrence of
+            #     a legal-notice marker and show 1500 chars around it.
+            nm2 = re.search(
+                r'(NOTICE IS HEREBY GIVEN|MORTGAGE FORECLOSURE SALE|'
+                r'NOTICE OF MORTGAGE|YOU ARE NOTIFIED|Minn\. Stat\.)',
+                results, re.IGNORECASE,
+            )
+            if nm2:
+                p = nm2.start()
+                recon["notice_body_marker"] = nm2.group(1)
+                recon["notice_body_context"] = results[max(0, p - 300):p + 1200]
+            else:
+                recon["notice_body_marker"] = None
+                recon["notice_body_context"] = None
+
             diag["step3_results_recon"] = recon
     except Exception as e:
         diag["step3_results_recon"] = {"error": f"{type(e).__name__}: {e}"}
