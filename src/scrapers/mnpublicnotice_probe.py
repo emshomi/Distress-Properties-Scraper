@@ -317,6 +317,74 @@ def probe_mnpublicnotice() -> dict[str, Any]:
         )
         logger.exception("mnpublicnotice probe failed", error_type=type(e).__name__)
 
+    # ---- Step 3: detect AJAX UpdatePanel + try a GET-based search ----
+    # Yesterday two full POSTs returned the unchanged landing page, which
+    # strongly suggests the search is an AJAX partial-postback (ToolkitScript
+    # Manager present) OR there is a GET results URL. This step gathers the
+    # evidence to decide which, without committing to either yet.
+    try:
+        with httpx.Client(
+            timeout=30, headers=_HEADERS, follow_redirects=True
+        ) as client:
+            # Re-GET to get a fresh session + page for inspection.
+            g = client.get(_SEARCH_PAGE)
+            page = g.text or ""
+            base_url = str(g.url)  # session-stamped
+
+            import re as _re
+            diag["step3_recon"] = {}
+
+            # (a) UpdatePanel / ScriptManager evidence
+            diag["step3_recon"]["has_scriptmanager"] = (
+                "ToolkitScriptManager" in page or "Sys.WebForms" in page
+            )
+            diag["step3_recon"]["has_updatepanel"] = (
+                "__doPostBack" in page and "UpdatePanel" in page
+            )
+            # The UpdatePanel id, if present (we need it for an async postback).
+            up = _re.search(r'id="([^"]*UpdatePanel[^"]*)"', page)
+            diag["step3_recon"]["updatepanel_id"] = up.group(1) if up else None
+            # The ScriptManager field name (target for async).
+            sm = _re.search(r'name="(ctl00\$[^"]*ScriptManager[^"]*)"', page)
+            diag["step3_recon"]["scriptmanager_field"] = sm.group(1) if sm else None
+
+            # (b) Any links/forms hinting at a results page or GET search
+            results_links = _re.findall(
+                r'(?:href|action)="([^"]*(?:Results|Search)\.aspx[^"]*)"', page
+            )
+            diag["step3_recon"]["results_or_search_links"] = sorted(set(results_links))[:10]
+
+            # (c) Try a GET-based search a few common ways and report which
+            # (if any) returns a different page with foreclosure content.
+            get_attempts = []
+            candidates = [
+                ("text param", {"text": "foreclosure"}),
+                ("keywords param", {"keywords": "foreclosure"}),
+                ("q param", {"q": "foreclosure"}),
+                ("SearchText param", {"SearchText": "foreclosure"}),
+            ]
+            for label, params in candidates:
+                try:
+                    gr = client.get(base_url, params=params)
+                    body = gr.text or ""
+                    fc = body.count("FORECLOSURE") + body.count("Foreclosure")
+                    cnt = _re.search(r'\b\d+\s*-\s*\d+\s+of\s+\d+\b', body)
+                    get_attempts.append({
+                        "label": label,
+                        "status": gr.status_code,
+                        "length": len(body),
+                        "foreclosure_hits": fc,
+                        "count_label": cnt.group(0) if cnt else None,
+                        "differs_from_form": len(body) != len(page),
+                    })
+                except Exception as ge:
+                    get_attempts.append({"label": label, "error": str(ge)[:120]})
+            diag["step3_recon"]["get_search_attempts"] = get_attempts
+
+    except Exception as e:
+        diag["step3_recon"] = {"error": f"{type(e).__name__}: {e}"}
+        logger.exception("mnpublicnotice step3 recon failed", error_type=type(e).__name__)
+
     return diag
 
 
