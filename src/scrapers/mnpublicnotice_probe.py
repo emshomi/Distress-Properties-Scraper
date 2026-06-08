@@ -456,45 +456,79 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             recon["inline_blocks_over_1000"] = sum(
                 1 for t in text_blocks if len(t) > 1000)
 
-            # (h) POSTBACK detail attempt: the View button is a submit inside
-            #     the results form. Replicate clicking it — harvest the RESULTS
-            #     page form, set EVENTTARGET to the btnView2 control, POST back
-            #     on the same client. This is what actually opens the record.
+            # (h) POSTBACK detail attempt: btnView (the hidden ASP.NET submit;
+            #     btnView2 is the cosmetic JS-nav twin). Clicking it stores the
+            #     selected record server-side, then ASP.NET redirects to
+            #     Details.aspx which renders from that session state. We POST
+            #     btnView, follow the pageRedirect, and read the detail page —
+            #     all on the same client.
             if m and rd:
                 try:
                     rflds = _harvest_form_fields(results)
+                    # Use the HIDDEN btnView (not btnView2) for the first row.
                     ctl_m = re.search(
                         r'(ctl00\$ContentPlaceHolder1\$WSExtendedGridNP1\$'
-                        r'GridView1\$ctl\d+\$btnView2)', results)
+                        r'GridView1\$ctl\d+\$btnView)\b(?!2)', results)
+                    sm_m = re.search(r'name="(ctl00\$[^"]*ScriptManager[^"]*)"', results)
                     if ctl_m:
                         ctl_name = ctl_m.group(1)
                         pb = dict(rflds)
                         pb["__EVENTTARGET"] = ""
                         pb["__EVENTARGUMENT"] = ""
-                        pb[ctl_name] = ""  # submit button value
+                        pb["__ASYNCPOST"] = "true"
+                        pb[ctl_name] = ""
+                        # ScriptManager trigger pointing at this button's panel.
+                        if sm_m:
+                            pb[sm_m.group(1)] = (
+                                "ctl00$ContentPlaceHolder1$WSExtendedGridNP1$"
+                                "upGrid|" + ctl_name)
                         pbh = dict(_HEADERS)
                         pbh["Content-Type"] = (
                             "application/x-www-form-urlencoded; charset=UTF-8")
+                        pbh["X-MicrosoftAjax"] = "Delta=true"
+                        pbh["X-Requested-With"] = "XMLHttpRequest"
                         pbh["Referer"] = ru
                         pbh["Origin"] = _BASE
                         pbr = c.post(ru, data=pb, headers=pbh)
                         pbody = pbr.text or ""
-                        pdn = re.search(
-                            r'(NOTICE IS HEREBY GIVEN|MORTGAGE FORECLOSURE)',
-                            pbody, re.IGNORECASE)
+                        # Did the postback answer with a redirect to Details?
+                        pbrd = re.search(r"pageRedirect\|\|([^|]+)\|", pbody)
+                        detail_after = None
+                        detail_ctx = None
+                        detail_len = None
+                        if pbrd:
+                            du = _unq(pbrd.group(1))
+                            if du.startswith("/"):
+                                du = _BASE + du
+                            dh2 = dict(_HEADERS)
+                            dh2["Referer"] = ru
+                            dgr = c.get(du, headers=dh2)
+                            dtext = dgr.text or ""
+                            detail_len = len(dtext)
+                            ddn = re.search(
+                                r'(NOTICE IS HEREBY GIVEN|MORTGAGE FORECLOSURE)',
+                                dtext, re.IGNORECASE)
+                            detail_after = du
+                            if ddn:
+                                # Full = marker present AND we're past the
+                                # teaser cutoff (real body keeps going).
+                                tail = dtext[ddn.start():ddn.start() + 2000]
+                                detail_ctx = tail
                         recon["postback_detail"] = {
                             "ctl_name": ctl_name,
-                            "status": pbr.status_code,
-                            "len": len(pbody),
-                            "final_url": str(pbr.url),
-                            "has_notice_marker": bool(pdn),
-                            "looks_full": (bool(pdn) and len(pbody) > 20000),
-                            "body_context": (
-                                pbody[max(0, pdn.start() - 100):pdn.start() + 1400]
-                                if pdn else pbody[:600]),
+                            "postback_status": pbr.status_code,
+                            "postback_len": len(pbody),
+                            "had_pageRedirect": bool(pbrd),
+                            "detail_url": detail_after,
+                            "detail_len": detail_len,
+                            "detail_has_full_body": (
+                                detail_ctx is not None and
+                                "click &#39;view&#39;" not in (detail_ctx or "") and
+                                "click 'view'" not in (detail_ctx or "")),
+                            "detail_body_context": detail_ctx,
                         }
                     else:
-                        recon["postback_detail"] = {"error": "no btnView2 ctl found"}
+                        recon["postback_detail"] = {"error": "no btnView ctl found"}
                 except Exception as pe:
                     recon["postback_detail"] = {"error": str(pe)[:200]}
 
