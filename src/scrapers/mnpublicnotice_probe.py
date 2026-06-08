@@ -162,6 +162,7 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                 "has_viewstate": "__VIEWSTATE" in fields,
                 "viewstate_len": len(fields.get("__VIEWSTATE", "")),
                 "has_scriptmanager_field": _SM_FIELD in fields,
+                "field_names": sorted(fields.keys()),
             }
             if r1.status_code != 200 or "__VIEWSTATE" not in fields:
                 diag["verdict"] = "Could not load the search page / no viewstate."
@@ -203,15 +204,40 @@ def probe_mnpublicnotice() -> dict[str, Any]:
             # Approximate the body size we sent (sanity vs the browser's ~88KB).
             approx_body_len = sum(len(k) + len(str(v)) + 2 for k, v in body.items())
 
-            results = _count_result_rows(html2)
+            # ASP.NET AJAX may answer the search with a pageRedirect directive
+            # ("...|pageRedirect||<url>|..."), meaning the results render on a
+            # SUBSEQUENT GET (criteria were stored in session). Detect + follow.
+            redirect_url = None
+            rd = re.search(r"pageRedirect\|\|([^|]+)\|", html2)
+            if rd:
+                from urllib.parse import unquote
+                redirect_url = unquote(rd.group(1))
+                if redirect_url.startswith("/"):
+                    redirect_url = _BASE + redirect_url
+
+            results_html = html2
+            followed = False
+            if redirect_url:
+                try:
+                    rget = client.get(redirect_url, headers=_HEADERS)
+                    if rget.status_code == 200 and rget.text:
+                        results_html = rget.text
+                        followed = True
+                except httpx.HTTPError:
+                    pass
+
+            results = _count_result_rows(results_html)
             diag["step2_search"] = {
+                "followed_page_redirect": followed,
+                "redirect_url": redirect_url,
+                "results_html_length": len(results_html),
                 "status": r2.status_code,
                 "request_field_count": len(body),
                 "approx_request_body_len": approx_body_len,
                 "response_length": len(html2),
                 "is_delta": html2[:20].count("|") >= 2 and html2.lstrip()[:1].isdigit(),
                 **results,
-                "head_snippet": html2[:300],
+                "head_snippet": results_html[:300],
             }
 
             if (results["details_links_found"] or 0) > 0 or results["total_pages"]:
