@@ -532,6 +532,46 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                 except Exception as pe:
                     recon["postback_detail"] = {"error": str(pe)[:200]}
 
+            # (i) THE REAL SOURCE: PDFDocument.aspx?...&FileName=*.pdf
+            #     The browser screenshot proved the full notice lives in a PDF
+            #     served via PDFDocument.aspx (session-stamped). Check whether
+            #     that link is in the RESULTS payload (best case: no detail
+            #     page needed) and try downloading it on the SAME client.
+            pdf_links = re.findall(
+                r'PDFDocument\.aspx\?[^"\'<>\s]+', results)
+            from html import unescape as _un2
+            pdf_links = [_un2(p) for p in pdf_links]
+            recon["pdf_links_in_results"] = len(set(pdf_links))
+            recon["pdf_link_samples"] = sorted(set(pdf_links))[:5]
+            # Also look for the bare FileName= pattern anywhere.
+            fnames = re.findall(r'FileName=([^"\'&<>\s]+\.pdf)', results, re.IGNORECASE)
+            recon["filename_params_in_results"] = sorted(set(fnames))[:5]
+
+            # If a PDF link exists in results, download it on the same client.
+            if pdf_links:
+                pdf_url = pdf_links[0]
+                if pdf_url.startswith("/"):
+                    pdf_url = _BASE + pdf_url
+                elif not pdf_url.startswith("http"):
+                    # Relative to the session-stamped base.
+                    sb = re.match(r'(https://www\.mnpublicnotice\.com/\(S\([^)]+\)\)/)', ru or "")
+                    pdf_url = (sb.group(1) if sb else _BASE + "/") + pdf_url
+                try:
+                    ph2 = dict(_HEADERS)
+                    ph2["Referer"] = ru
+                    ph2["Accept"] = "application/pdf,*/*"
+                    pdfr = c.get(pdf_url, headers=ph2)
+                    raw = pdfr.content or b""
+                    recon["pdf_download_test"] = {
+                        "url": pdf_url,
+                        "status": pdfr.status_code,
+                        "bytes": len(raw),
+                        "content_type": pdfr.headers.get("content-type", ""),
+                        "is_pdf": raw[:5] == b"%PDF-",
+                    }
+                except Exception as xe:
+                    recon["pdf_download_test"] = {"url": pdf_url, "error": str(xe)[:160]}
+
             diag["step3_results_recon"] = recon
     except Exception as e:
         diag["step3_results_recon"] = {"error": f"{type(e).__name__}: {e}"}
