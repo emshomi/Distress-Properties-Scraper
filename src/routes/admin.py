@@ -404,5 +404,28 @@ async def scrape_startribune(payload: ScrapeIn) -> dict[str, Any]:
             detail="Failed to run the Star Tribune scrape.",
         )
 
+# ============================================================
+# POST /admin/probe/mnpublicnotice — verify server can use the site
+# ============================================================
+
+
+@router.post(
+    "/probe/mnpublicnotice",
+    status_code=http_status.HTTP_200_OK,
+    summary="Diagnostic: can THIS server fetch + search mnpublicnotice.com?",
+    dependencies=[AdminKeyRequired],
+)
+async def probe_mnpublicnotice_route() -> dict[str, Any]:
+    """Run the mnpublicnotice.com source-verification probe from this server
+    and return the diagnostic. Writes nothing — it only reports what our
+    server receives, so we know whether a real scraper is viable before
+    building one."""
+    try:
+        import anyio
+        diag = await anyio.to_thread.run_sync(probe_mnpublicnotice)
+        return success_envelope(diag)
+    except Exception as e:
+        logger.exception("admin mnpublicnotice probe failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Probe failed to run.")
 
 __all__ = ["router"]
