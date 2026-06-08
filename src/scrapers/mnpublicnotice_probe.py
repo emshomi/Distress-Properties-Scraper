@@ -434,6 +434,70 @@ def probe_mnpublicnotice() -> dict[str, Any]:
                             {"url": u, "error": str(de)[:160]})
                 recon["same_session_detail"] = same_session_attempts
 
+            # (g) Is the FULL text hiding in the results payload (hidden div /
+            #     second copy), or does the server only ship the teaser?
+            #     Check for content PAST the visible truncation point.
+            tease = re.search(
+                r'NOTICE IS HEREBY GIVEN.{0,400}?click &#39;view&#39;',
+                results, re.DOTALL | re.IGNORECASE)
+            recon["teaser_len_first"] = (
+                tease.end() - tease.start() if tease else None)
+            # Count how many times the FIRST notice's distinctive mortgagor
+            # text appears — >1 would mean a hidden full copy exists.
+            mort = re.search(r'Mortgagor:\s*([A-Za-z ]{8,40})', results)
+            if mort:
+                frag = mort.group(1).strip()[:20]
+                recon["mortgagor_fragment"] = frag
+                recon["mortgagor_occurrences"] = results.count(frag)
+            # Longest run between tags (proxy for "is any full body inline?").
+            text_blocks = re.findall(r'>([^<]{200,})<', results)
+            recon["longest_inline_text_block"] = (
+                max((len(t) for t in text_blocks), default=0))
+            recon["inline_blocks_over_1000"] = sum(
+                1 for t in text_blocks if len(t) > 1000)
+
+            # (h) POSTBACK detail attempt: the View button is a submit inside
+            #     the results form. Replicate clicking it — harvest the RESULTS
+            #     page form, set EVENTTARGET to the btnView2 control, POST back
+            #     on the same client. This is what actually opens the record.
+            if m and rd:
+                try:
+                    rflds = _harvest_form_fields(results)
+                    ctl_m = re.search(
+                        r'(ctl00\$ContentPlaceHolder1\$WSExtendedGridNP1\$'
+                        r'GridView1\$ctl\d+\$btnView2)', results)
+                    if ctl_m:
+                        ctl_name = ctl_m.group(1)
+                        pb = dict(rflds)
+                        pb["__EVENTTARGET"] = ""
+                        pb["__EVENTARGUMENT"] = ""
+                        pb[ctl_name] = ""  # submit button value
+                        pbh = dict(_HEADERS)
+                        pbh["Content-Type"] = (
+                            "application/x-www-form-urlencoded; charset=UTF-8")
+                        pbh["Referer"] = ru
+                        pbh["Origin"] = _BASE
+                        pbr = c.post(ru, data=pb, headers=pbh)
+                        pbody = pbr.text or ""
+                        pdn = re.search(
+                            r'(NOTICE IS HEREBY GIVEN|MORTGAGE FORECLOSURE)',
+                            pbody, re.IGNORECASE)
+                        recon["postback_detail"] = {
+                            "ctl_name": ctl_name,
+                            "status": pbr.status_code,
+                            "len": len(pbody),
+                            "final_url": str(pbr.url),
+                            "has_notice_marker": bool(pdn),
+                            "looks_full": (bool(pdn) and len(pbody) > 20000),
+                            "body_context": (
+                                pbody[max(0, pdn.start() - 100):pdn.start() + 1400]
+                                if pdn else pbody[:600]),
+                        }
+                    else:
+                        recon["postback_detail"] = {"error": "no btnView2 ctl found"}
+                except Exception as pe:
+                    recon["postback_detail"] = {"error": str(pe)[:200]}
+
             diag["step3_results_recon"] = recon
     except Exception as e:
         diag["step3_results_recon"] = {"error": f"{type(e).__name__}: {e}"}
