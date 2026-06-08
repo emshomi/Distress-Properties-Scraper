@@ -126,18 +126,39 @@ def _harvest_form_fields(html: str) -> dict[str, str]:
 
 
 def _count_result_rows(delta: str) -> dict[str, Any]:
-    """Inspect a search response for result evidence."""
-    page_of = re.search(r'Page\s+\d+\s+of\s+(\d+)\s+Pages', delta)
-    details = re.findall(r'Details\.aspx\?[A-Za-z0-9_&=%.-]+', delta)
+    """Inspect a results page for result evidence + the patterns the scraper
+    needs: full Details.aspx links and the pagination control."""
+    from html import unescape as _un
+    page_of = re.search(r'Page\s+(\d+)\s+of\s+(\d+)\s+Pages', delta)
+    # Full detail links: capture the WHOLE href (SID + record id), unescaped.
+    raw_details = re.findall(r'Details\.aspx\?[^"\'<>\s]+', delta)
+    details = [_un(d) for d in raw_details]
+    # Notice "VIEW" buttons / links — try several render styles.
+    view_buttons = (
+        len(re.findall(r'>\s*VIEW\s*<', delta, re.IGNORECASE))
+        + len(re.findall(r'value="VIEW"', delta, re.IGNORECASE))
+        + len(re.findall(r'class="[^"]*view[^"]*"', delta, re.IGNORECASE))
+    )
     foreclosure_hits = delta.count("FORECLOSURE") + delta.count("Foreclosure")
-    view_buttons = len(re.findall(r'>\s*VIEW\s*<', delta, re.IGNORECASE))
+    # Pagination control: the "next page" link/postback target.
+    next_link = re.search(
+        r'(href|onclick)="([^"]*(?:Page|page|pg|activePage)[^"]*)"', delta
+    )
+    # __doPostBack targets referencing the results grid (paging triggers).
+    grid_posts = re.findall(
+        r"__doPostBack\(['\"]([^'\"]*(?:Grid|Pager|Page)[^'\"]*)['\"]",
+        delta,
+    )
     return {
+        "current_page": int(page_of.group(1)) if page_of else None,
+        "total_pages": int(page_of.group(2)) if page_of else None,
         "total_pages_label": page_of.group(0) if page_of else None,
-        "total_pages": int(page_of.group(1)) if page_of else None,
         "details_links_found": len(set(details)),
-        "details_samples": sorted(set(details))[:8],
+        "details_samples": sorted(set(details))[:10],
         "foreclosure_hits": foreclosure_hits,
         "view_buttons": view_buttons,
+        "next_link_sample": next_link.group(2) if next_link else None,
+        "grid_postback_targets": sorted(set(grid_posts))[:10],
     }
 
 
