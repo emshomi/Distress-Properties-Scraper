@@ -834,6 +834,59 @@ def _load_owner_map() -> dict[str, dict[str, Any]]:
         }
     return owner_map
 
+def _load_parcel_enrichment(county_code: str, parcel_id: str) -> Optional[dict[str, Any]]:
+    """Fetch the enriched property characteristics for ONE parcel from
+    core.parcels, keyed by (county_code, parcel_id). Returns only the fields
+    that are actually populated (null fields are omitted, so the frontend shows
+    nothing for them rather than 'Unknown'/blank). The literal string 'Unknown'
+    (a MnGeo non-value) is treated as null. Returns None if the parcel isn't
+    found or has no enrichment.
+
+    The caller passes the EFFECTIVE parcel id (the real gis_pid for sheriff
+    rows, recovered via _effective_parcel_id) and the lowercase county slug.
+    """
+    if not county_code or not parcel_id:
+        return None
+    try:
+        result = (
+            core_table("parcels")
+            .select(
+                "year_built, sqft, lot_sqft, last_sale_price, last_sale_date, "
+                "emv_land, emv_building, emv_total, annual_tax, "
+                "special_assessments, num_units, use_class, school_district, "
+                "homestead_status, garage, garage_sqft, basement, heating, "
+                "cooling, legal_description, property_type, "
+                "estimated_market_value"
+            )
+            .eq("county_code", county_code)
+            .eq("parcel_id", parcel_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.warning(
+            "parcel enrichment fetch failed",
+            county=county_code, parcel_id=parcel_id,
+            error_type=type(e).__name__,
+        )
+        return None
+
+    if not rows:
+        return None
+
+    raw = rows[0]
+    # Keep only populated fields; treat 'Unknown' (MnGeo non-value) as absent.
+    enrichment: dict[str, Any] = {}
+    for k, v in raw.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip().lower() in ("", "unknown"):
+            continue
+        enrichment[k] = v
+
+    return enrichment or None
+
 
 # ============================================================
 # REDEMPTION-WINDOW COMPUTATION
