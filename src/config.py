@@ -139,6 +139,7 @@ class Settings(BaseSettings):
     scraper_mcro_probate_enabled: bool = Field(default=False)
     scraper_usps_vacancy_enabled: bool = Field(default=False)
     scraper_tax_forfeit_enabled: bool = Field(default=True)
+    scraper_parcel_enrich_mngeo_enabled: bool = Field(default=True)
 
     # ----- Scraper behavior -----
 
