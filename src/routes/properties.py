@@ -1546,16 +1546,23 @@ async def list_properties(
 ) -> dict[str, Any]:
     """Return a paginated list of distress events with optional filters."""
     try:
+        # Read from the enrichment-joined view (signals.distress_with_parcel),
+        # not distress_events directly. Same rows, plus the parcel
+        # characteristics (year_built, sqft, lot_sqft, emv_total, property_type,
+        # school_district, ...) exposed as real, filterable/sortable columns.
+        # This is what lets the buyer-lens filters (year built, square footage,
+        # value, type, school) run at the DB level and scale as enrichment grows.
         query = (
-            signals_table("distress_events")
+            signals_table("distress_with_parcel")
             .select(
                 "source_id, source, parcel_id, event_type, event_date, "
                 "event_value, severity, title, description, raw_data, "
-                "observed_at",
+                "observed_at, year_built, sqft, lot_sqft, emv_total, "
+                "property_type, school_district",
                 count="exact",
             )
         )
-
+        
         if category:
             query = _apply_category_filter(query, category)
 
