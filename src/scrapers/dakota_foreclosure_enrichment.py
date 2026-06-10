@@ -124,7 +124,7 @@ def _norm_addr(s: Any) -> str:
         "15527 CORNELL TRAIL"      -> "15527 CORNELL TRL"
         "15527 CORNELL TRL"        -> "15527 CORNELL TRL"   (already short)
         "2007 122ND ST E #B-1"     -> "2007 122ND ST E"     (unit stripped)
-        "350 18TH AVENUE SOUTH"    -> "350 18TH AVE SOUTH"
+        "350 18TH AVENUE SOUTH"    -> "350 18TH AVE S"
     """
     if s is None:
         return ""
