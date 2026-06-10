@@ -96,6 +96,22 @@ _SUFFIX_MAP: dict[str, str] = {
 }
 
 
+# Directional normalization. The foreclosure feed spells directionals out
+# ("SOUTH", "EAST"); the parcel layer abbreviates ("S", "E"). Like the suffix
+# map, we collapse long->short and apply it identically to BOTH sides, so it
+# can never introduce a one-sided (wrong) match. Compound directionals
+# (NORTHEAST) are included alongside the single forms.
+_DIRECTIONAL_MAP: dict[str, str] = {
+    "NORTHEAST": "NE",
+    "NORTHWEST": "NW",
+    "SOUTHEAST": "SE",
+    "SOUTHWEST": "SW",
+    "NORTH": "N",
+    "SOUTH": "S",
+    "EAST": "E",
+    "WEST": "W",
+}
+
 def _norm_addr(s: Any) -> str:
     """Normalize an address for matching across Dakota's two layers.
 
