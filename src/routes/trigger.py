@@ -65,6 +65,7 @@ _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "mcro_probate": McroProbateScraper,
     "usps_vacancy": UspsVacancyScraper,
     "tax_forfeit": TaxForfeitScraper,
+    "parcel_enrich_mngeo": ParcelEnrichScraper,
 }
 
 # Track background tasks so they aren't garbage-collected mid-run.
