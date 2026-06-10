@@ -431,6 +431,26 @@ async def probe_mnpublicnotice_route() -> dict[str, Any]:
         logger.exception("admin mnpublicnotice probe failed", error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Probe failed to run.")
 
+
+@router.get(
+    "/probe/anoka_assessor",
+    status_code=http_status.HTTP_200_OK,
+    summary="Diagnostic: does Anoka's Assessor_Sales service expose year_built / property_type?",
+    dependencies=[AdminKeyRequired],
+)
+async def probe_anoka_assessor_route() -> dict[str, Any]:
+    """Dump the Anoka Assessor_Sales service (layers, fields, one sample row
+    each) so we can see whether year_built / property_type are available before
+    deciding to ingest Anoka parcels into core.parcels. Writes nothing."""
+    try:
+        import anyio
+        diag = await anyio.to_thread.run_sync(probe_anoka_assessor)
+        return success_envelope(diag)
+    except Exception as e:
+        logger.exception("admin anoka assessor probe failed", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Probe failed to run.")
+ 
+
 @router.post(
     "/probe/hennepin-sheriff",
     status_code=http_status.HTTP_200_OK,
