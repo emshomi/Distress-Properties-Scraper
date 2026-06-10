@@ -1,7 +1,7 @@
 """
 Public properties + stats endpoints for the govire.com frontend.
 
-Returns live data from signals.distress_events and core.parcels —
+Returns live data from signals.distress_events and core.parcels —# Drop the internal de-dup key — single-property responses don't need it.
 NO hardcoded numbers.
 
 Each upstream scraper writes raw_data in its own shape (we built them
@@ -1826,13 +1826,25 @@ async def get_property(source: str, source_id: str) -> dict[str, Any]:
                 detail=f"Property not found: {source}/{source_id}",
             )
 
-        overlay_map = _load_overlay_map()
+       overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         shaped = _shape_property_row(rows[0], overlay_map, owner_map)
         shaped["raw"] = rows[0].get("raw_data") or {}
+
+        # Attach enriched property characteristics from core.parcels, keyed by
+        # the EFFECTIVE parcel id (real gis_pid for sheriff rows). This is the
+        # detail-view data: year built, lot size, school district, assessor
+        # values, garage/basement/heating where available. Only populated
+        # fields are returned; the drawer renders whatever exists.
+        raw_data = rows[0].get("raw_data") or {}
+        src = rows[0].get("source") or ""
+        eff_pid = _effective_parcel_id(src, raw_data, rows[0])
+        county_slug = (_resolve_county(src, raw_data) or "").lower()
+        shaped["enrichment"] = _load_parcel_enrichment(county_slug, eff_pid) if eff_pid else None
+
         # Drop the internal de-dup key — single-property responses don't need it.
         shaped.pop("_eff_key", None)
-        
+
         return success_envelope(shaped)
 
     except HTTPException:
