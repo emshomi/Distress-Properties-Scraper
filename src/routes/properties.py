@@ -1701,7 +1701,7 @@ async def list_properties(
 
         
 
-       if min_amount is not None:
+        if min_amount is not None:
             query = query.gte("event_value", min_amount)
 
         # --- Buyer-lens filters (real columns on the view) ---
