@@ -29,6 +29,7 @@ from src.scrapers.mpls_vbr import MplsVacantBuildingScraper
 from src.scrapers.saint_paul_vacant import SaintPaulVacantBuildingScraper
 from src.scrapers.tax_forfeit import TaxForfeitScraper
 from src.scrapers.usps_vacancy import UspsVacancyScraper
+from src.scrapers.parcel_enrich import ParcelEnrichScraper
 from src.utils.logger import logger
 
 
@@ -42,6 +43,7 @@ _SCRAPER_SCHEDULES: tuple[tuple[type[BaseScraper], dict[str, Any]], ...] = (
     (MplsVacantBuildingScraper, {"hour": 7, "minute": 0}),
     (SaintPaulVacantBuildingScraper, {"hour": 7, "minute": 15}),
     (McroProbateScraper, {"hour": 8, "minute": 0}),
+    (ParcelEnrichScraper, {"hour": 8, "minute": 30}),
 
     # Weekly: USPS vacancy, Sunday 02:00 CST
     (UspsVacancyScraper, {"day_of_week": "sun", "hour": 2, "minute": 0}),
