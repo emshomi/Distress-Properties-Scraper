@@ -1514,8 +1514,46 @@ async def list_properties(
     min_amount: Optional[float] = Query(
         default=None,
         ge=0,
-        description="Minimum event_value (USD).",
+        description="Minimum event_value (USD) — the debt/bid amount (investor lens).",
     ),
+    # --- Buyer-lens filters (backed by signals.distress_with_parcel columns) ---
+    year_built_min: Optional[int] = Query(
+        default=None, ge=1700, le=2100,
+        description="Earliest year built (inclusive). Rows without a known "
+                    "year_built are excluded when this is set.",
+    ),
+    year_built_max: Optional[int] = Query(
+        default=None, ge=1700, le=2100,
+        description="Latest year built (inclusive).",
+    ),
+    sqft_min: Optional[int] = Query(
+        default=None, ge=0,
+        description="Minimum finished interior square footage. Coverage varies "
+                    "by county (currently strongest in Ramsey; not yet present "
+                    "for Hennepin) — rows without sqft are excluded when set.",
+    ),
+    lot_sqft_min: Optional[int] = Query(
+        default=None, ge=0,
+        description="Minimum lot size in square feet.",
+    ),
+    property_type: Optional[str] = Query(
+        default=None,
+        description="Exact property type (e.g. 'townhouse', 'single family').",
+    ),
+    school_district: Optional[str] = Query(
+        default=None,
+        description="Exact school district code (e.g. '281').",
+    ),
+    price_min: Optional[float] = Query(
+        default=None, ge=0,
+        description="Minimum estimated market value (emv_total) — the "
+                    "property's worth (buyer lens), distinct from min_amount.",
+    ),
+    price_max: Optional[float] = Query(
+        default=None, ge=0,
+        description="Maximum estimated market value (emv_total).",
+    ),
+    
     sale_date_from: Optional[str] = Query(
         default=None,
         description="Earliest sale date (YYYY-MM-DD).",
