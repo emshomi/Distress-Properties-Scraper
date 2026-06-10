@@ -1701,12 +1701,35 @@ async def list_properties(
 
         
 
-        if min_amount is not None:
+       if min_amount is not None:
             query = query.gte("event_value", min_amount)
+
+        # --- Buyer-lens filters (real columns on the view) ---
+        # Each is a plain DB-level comparison, so it's fast and scales with the
+        # data. A characteristic filter naturally excludes rows where that
+        # field is null (e.g. an unmatched parcel has no year_built) — which is
+        # the honest behavior: "built after 1990" should not return properties
+        # whose build year we don't know. The frontend signals when a
+        # characteristic filter is narrowing to enriched rows.
+        if year_built_min is not None:
+            query = query.gte("year_built", year_built_min)
+        if year_built_max is not None:
+            query = query.lte("year_built", year_built_max)
+        if sqft_min is not None:
+            query = query.gte("sqft", sqft_min)
+        if lot_sqft_min is not None:
+            query = query.gte("lot_sqft", lot_sqft_min)
+        if property_type:
+            query = query.eq("property_type", property_type)
+        if school_district:
+            query = query.eq("school_district", school_district)
+        if price_min is not None:
+            query = query.gte("emv_total", price_min)
+        if price_max is not None:
+            query = query.lte("emv_total", price_max)
 
         if sale_date_from:
             query = query.gte("event_date", sale_date_from)
-
         if sale_date_to:
             query = query.lte("event_date", sale_date_to)
 
