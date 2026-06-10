@@ -38,6 +38,7 @@ from src.scrapers.ramsey_tax_roll import RamseyTaxRollScraper
 from src.scrapers.saint_paul_vacant import SaintPaulVacantBuildingScraper
 from src.scrapers.tax_forfeit import TaxForfeitScraper
 from src.scrapers.usps_vacancy import UspsVacancyScraper
+from src.scrapers.parcel_enrich import ParcelEnrichScraper
 from src.utils.errors import (
     ScraperAlreadyRunningError,
     ScraperDisabledError,
