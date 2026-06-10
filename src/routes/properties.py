@@ -1826,7 +1826,7 @@ async def get_property(source: str, source_id: str) -> dict[str, Any]:
                 detail=f"Property not found: {source}/{source_id}",
             )
 
-       overlay_map = _load_overlay_map()
+        overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         shaped = _shape_property_row(rows[0], overlay_map, owner_map)
         shaped["raw"] = rows[0].get("raw_data") or {}
