@@ -136,7 +136,18 @@ def _norm_addr(s: Any) -> str:
     if hash_idx != -1:
         text = text[:hash_idx]
     tokens = text.split()
-    mapped = [_SUFFIX_MAP.get(tok, tok) for tok in tokens]
+    # Map each token through BOTH the street-suffix and directional maps
+    # (a token is only ever in one of them), collapsing spelled-out forms to
+    # the abbreviation the parcel layer uses. Applied identically to both
+    # sides, so it cannot create a one-sided mismatch.
+    mapped = []
+    for tok in tokens:
+        if tok in _SUFFIX_MAP:
+            mapped.append(_SUFFIX_MAP[tok])
+        elif tok in _DIRECTIONAL_MAP:
+            mapped.append(_DIRECTIONAL_MAP[tok])
+        else:
+            mapped.append(tok)
     return " ".join(mapped)
 
 
