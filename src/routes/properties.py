@@ -1526,7 +1526,7 @@ async def list_properties(
     ),
     sort: str = Query(
         default="event_date",
-        pattern="^(event_date|event_value|observed_at|equity|redemption_urgency)$",
+        pattern="^(event_date|event_value|observed_at|equity|redemption_urgency|year_built|sqft|emv_total)$",
         description=(
             "Sort field. event_date/event_value/observed_at sort on real DB "
             "columns (fast path). 'equity' (market value minus amount due, "
