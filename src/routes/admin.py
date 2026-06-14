@@ -289,9 +289,44 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
 
         if not already:
             # FK chain: distress_events.parcel_id -> core.parcels.parcel_id,
-            # and core.parcels.county_code -> core.counties.county_code. So the
-            # parcel must exist first. Check-then-insert (plain insert, so any
-            # error surfaces rather than silently no-op'ing).
+            # and core.parcels.county_code -> core.counties.county_code. So both
+            # the county AND the parcel must exist first.
+            #
+            # Ensure the county exists in core.counties BEFORE inserting the
+            # parcel — statewide notices reference any of MN's 87 counties, and
+            # a parcel insert for an unseeded county would FK-fail (the cause of
+            # the approval 500s). Auto-seeding here means any new MN county
+            # self-heals instead of needing a manual seed.
+            county_code = built["parcel_row"].get("county_code")
+            if county_code:
+                county_exists = (
+                    core_table("counties")
+                    .select("county_code")
+                    .eq("county_code", county_code)
+                    .limit(1)
+                    .execute()
+                )
+                if not county_exists.data:
+                    # Build a readable name from the raw extraction county, e.g.
+                    # "Saint Louis" -> "Saint Louis County". Slug is the FK value.
+                    raw_county = (extracted.get("county") or county_code).strip()
+                    county_name = (
+                        raw_county
+                        if raw_county.lower().endswith("county")
+                        else f"{raw_county} County"
+                    )
+                    core_table("counties").insert({
+                        "county_code": county_code,
+                        "county_name": county_name,
+                        "state": "MN",
+                    }).execute()
+                    logger.info(
+                        "auto-seeded county for extraction promotion",
+                        county_code=county_code,
+                        county_name=county_name,
+                    )
+
+            # Parcel next (check-then-insert).
             pid = built["parcel_row"]["parcel_id"]
             parcel_exists = (
                 core_table("parcels")
@@ -305,6 +340,8 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
 
             signals_table("distress_events").insert(built["distress_event"]).execute()
             signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
+
+        
 
         ts = datetime.now(timezone.utc).isoformat()
         ai_table("extracted_foreclosures").update({
