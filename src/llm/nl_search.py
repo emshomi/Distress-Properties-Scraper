@@ -30,7 +30,14 @@ _CATEGORIES = {"foreclosure", "tax_forfeit", "vacant", "tax_delinquent", "tax_as
 _COUNTIES = {"Anoka", "Dakota", "Hennepin", "Ramsey", "Washington", "Scott", "Carver", "Statewide"}
 _REDEMPTION = {"in_redemption", "expiring_soon", "expired"}
 _STATUS = {"active", "postponed"}
-_SORT = {"event_date", "event_value", "observed_at", "equity", "redemption_urgency"}
+_PROPERTY_TYPES = {
+    "single_family", "multifamily", "townhouse", "condo",
+    "commercial", "industrial", "agricultural", "land",
+}
+_SORT = {
+    "event_date", "event_value", "observed_at", "equity", "redemption_urgency",
+    "year_built", "sqft", "emv_total",
+}
 _ORDER = {"asc", "desc"}
 
 # Common city -> county mapping so "Minneapolis" resolves to Hennepin, etc.
@@ -70,11 +77,18 @@ The JSON may contain ONLY these keys (omit any that don't apply):
 - "county": one of ["Anoka","Dakota","Hennepin","Ramsey","Washington","Scott","Carver"]
 - "redemption": one of ["in_redemption","expiring_soon","expired"] (foreclosure redemption window state)
 - "multi_signal": an integer 2 or 3 (2 = on 2+ government lists; 3 = on 3+, "triple distress")
-- "min_amount": a number (minimum dollar amount)
+- "min_amount": a number (minimum dollar amount OWED — the foreclosure debt/bid)
 - "sale_date_from": "YYYY-MM-DD"
 - "sale_date_to": "YYYY-MM-DD"
 - "status": one of ["active","postponed"]
-- "sort": one of ["event_date","event_value","observed_at","equity","redemption_urgency"]
+- "year_built_min": a 4-digit year (properties built in or after this year)
+- "year_built_max": a 4-digit year (properties built in or before this year)
+- "sqft_min": a number (minimum interior square feet)
+- "lot_sqft_min": a number (minimum lot size in square feet)
+- "property_type": one of ["single_family","multifamily","townhouse","condo","commercial","industrial","agricultural","land"]
+- "price_min": a number (minimum market value / estimated worth, in dollars)
+- "price_max": a number (maximum market value / estimated worth, in dollars)
+- "sort": one of ["event_date","event_value","observed_at","equity","redemption_urgency","year_built","sqft","emv_total"]
 - "order": one of ["asc","desc"]
 
 Rules:
@@ -89,6 +103,18 @@ set "county". (e.g. Minneapolis -> Hennepin, Saint Paul -> Ramsey.)
 - "tax forfeited", "forfeit" -> category=tax_forfeit.
 - "behind on taxes", "tax delinquent" -> category=tax_delinquent.
 - "foreclosure", "sheriff sale", "foreclosed" -> category=foreclosure.
+- "built after 2010", "built since 2010", "2010 or newer", "newer than 2010" -> year_built_min=2010 (use the stated year).
+- "built before 1990", "older than 1990", "pre-1990" -> year_built_max=1990 (use the stated year).
+- "built between 1990 and 2010" -> year_built_min=1990 AND year_built_max=2010.
+- "at least 1500 square feet", "1500+ sqft", "bigger than 1500 sqft" -> sqft_min=1500.
+- "big lot", "large lot", "at least half an acre" -> lot_sqft_min (half acre ~= 21780; one acre ~= 43560).
+- "single family", "single-family home", "house" -> property_type=single_family.
+- "townhouse"/"townhome" -> townhouse; "condo" -> condo; "duplex"/"multifamily"/"multi-unit" -> multifamily; "commercial" -> commercial; "land"/"vacant lot"/"empty lot" -> land.
+- PRICE vs DEBT — important distinction:
+  * "homes under $200k", "worth less than $200k", "priced under $200k", "cheaper than $300k", "between $150k and $300k" refer to the property's MARKET VALUE -> use price_min / price_max.
+  * "at least $300k owed", "minimum debt", "bid over $250k", "amount due over $200k" refer to the foreclosure DEBT/BID -> use min_amount.
+  * If the user just says "under $200k" about homes/houses to buy, treat it as MARKET VALUE -> price_max.
+- "newest first" -> sort=year_built, order=desc. "biggest first" -> sort=sqft, order=desc. "most valuable" -> sort=emv_total, order=desc. "cheapest" -> sort=emv_total, order=asc.
 - If a constraint can't be expressed with the keys above, OMIT it (never invent keys).
 - If the query is empty or unclear, return {}.
 
@@ -156,6 +182,21 @@ def _validate(raw_obj: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if isinstance(st, str) and st in _STATUS:
         out["status"] = st
 
+    # Buyer-lens filters (mirror the /properties endpoint).
+    for yk in ("year_built_min", "year_built_max"):
+        yv = raw_obj.get(yk)
+        if isinstance(yv, int) and 1800 <= yv <= 2100:
+            out[yk] = yv
+
+    for nk in ("sqft_min", "lot_sqft_min", "price_min", "price_max"):
+        nv = raw_obj.get(nk)
+        if isinstance(nv, (int, float)) and nv >= 0:
+            out[nk] = float(nv)
+
+    ptype = raw_obj.get("property_type")
+    if isinstance(ptype, str) and ptype in _PROPERTY_TYPES:
+        out["property_type"] = ptype
+
     sort = raw_obj.get("sort")
     if isinstance(sort, str) and sort in _SORT:
         out["sort"] = sort
@@ -185,6 +226,18 @@ def _describe(filters: dict[str, Any], notes: list[str]) -> str:
 
     if "county" in filters:
         parts.append(f"in {filters['county']} County")
+    if "property_type" in filters:
+        pt_label = {
+            "single_family": "single-family homes",
+            "multifamily": "multifamily properties",
+            "townhouse": "townhouses",
+            "condo": "condos",
+            "commercial": "commercial properties",
+            "industrial": "industrial properties",
+            "agricultural": "agricultural properties",
+            "land": "land / vacant lots",
+        }
+        parts.append(f"({pt_label.get(filters['property_type'], filters['property_type'])})")
     if filters.get("multi_signal") == 3:
         parts.append("on 3+ government lists (triple-distress)")
     elif filters.get("multi_signal") == 2:
@@ -197,7 +250,19 @@ def _describe(filters: dict[str, Any], notes: list[str]) -> str:
         }
         parts.append(rl.get(filters["redemption"], ""))
     if "min_amount" in filters:
-        parts.append(f"of at least ${int(filters['min_amount']):,}")
+        parts.append(f"with at least ${int(filters['min_amount']):,} owed")
+    if "price_min" in filters:
+        parts.append(f"worth at least ${int(filters['price_min']):,}")
+    if "price_max" in filters:
+        parts.append(f"worth up to ${int(filters['price_max']):,}")
+    if "year_built_min" in filters:
+        parts.append(f"built in or after {filters['year_built_min']}")
+    if "year_built_max" in filters:
+        parts.append(f"built in or before {filters['year_built_max']}")
+    if "sqft_min" in filters:
+        parts.append(f"at least {int(filters['sqft_min']):,} sqft")
+    if "lot_sqft_min" in filters:
+        parts.append(f"on a lot of at least {int(filters['lot_sqft_min']):,} sqft")
     if "sale_date_from" in filters:
         parts.append(f"sold on/after {filters['sale_date_from']}")
     if "sale_date_to" in filters:
@@ -206,6 +271,12 @@ def _describe(filters: dict[str, Any], notes: list[str]) -> str:
         parts.append("ranked by estimated equity")
     elif filters.get("sort") == "redemption_urgency":
         parts.append("ranked by redemption urgency")
+    elif filters.get("sort") == "year_built":
+        parts.append("ranked by year built")
+    elif filters.get("sort") == "sqft":
+        parts.append("ranked by size")
+    elif filters.get("sort") == "emv_total":
+        parts.append("ranked by market value")
 
     desc = "Searching: " + " ".join(p for p in parts if p).strip() + "."
     return desc
