@@ -39,18 +39,30 @@ def _county_lower(county: Optional[str]) -> str:
     return (county or "unknown").strip().lower()
 
 
+# County spelling variants that must collapse to the seeded core.counties slug.
+# The extraction LLM writes counties inconsistently ("St. Louis" vs
+# "Saint Louis"); both must map to the seeded code 'st_louis'.
+_COUNTY_SLUG_ALIASES = {
+    "saint_louis": "st_louis",
+    "st_louis": "st_louis",
+}
+
+
 def _county_slug(county: Optional[str]) -> Optional[str]:
     """Convert a county name to the core.counties county_code slug: lowercase,
     non-alphanumeric collapsed to a single underscore. Matches the seeded
     values exactly: 'Scott' -> 'scott', 'St. Louis' -> 'st_louis',
-    'Otter Tail' -> 'otter_tail'. Returns None if no county given."""
+    'Saint Louis' -> 'st_louis', 'Otter Tail' -> 'otter_tail'. Returns None if
+    no county given."""
     if not county:
         return None
     s = str(county).strip().lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
-    return s or None
-
+    if not s:
+        return None
+    # Collapse known spelling variants to the seeded slug.
+    return _COUNTY_SLUG_ALIASES.get(s, s)
 
 def _money_str(value: Any) -> str:
     """Format a number as $X,XXX for human-readable title/description text.
