@@ -71,6 +71,40 @@ def redemption_relative(state: Optional[str]) -> Optional[str]:
     }.get(state, None)
 
 
+# Human labels for the category implied by event_type / source, used to build
+# a SAFE generic title/description for sub-standard tiers. The scraper-written
+# title/description embed owner names and dollar amounts verbatim, so they
+# cannot be shown below Standard — we replace them with a generated string
+# built only from non-locating fields (category + county).
+_EVENT_LABELS = {
+    "sheriff_sale": "Foreclosure (sheriff sale)",
+    "foreclosure": "Foreclosure",
+    "tax_forfeit": "Tax-forfeit property",
+    "tax_delinquent": "Tax-delinquent property",
+    "tax_assessment": "Tax assessment",
+    "vacant": "Vacant/registered building",
+}
+
+
+def _safe_title(p: dict[str, Any]) -> str:
+    """A generic, non-locating title from category + county only."""
+    label = _EVENT_LABELS.get((p.get("event_type") or "").lower(), "Distressed property")
+    county = p.get("county")
+    return f"{label} — {county} County" if county else label
+
+
+def _safe_description(p: dict[str, Any]) -> str:
+    """A generic, non-locating description. Mentions only the band + relative
+    redemption cue, never owner / address / dollar figures."""
+    label = _EVENT_LABELS.get((p.get("event_type") or "").lower(), "Distressed property")
+    band = p.get("equity_band")
+    parts = [f"{label}."]
+    if band:
+        parts.append(f"Estimated equity band: {band}.")
+    parts.append("Details locked — upgrade to view owner, address, and amounts.")
+    return " ".join(parts)
+
+
 # ------------------------------------------------------------------
 # Field groups (match the keys produced by the per-source extractors
 # and _redemption_fields / _shape_property_row in properties.py).
@@ -138,6 +172,15 @@ def redact_property(
 
     # ---- BELOW STANDARD: lock locators + exact dates ----
     if rank < _TIER_RANK["standard"]:
+        # title/description are scraper-written and embed owner names + dollar
+        # amounts in plain text. They bypass field-level locks, so replace them
+        # with generated, non-locating placeholders built from safe fields only.
+        if "title" in p:
+            p["title"] = _safe_title(p)
+            p["title_locked"] = True
+        if "description" in p:
+            p["description"] = _safe_description(p)
+            p["description_locked"] = True
         for f in _LOCATOR_FIELDS:
             _lock(p, f)
         for f in _DATE_FIELDS:
