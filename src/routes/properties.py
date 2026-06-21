@@ -30,6 +30,7 @@ from src.utils.redaction import (
     redact_property,
     redact_detail_extras,
     owner_browse_allowed,
+    gate_filters_for_tier,
 )
 
 
@@ -1589,6 +1590,48 @@ async def list_properties(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """Return a paginated list of distress events with optional filters."""
+    # ---- Tier filter/sort gating (server-side, non-bypassable) ----
+    # Per GOVIRE_FILTER_GATING_SPEC.md: the STANDARD tier can read full property
+    # detail but may NOT use the power filters/sorts ("hunting" is premium).
+    # free/basic keep filters (their rows are locked → teaser only); premium/
+    # admin keep them on full data. gate_filters_for_tier neutralizes the gated
+    # levers for standard and forces the default sort. Navigation filters
+    # (category/county/status) are always preserved. This runs BEFORE the query
+    # is built, so a standard token cannot bypass it from the browser.
+    _gated = gate_filters_for_tier(
+        _ctx.tier,
+        {
+            "multi_signal": multi_signal,
+            "min_amount": min_amount,
+            "year_built_min": year_built_min,
+            "year_built_max": year_built_max,
+            "sqft_min": sqft_min,
+            "lot_sqft_min": lot_sqft_min,
+            "property_type": property_type,
+            "school_district": school_district,
+            "price_min": price_min,
+            "price_max": price_max,
+            "sale_date_from": sale_date_from,
+            "sale_date_to": sale_date_to,
+            "redemption": redemption,
+            "sort": sort,
+        },
+    )
+    multi_signal = _gated["multi_signal"]
+    min_amount = _gated["min_amount"]
+    year_built_min = _gated["year_built_min"]
+    year_built_max = _gated["year_built_max"]
+    sqft_min = _gated["sqft_min"]
+    lot_sqft_min = _gated["lot_sqft_min"]
+    property_type = _gated["property_type"]
+    school_district = _gated["school_district"]
+    price_min = _gated["price_min"]
+    price_max = _gated["price_max"]
+    sale_date_from = _gated["sale_date_from"]
+    sale_date_to = _gated["sale_date_to"]
+    redemption = _gated["redemption"]
+    sort = _gated["sort"]
+
     try:
         # Read from the enrichment-joined view (signals.distress_with_parcel),
         # not distress_events directly. Same rows, plus the parcel
