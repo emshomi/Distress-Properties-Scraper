@@ -47,6 +47,14 @@ class Settings(BaseSettings):
         description="Shared secret for protected endpoints (X-Admin-Key header)",
     )
 
+    # ----- Auth JWT verification -----
+
+    jwt_public_key: SecretStr | None = Field(
+        default=None,
+        description="Public key (PEM) for verifying app_auth-issued JWTs; "
+                    "optional, JWT tier checks are skipped when unset",
+    )
+
     # ----- Supabase connection -----
 
     supabase_url: HttpUrl | None = Field(
