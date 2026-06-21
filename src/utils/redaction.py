@@ -36,6 +36,7 @@ _TIER_RANK = {"free": 0, "basic": 1, "standard": 2, "premium": 3, "admin": 99}
 def tier_rank(tier: Optional[str]) -> int:
     return _TIER_RANK.get((tier or "free").lower(), 0)
 
+
 # ------------------------------------------------------------------
 # Equity band — derive a coarse band from an exact equity/value figure
 # so free/anonymous callers feel that value exists without seeing it.
@@ -293,6 +294,24 @@ def filtering_allowed(tier: str) -> bool:
     return (tier or "free").lower() != "standard"
 
 
+# ------------------------------------------------------------------
+# AI features (natural-language search, per-property summary).
+#
+# These call Claude on every use, so they cost real money per request. They are
+# also pure "hunting"/"leverage" tools. Both reasons point the same way:
+# PREMIUM-ONLY (and admin). Every tier below premium sees them locked; the
+# backend rejects the request BEFORE any Claude call, so no cost is incurred
+# for a non-premium caller and the gate cannot be bypassed in the browser.
+#
+# NOTE: this is a STRICTER gate than filtering_allowed(). Filters are banned for
+# standard only (free/basic keep them on locked rows). AI features are banned
+# for everyone below premium — because each call spends money.
+# ------------------------------------------------------------------
+def ai_features_allowed(tier: str) -> bool:
+    """Premium/admin only — AI search and AI summary (each costs a Claude call)."""
+    return tier_rank(tier) >= _TIER_RANK["premium"]
+
+
 # Navigation filters every tier keeps — these scope the READING view without
 # surfacing "the best deals", so they are not hunting:
 #   - category : which signal tab (foreclosure / vacant / ...) — core nav
@@ -349,6 +368,7 @@ __all__ = [
     "owner_browse_allowed",
     "filtering_allowed",
     "gate_filters_for_tier",
+    "ai_features_allowed",
     "equity_band",
     "redemption_relative",
     "tier_rank",
