@@ -36,7 +36,6 @@ _TIER_RANK = {"free": 0, "basic": 1, "standard": 2, "premium": 3, "admin": 99}
 def tier_rank(tier: Optional[str]) -> int:
     return _TIER_RANK.get((tier or "free").lower(), 0)
 
-
 # ------------------------------------------------------------------
 # Equity band — derive a coarse band from an exact equity/value figure
 # so free/anonymous callers feel that value exists without seeing it.
