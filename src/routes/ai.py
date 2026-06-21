@@ -17,6 +17,8 @@ from src.llm.nl_search import compile_query
 from src.llm.property_summary import summarize_property
 from src.llm.foreclosure_extraction import extract_foreclosure_notice
 from src.routes.properties import list_properties, require_access_key
+from src.middleware.tier import TierResolved, TierContext
+from src.utils.redaction import ai_features_allowed
 from src.utils.logger import logger
 
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -88,6 +90,7 @@ class SearchBody(BaseModel):
 async def ai_search(
     body: SearchBody,
     access_key: str = Depends(require_access_key),
+    _ctx: TierContext = TierResolved,
 ) -> dict[str, Any]:
     """Compile the user's English query into validated filters (Claude as a
     query compiler — it can only set values for filters that already exist),
@@ -98,6 +101,24 @@ async def ai_search(
     Claude never sees data, never writes SQL, never returns results — it only
     picks filter values, which are validated against a strict allowlist before
     anything touches the database."""
+
+    # ---- Tier gate: AI search is PREMIUM-ONLY (each query costs a Claude call).
+    # Reject BEFORE compile_query so no Claude cost is incurred for a non-premium
+    # caller, and so the gate cannot be bypassed from the browser. ----
+    if not ai_features_allowed(_ctx.tier):
+        return _envelope({
+            "ok": False,
+            "error": "premium_required",
+            "interpretation": (
+                "AI search is a Premium feature. Upgrade to search the full "
+                "dataset in plain English and jump straight to the deals."
+            ),
+            "filters": {},
+            "notes": [],
+            "properties": [],
+            "total": 0,
+            "premium_required": True,
+        })
 
     plan = compile_query(body.query)
 
@@ -197,6 +218,7 @@ class SummaryBody(BaseModel):
 async def ai_summary(
     body: SummaryBody,
     _access_key: str = Depends(require_access_key),
+    _ctx: TierContext = TierResolved,
 ) -> dict[str, Any]:
     """Fetch one property by (source, source_id), shape it through the same
     path the table uses, then produce a plain-English summary that can only
@@ -205,6 +227,16 @@ async def ai_summary(
     Fails honestly: if the property isn't found we 404; if the LLM is
     unavailable we return ok=False with an explanation rather than inventing
     a summary."""
+    # ---- Tier gate: AI summary is PREMIUM-ONLY (each summary costs a Claude
+    # call). Reject before any DB fetch or Claude call. ----
+    if not ai_features_allowed(_ctx.tier):
+        return _envelope({
+            "ok": False,
+            "error": "premium_required",
+            "summary": None,
+            "premium_required": True,
+        })
+
     from src.routes.properties import (
         _load_overlay_map,
         _load_owner_map,
