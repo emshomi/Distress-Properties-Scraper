@@ -25,6 +25,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status as 
 from src.db.supabase_client import core_table, signals_table
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
+from src.middleware.tier import TierResolved, TierContext
+from src.utils.redaction import (
+    redact_property,
+    redact_detail_extras,
+    owner_browse_allowed,
+)
 
 
 # ============================================================
@@ -1466,7 +1472,7 @@ def _sort_computed(
     summary="List distressed properties (filterable, paginated).",
 )
 async def list_properties(
-    _access_key: str = Depends(require_access_key),
+    _ctx: TierContext = TierResolved,
     category: Optional[str] = Query(
         default=None,
         pattern="^(foreclosure|tax_forfeit|vacant|tax_delinquent|tax_assessment)$",
@@ -1829,7 +1835,7 @@ async def list_properties(
             page = shaped[offset:offset + limit]
             
             return success_envelope({
-                "properties": page,
+                "properties": [redact_property(_r, tier=_ctx.tier) for _r in page],
                 "total": total,
                 "limit": limit,
                 "offset": offset,
@@ -1846,7 +1852,12 @@ async def list_properties(
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         return success_envelope({
-            "properties": [_shape_property_row(r, overlay_map, owner_map) for r in rows],
+            "properties": [
+                redact_property(
+                    _shape_property_row(r, overlay_map, owner_map), tier=_ctx.tier
+                )
+                for r in rows
+            ],
             "total": total,
             "limit": limit,
             "offset": offset,
@@ -1875,7 +1886,11 @@ async def list_properties(
     status_code=http_status.HTTP_200_OK,
     summary="Fetch a single property by (source, source_id).",
 )
-async def get_property(source: str, source_id: str) -> dict[str, Any]:
+async def get_property(
+    source: str,
+    source_id: str,
+    _ctx: TierContext = TierResolved,
+) -> dict[str, Any]:
     """Return the full record for one property identified by its
     natural key (source, source_id)."""
     try:
@@ -1913,6 +1928,10 @@ async def get_property(source: str, source_id: str) -> dict[str, Any]:
         # Drop the internal de-dup key — single-property responses don't need it.
         shaped.pop("_eff_key", None)
 
+        # Tier-aware redaction (admin/premium full; lower tiers locked).
+        shaped = redact_property(shaped, tier=_ctx.tier)
+        shaped = redact_detail_extras(shaped, tier=_ctx.tier)
+
         return success_envelope(shaped)
 
     except HTTPException:
@@ -1941,7 +1960,7 @@ async def get_property(source: str, source_id: str) -> dict[str, Any]:
     summary="List resolved owners with their distressed-property counts.",
 )
 async def list_owners(
-    _access_key: str = Depends(require_access_key),
+    _ctx: TierContext = TierResolved,
     owner_type: Optional[str] = Query(
         default=None,
         pattern="^(individual|llc_business|bank_lender|government)$",
@@ -1959,6 +1978,11 @@ async def list_owners(
     """Browse owners from signals.owner_distress_summary, biggest portfolios
     first. Defaults to 2+ properties (the frequent-flyer signal); pass
     min_parcels=1 to include single-property owners."""
+    if not owner_browse_allowed(_ctx.tier):
+        raise HTTPException(
+            status_code=402,
+            detail="Owner portfolio browsing requires a Premium subscription.",
+        )
     try:
         query = (
             signals_table("owner_distress_summary")
@@ -2009,7 +2033,7 @@ async def list_owners(
 )
 async def owner_properties(
     owner_norm: str,
-    _access_key: str = Depends(require_access_key),
+    _ctx: TierContext = TierResolved,
 ) -> dict[str, Any]:
     """Return all distress events whose normalized gis_owner matches
     owner_norm, shaped like regular property rows so the frontend reuses its
@@ -2047,6 +2071,13 @@ async def owner_properties(
                 detail=f"No properties found for owner: {owner_norm}",
             )
 
+        # Owner-portfolio browse is a PREMIUM leverage feature.
+        if not owner_browse_allowed(_ctx.tier):
+            raise HTTPException(
+                status_code=402,
+                detail="Owner portfolio browsing requires a Premium subscription.",
+            )
+
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         shaped = [
@@ -2055,6 +2086,9 @@ async def owner_properties(
         # Drop the internal de-dup key before returning.
         for s in shaped:
             s.pop("_eff_key", None)
+        # Redact each row to the caller's tier (premium here, but keep
+        # the pass so future tier changes are honored).
+        shaped = [redact_property(s, tier=_ctx.tier) for s in shaped]
 
         # The owner summary (type, count) comes from the first shaped row's
         # attached owner_portfolio — identical across the set, so any row's is
@@ -2064,7 +2098,7 @@ async def owner_properties(
         return success_envelope({
             "owner_norm": key,
             "summary": summary,
-            "properties": shaped,
+            "properties": [redact_property(_r, tier=_ctx.tier) for _r in shaped],
             "total": len(shaped),
         })
     except HTTPException:
