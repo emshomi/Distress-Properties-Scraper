@@ -11,6 +11,8 @@ starlette==0.41.3
 # ---- Configuration & data validation ----
 pydantic==2.10.3
 pydantic-settings==2.6.1
+# ---- JWT verification (app_auth token tier claims) ----
+PyJWT[crypto]==2.10.1
 # ---- Email (Resend — access-approval notifications) ----
 resend==2.4.0
 # ---- Database client ----
