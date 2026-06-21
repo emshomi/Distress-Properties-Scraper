@@ -70,6 +70,8 @@ def _tier_from_jwt(token: str) -> Optional[str]:
             token,
             public_key,
             algorithms=["RS256"],
+            audience="govire",
+            issuer="govire-auth",
             options={"require": ["exp"]},
         )
     except Exception as e:
