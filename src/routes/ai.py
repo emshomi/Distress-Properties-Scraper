@@ -89,7 +89,6 @@ class SearchBody(BaseModel):
 )
 async def ai_search(
     body: SearchBody,
-    access_key: str = Depends(require_access_key),
     _ctx: TierContext = TierResolved,
 ) -> dict[str, Any]:
     """Compile the user's English query into validated filters (Claude as a
@@ -145,7 +144,7 @@ async def ai_search(
     # nl_search._validate, so these are all safe, known parameters.
     try:
         result = await list_properties(
-            _access_key=access_key,
+            _ctx=_ctx,
             category=f.get("category"),
             source=None,
             county=f.get("county"),
@@ -217,7 +216,6 @@ class SummaryBody(BaseModel):
 )
 async def ai_summary(
     body: SummaryBody,
-    _access_key: str = Depends(require_access_key),
     _ctx: TierContext = TierResolved,
 ) -> dict[str, Any]:
     """Fetch one property by (source, source_id), shape it through the same
