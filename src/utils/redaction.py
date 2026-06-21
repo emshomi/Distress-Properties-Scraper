@@ -259,10 +259,97 @@ def owner_browse_allowed(tier: str) -> bool:
     return tier_rank(tier) >= _TIER_RANK["premium"]
 
 
+# ------------------------------------------------------------------
+# Filter / sort gating (the launch premium differentiator).
+#
+# Per GOVIRE_FILTER_GATING_SPEC.md:
+#   "Reading is not hunting." Standard can READ every property in full, but
+#   only PREMIUM can HUNT — slice the whole dataset down with the power
+#   filters and sorts. The principle that makes the price gap honest.
+#
+# The deliberate INVERSION: filters are banned for STANDARD ONLY.
+#   - free / basic : filters allowed, but rows are LOCKED, so filtering only
+#                    previews the SHAPE of the data, never locates a property
+#                    (a teaser that whets the appetite).
+#   - standard     : filters BANNED. Standard sees full property detail; if it
+#                    could also hunt, premium would have nothing left. Removing
+#                    filters in the middle tier IS the upgrade lever.
+#   - premium/admin: filters allowed on full data — the destination.
+#
+# Enforcement is SERVER-SIDE: a Standard token that requests a gated filter or
+# sort has it neutralized here, so it cannot be bypassed in the browser. The
+# frontend separately shows the controls as locked ("Upgrade to Premium").
+# ------------------------------------------------------------------
+def filtering_allowed(tier: str) -> bool:
+    """Whether this tier may use the power filters/sorts ("hunting").
+
+    Per the spec's deliberate inversion, filters are banned for STANDARD ONLY:
+      - free / basic : filters allowed, but their rows are LOCKED, so filtering
+                       only previews the data's shape (a teaser — can't locate).
+      - standard     : filters BANNED. Standard reads full property detail; if
+                       it could also hunt, premium would have nothing left.
+                       This middle-tier removal IS the upgrade lever.
+      - premium/admin: filters allowed on FULL data — the destination.
+    """
+    return (tier or "free").lower() != "standard"
+
+
+# Navigation filters every tier keeps — these scope the READING view without
+# surfacing "the best deals", so they are not hunting:
+#   - category : which signal tab (foreclosure / vacant / ...) — core nav
+#   - county   : scope to your area so you don't scroll other counties
+#   - status   : active vs postponed — a state of the same reading view
+# Everything else (multi_signal, value/price bands, year built, sqft, lot,
+# property_type, school_district, min_amount, sale-date range, redemption-state
+# filter, and all non-default SORTS) is HUNTING → premium-only.
+_NAVIGATION_FILTERS_KEPT = ("category", "county", "status")
+
+# The default sort non-premium tiers are pinned to (matches the endpoint
+# default). Any other requested sort is reset to this for sub-premium tiers.
+_DEFAULT_SORT = "event_date"
+
+
+def gate_filters_for_tier(tier: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Given the raw filter/sort params dict, return a copy with the power
+    filters/sorts neutralized for the STANDARD tier (only).
+
+    Keys expected (any subset): multi_signal, min_amount, year_built_min,
+    year_built_max, sqft_min, lot_sqft_min, property_type, school_district,
+    price_min, price_max, sale_date_from, sale_date_to, redemption, sort.
+
+    free / basic / premium / admin: returned unchanged (free/basic filter on
+    locked rows as a teaser; premium/admin hunt on full data).
+    standard: every gated filter is set to None; `sort` is forced to the
+    default. Navigation filters (category/county/status) are never touched.
+    """
+    if filtering_allowed(tier):
+        return dict(params)
+
+    gated = dict(params)
+    _GATED_FILTER_KEYS = (
+        "multi_signal", "min_amount",
+        "year_built_min", "year_built_max",
+        "sqft_min", "lot_sqft_min",
+        "property_type", "school_district",
+        "price_min", "price_max",
+        "sale_date_from", "sale_date_to",
+        "redemption",
+    )
+    for k in _GATED_FILTER_KEYS:
+        if k in gated:
+            gated[k] = None
+    # Force default sort (ignore any requested non-default sort).
+    if "sort" in gated:
+        gated["sort"] = _DEFAULT_SORT
+    return gated
+
+
 __all__ = [
     "redact_property",
     "redact_detail_extras",
     "owner_browse_allowed",
+    "filtering_allowed",
+    "gate_filters_for_tier",
     "equity_band",
     "redemption_relative",
     "tier_rank",
