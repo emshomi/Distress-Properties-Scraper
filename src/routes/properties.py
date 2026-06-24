@@ -1518,7 +1518,7 @@ async def list_properties(
         ),
     ),
 
-    
+   
     min_amount: Optional[float] = Query(
         default=None,
         ge=0,
