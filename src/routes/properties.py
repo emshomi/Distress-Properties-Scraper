@@ -1,7 +1,7 @@
 """
 Public properties + stats endpoints for the govire.com frontend.
 
-Returns live data from signals.distress_events and core.parcels —# Drop the internal de-dup key — single-property responses don't need it.
+Returns live data from signals.distress_events and core.parcels —
 NO hardcoded numbers.
 
 Each upstream scraper writes raw_data in its own shape (we built them
