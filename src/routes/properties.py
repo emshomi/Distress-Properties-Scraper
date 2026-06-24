@@ -1632,6 +1632,7 @@ async def list_properties(
     sale_date_to = _gated["sale_date_to"]
     redemption = _gated["redemption"]
     sort = _gated["sort"]
+    logger.info("TIER_GATE_PROBE", probe_tier=_ctx.tier, probe_gated_sort=_gated["sort"], probe_incoming_sort=sort)
 
     try:
         # Read from the enrichment-joined view (signals.distress_with_parcel),
