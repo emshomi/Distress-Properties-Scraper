@@ -8,27 +8,26 @@ PIPELINE
   1. Open mnpublicnotice.com in a real (Playwright) browser.
   2. Search "foreclosure" over a recent window; collect notice IDs from results.
   3. For each NEW notice (not already in ai.extracted_foreclosures), open its
-     full Details page and read the COMPLETE notice text (not the teaser).
+     Details page, solve the reCAPTCHA, and read the COMPLETE notice text --
+     preferring the downloadable PDF (full text even for capped notices).
   4. Run that text through the SAME extraction prompt as the server pipeline
      (calling Anthropic directly), then insert into Supabase
      ai.extracted_foreclosures as 'pending' -- lands in the Notice-review tab.
-  5. If a captcha blocks a page, solve it via 2Captcha (optional; only used if
-     a captcha actually appears).
 
 SELF-CONTAINED: imports NO app code. Extraction prompt + coercion are copied
 verbatim from src/llm/foreclosure_extraction.py so output is identical. Depends
 only on installed libs: playwright, playwright-stealth, anthropic, supabase,
-(twocaptcha optional). This file has NO secrets -- safe to commit to GitHub.
+2captcha-python, pdfplumber. This file has NO secrets -- safe to commit to git.
 
 SETUP (one time)
-  1. Keep this file in a PERMANENT folder, e.g. C:\\Users\\emsho\\govire-tools\\
+  1. Keep this file in a PERMANENT folder, e.g. C:\\Users\\emsho\\govire-scrapers\\
   2. Create a .env NEXT TO it with:
         SUPABASE_URL=https://zdqwigbssxhqzlveisdz.supabase.co
         SUPABASE_SERVICE_KEY=<service_role key>
         ANTHROPIC_API_KEY=<anthropic key>
-        TWOCAPTCHA_API_KEY=<2captcha key>     (optional; only if captcha appears)
+        TWOCAPTCHA_API_KEY=<2captcha key>
   3. Install the browser binary once:  python -m playwright install chromium
-  4. Test:    py govire_mnpn_browser.py --max 3
+  4. Test:    py govire_mnpn_browser.py --max 1
      Daily:   py govire_mnpn_browser.py --max 50 --headless
 
 Keys live ONLY in the local .env (gitignore it). This .py is safe in git.
@@ -42,6 +41,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -70,6 +70,11 @@ try:
     from twocaptcha import TwoCaptcha
 except Exception:
     TwoCaptcha = None
+# Optional: pdfplumber for extracting full text from the complete-notice PDF.
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
 
 
 # ============================================================
@@ -385,6 +390,34 @@ def _maybe_solve_captcha(page, env: dict[str, str]) -> bool:
                     tas.forEach(t => { t.value = tok; t.innerHTML = tok; });
                 };
                 setTok();
+                // Invoke grecaptcha's registered callback(s) so the page's own
+                // client-side handler runs (this is what populates the PDF
+                // download link). Walk ___grecaptcha_cfg.clients for any function
+                // whose key looks like a callback and call it with the token.
+                try {
+                    const cfg = window.___grecaptcha_cfg;
+                    if (cfg && cfg.clients) {
+                        Object.values(cfg.clients).forEach(client => {
+                            const stack = [client];
+                            const seen = new Set();
+                            while (stack.length) {
+                                const o = stack.pop();
+                                if (!o || typeof o !== 'object' || seen.has(o)) continue;
+                                seen.add(o);
+                                for (const k of Object.keys(o)) {
+                                    let v;
+                                    try { v = o[k]; } catch (e) { continue; }
+                                    if (typeof v === 'function' && /callback/i.test(k)) {
+                                        try { v(tok); } catch (e) {}
+                                    } else if (v && typeof v === 'object') {
+                                        stack.push(v);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                } catch (e) {}
+                setTok();
                 // Find the View Notice submit button and its postback target name.
                 let target = null;
                 document.querySelectorAll("input[type='submit']").forEach(b => {
@@ -567,13 +600,102 @@ def _read_notice_text(page) -> str:
         return page.content()
 
 
-def _fetch_full_notice(page, notice_id: str) -> Optional[str]:
+def _get_pdf_url(page) -> Optional[str]:
+    """After the captcha is accepted, the download anchor (id ...lnkDownload)
+    has its href populated with the complete-notice PDF URL. Confirmed real
+    format (relative, no (S(sid)) prefix):
+      href="PDFDocument.aspx?SID=<sid+digits>&FileName=<file>.pdf"
+    A populated href is ALSO the signal the captcha was accepted. Poll for it
+    using query_selector/get_attribute (which return None instead of throwing).
+    Returns an absolute URL (resolved against the page's own URL) or None."""
+
+    def _resolve(href: str) -> str:
+        href = href.replace("&amp;", "&").strip()
+        if href.startswith("http"):
+            return href
+        if href.startswith("/"):
+            return f"{_BASE}{href}"
+        # Relative (e.g. "PDFDocument.aspx?...") -> resolve against the directory
+        # of the CURRENT page URL, which already carries the (S(sid)) segment.
+        cur = page.url
+        base_dir = cur.rsplit("/", 1)[0]  # strip the last path segment
+        return f"{base_dir}/{href.lstrip('/')}"
+
+    for _ in range(12):  # up to ~18s for the postback to populate the anchor
+        # Path A: read the anchor's href directly (non-throwing).
+        href = None
+        try:
+            a = page.query_selector("a[id$='lnkDownload']")
+            if a:
+                href = a.get_attribute("href")
+        except Exception:
+            href = None
+        if href and "PDFDocument" in href:
+            return _resolve(href)
+
+        # Path B: scan the raw HTML for the PDFDocument link (covers cases where
+        # the element read misses but the href is present in the markup).
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+        m = re.search(r'href=["\']([^"\']*PDFDocument\.aspx\?[^"\']+)["\']', html, re.I)
+        if not m:
+            m = re.search(r'([A-Za-z0-9_./()-]*PDFDocument\.aspx\?[^"\'\s<>]+)', html, re.I)
+        if m:
+            return _resolve(m.group(1))
+
+        page.wait_for_timeout(1500)
+    return None
+
+
+def _pdf_text(context, pdf_url: str) -> Optional[str]:
+    """Download the complete-notice PDF in the authenticated browser session and
+    extract its text with pdfplumber. Returns the full text or None."""
+    if pdfplumber is None:
+        _log("  pdfplumber not installed; cannot read PDF (pip install pdfplumber)")
+        return None
+    try:
+        resp = context.request.get(pdf_url, timeout=45000)
+        if not resp.ok:
+            _log(f"  PDF download HTTP {resp.status}")
+            return None
+        body = resp.body()
+    except Exception as e:
+        _log(f"  PDF download failed: {type(e).__name__}: {str(e)[:120]}")
+        return None
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf.write(body)
+            tmp_path = tf.name
+        parts = []
+        with pdfplumber.open(tmp_path) as pdf:
+            for pg in pdf.pages:
+                t = pg.extract_text() or ""
+                if t:
+                    parts.append(t)
+        text = "\n".join(parts).strip()
+        return text or None
+    except Exception as e:
+        _log(f"  PDF parse failed: {type(e).__name__}: {str(e)[:120]}")
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def _fetch_full_notice(page, notice_id: str, context=None) -> Optional[str]:
     """Return the full notice text. Strategy:
-      1. Open Details.aspx; if reCAPTCHA-gated, solve it in place (postback
-         reveals the notice on the same page).
-      2. Read the notice. If it's the 1000-char-capped web stub, navigate to
-         DetailsPrint.aspx in the SAME session (now captcha-cleared) for the
-         complete text; solve again only if it re-prompts.
+      1. Open Details.aspx; if reCAPTCHA-gated, solve it in place (the postback
+         reveals the notice AND populates the PDF download link).
+      2. PREFER the complete-notice PDF: read the populated lnkDownload href and
+         download+parse the PDF (full text even for the ~1000-char-capped
+         notices). This is the most reliable full-text source.
+      3. Fall back to the on-page HTML text (and DetailsPrint) if no PDF.
     """
     url = f"{_BASE}/Details.aspx?ID={notice_id}"
     try:
@@ -589,6 +711,25 @@ def _fetch_full_notice(page, notice_id: str) -> Optional[str]:
             b = ""
         return ("complete the reCAPTCHA" in b) or bool(page.query_selector("[data-sitekey]"))
 
+    def _try_pdf() -> Optional[str]:
+        """Try to grab + parse the complete-notice PDF from the CURRENT page
+        state. Returns full text or None. Safe to call repeatedly."""
+        if context is None:
+            return None
+        pdf_url = _get_pdf_url(page)
+        if not pdf_url:
+            return None
+        _log("  found PDF link; downloading complete notice...")
+        raw = _pdf_text(context, pdf_url)
+        if not raw:
+            return None
+        sliced = _slice_notice_text(raw)
+        best = sliced if (sliced and len(sliced) > 200) else raw
+        if best and len(best) > 200:
+            _log(f"  PDF text extracted ({len(best)} chars)")
+            return best
+        return None
+
     # Solve on Details.aspx if gated, then poll for the notice to appear.
     if _gated():
         _maybe_solve_captcha(page, _ENV)
@@ -597,13 +738,17 @@ def _fetch_full_notice(page, notice_id: str) -> Optional[str]:
                 break
             page.wait_for_timeout(1500)
 
+    # PRIMARY: the complete-notice PDF (also confirms the captcha was accepted).
+    pdf_text_result = _try_pdf()
+    if pdf_text_result:
+        return pdf_text_result
+
     sid = _current_sid(page)
 
-    # Read what Details gave us.
+    # FALLBACK 1: on-page HTML text.
     sliced = _slice_notice_text(_read_notice_text(page))
 
-    # If we only got the capped stub (or nothing), go to the print view for the
-    # full text, in the same now-cleared session.
+    # FALLBACK 2: if only the capped stub (or nothing), try the print view.
     if (not sliced) or len(sliced) < 900:
         print_url = (f"{_BASE}/(S({sid}))/DetailsPrint.aspx?SID={sid}&ID={notice_id}"
                      if sid else f"{_BASE}/DetailsPrint.aspx?ID={notice_id}")
@@ -615,6 +760,31 @@ def _fetch_full_notice(page, notice_id: str) -> Optional[str]:
                     if not _gated():
                         break
                     page.wait_for_timeout(1500)
+            # The PDF link may now be populated on this print page -- try again.
+            pdf_text_result = _try_pdf()
+            if pdf_text_result:
+                return pdf_text_result
+            full = _slice_notice_text(_read_notice_text(page))
+            if full and len(full) > (len(sliced) if sliced else 0):
+                sliced = full
+        except Exception:
+            pass
+
+    # LAST CHANCE: the PDF link populates a bit late on some notices. Before
+    # falling back to the capped stub, navigate back to Details and try the PDF
+    # one more time on the now-cleared session.
+    if (not sliced) or len(sliced) < 900:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            if _gated():
+                _maybe_solve_captcha(page, _ENV)
+                for _ in range(10):
+                    if not _gated():
+                        break
+                    page.wait_for_timeout(1500)
+            pdf_text_result = _try_pdf()
+            if pdf_text_result:
+                return pdf_text_result
             full = _slice_notice_text(_read_notice_text(page))
             if full and len(full) > (len(sliced) if sliced else 0):
                 sliced = full
@@ -692,7 +862,7 @@ def main() -> int:
             stats["new"] += 1
             processed_new += 1
             _log(f"Notice {nid}: fetching full text...")
-            notice_text = _fetch_full_notice(page, nid)
+            notice_text = _fetch_full_notice(page, nid, context)
             if not notice_text:
                 _log(f"  notice {nid}: no full notice text found (skipped)")
                 stats["no_text"] += 1
