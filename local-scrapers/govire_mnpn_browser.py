@@ -8,8 +8,9 @@ PIPELINE
   1. Open mnpublicnotice.com in a real (Playwright) browser.
   2. Search "foreclosure" over a recent window; collect notice IDs from results.
   3. For each NEW notice (not already in ai.extracted_foreclosures), open its
-     Details page, solve the reCAPTCHA, and read the COMPLETE notice text --
-     preferring the downloadable PDF (full text even for capped notices).
+     Details page, solve the Cloudflare Turnstile captcha, and read the COMPLETE
+     notice text -- preferring the downloadable PDF (full text even for capped
+     notices).
   4. Run that text through the SAME extraction prompt as the server pipeline
      (calling Anthropic directly), then insert into Supabase
      ai.extracted_foreclosures as 'pending' -- lands in the Notice-review tab.
@@ -18,6 +19,10 @@ SELF-CONTAINED: imports NO app code. Extraction prompt + coercion are copied
 verbatim from src/llm/foreclosure_extraction.py so output is identical. Depends
 only on installed libs: playwright, playwright-stealth, anthropic, supabase,
 2captcha-python, pdfplumber. This file has NO secrets -- safe to commit to git.
+
+CAPTCHA NOTE (July 2026): mnpublicnotice.com migrated from Google reCAPTCHA to
+Cloudflare Turnstile. _maybe_solve_captcha now uses 2Captcha's turnstile method
+and writes the token into the cf-turnstile-response field.
 
 SETUP (one time)
   1. Keep this file in a PERMANENT folder, e.g. C:\\Users\\emsho\\govire-scrapers\\
@@ -323,18 +328,19 @@ _DETAIL_ID_RE = re.compile(r'Details\.aspx\?SID=([A-Za-z0-9]+)&(?:amp;)?ID=(\d+)
 
 
 def _maybe_solve_captcha(page, env: dict[str, str]) -> bool:
-    """Solve the explicit-render reCAPTCHA gating a Details/DetailsPrint page,
-    then fire the 'View Notice' ASP.NET postback so the notice renders.
+    """Solve the Cloudflare Turnstile gating a Details/DetailsPrint page, then
+    fire the 'View Notice' ASP.NET postback so the notice renders.
 
-    Mechanics confirmed from the page HTML:
-      - reCAPTCHA: api.js?onload=onloadCallback&render=explicit,
-        sitekey 6Lc1nQ8sAAAAAOmL_0Gqea1tvQsWbW-dDo7g2Tr5, widget id 'recaptcha'.
+    Mechanics confirmed from the live page HTML (July 2026 -- the site migrated
+    from Google reCAPTCHA to Cloudflare Turnstile):
+      - Widget: <div class="cf-turnstile" data-sitekey="0x4AAAAAADs-..."
+        id="recaptcha">, containing hidden input name="cf-turnstile-response".
+      - No data-callback / data-action: plain token-into-hidden-field flow.
       - Submit button: name ctl00$ContentPlaceHolder1$PublicNoticeDetailsBody1$
-        btnViewNotice, which calls WebForm_DoPostBackWithOptions(...).
-    The server validates g-recaptcha-response on that postback. So we set the
-    textarea value to the 2Captcha token and trigger the button's postback via
-    __doPostBack with the exact target name -- which preserves the token through
-    submit (a normal click can let grecaptcha clear it first).
+        btnViewNotice, driven by __doPostBack.
+    We solve via 2Captcha's turnstile method, write the token into the
+    cf-turnstile-response field, then trigger the button's postback via
+    __doPostBack with the exact target name (preserves the token through submit).
     """
     try:
         el = page.query_selector("[data-sitekey]")
@@ -349,9 +355,7 @@ def _maybe_solve_captcha(page, env: dict[str, str]) -> bool:
     if not sitekey:
         try:
             html = page.content()
-            m = re.search(r"data-sitekey=['\"]([A-Za-z0-9_-]{30,})['\"]", html)
-            if not m:
-                m = re.search(r"sitekey['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_-]{30,})['\"]", html)
+            m = re.search(r"data-sitekey=['\"]([A-Za-z0-9_-]{20,})['\"]", html)
             if m:
                 sitekey = m.group(1)
         except Exception:
@@ -364,59 +368,33 @@ def _maybe_solve_captcha(page, env: dict[str, str]) -> bool:
         _log("  CAPTCHA present but no 2Captcha key/lib configured; skipping page")
         return False
     try:
-        _log("  CAPTCHA detected; solving via 2Captcha (may take ~30-60s)...")
+        _log("  Turnstile detected; solving via 2Captcha (may take ~15-45s)...")
         solver = TwoCaptcha(key)
-        result = solver.recaptcha(sitekey=sitekey, url=page.url)
+        result = solver.turnstile(sitekey=sitekey, url=page.url)
         token = result.get("code") if isinstance(result, dict) else None
         if not token:
             _log("  2Captcha returned no token; skipping page")
             return False
 
-        # Set the token into g-recaptcha-response, then fire the exact postback
-        # target for the 'View Notice' button. Doing both in one JS step keeps
-        # the token in place at submit time.
+        # Write the token into cf-turnstile-response (create it if missing),
+        # then fire the exact postback target for the 'View Notice' button.
+        # Doing both in one JS step keeps the token in place at submit time.
         page.evaluate(
             """(tok) => {
                 const setTok = () => {
-                    let tas = Array.from(document.getElementsByName('g-recaptcha-response'));
-                    if (tas.length === 0) {
-                        const ta = document.createElement('textarea');
-                        ta.name = 'g-recaptcha-response';
-                        ta.id = 'g-recaptcha-response';
-                        const f = document.forms['aspnetForm'] || document.querySelector('form');
-                        (f || document.body).appendChild(ta);
-                        tas = [ta];
+                    let inputs = Array.from(
+                        document.getElementsByName('cf-turnstile-response'));
+                    if (inputs.length === 0) {
+                        const inp = document.createElement('input');
+                        inp.type = 'hidden';
+                        inp.name = 'cf-turnstile-response';
+                        const f = document.forms['aspnetForm']
+                                  || document.querySelector('form');
+                        (f || document.body).appendChild(inp);
+                        inputs = [inp];
                     }
-                    tas.forEach(t => { t.value = tok; t.innerHTML = tok; });
+                    inputs.forEach(t => { t.value = tok; });
                 };
-                setTok();
-                // Invoke grecaptcha's registered callback(s) so the page's own
-                // client-side handler runs (this is what populates the PDF
-                // download link). Walk ___grecaptcha_cfg.clients for any function
-                // whose key looks like a callback and call it with the token.
-                try {
-                    const cfg = window.___grecaptcha_cfg;
-                    if (cfg && cfg.clients) {
-                        Object.values(cfg.clients).forEach(client => {
-                            const stack = [client];
-                            const seen = new Set();
-                            while (stack.length) {
-                                const o = stack.pop();
-                                if (!o || typeof o !== 'object' || seen.has(o)) continue;
-                                seen.add(o);
-                                for (const k of Object.keys(o)) {
-                                    let v;
-                                    try { v = o[k]; } catch (e) { continue; }
-                                    if (typeof v === 'function' && /callback/i.test(k)) {
-                                        try { v(tok); } catch (e) {}
-                                    } else if (v && typeof v === 'object') {
-                                        stack.push(v);
-                                    }
-                                }
-                            }
-                        });
-                    }
-                } catch (e) {}
                 setTok();
                 // Find the View Notice submit button and its postback target name.
                 let target = null;
@@ -429,13 +407,14 @@ def _maybe_solve_captcha(page, env: dict[str, str]) -> bool:
                 if (target && typeof __doPostBack === 'function') {
                     __doPostBack(target, '');
                 } else {
-                    const f = document.forms['aspnetForm'] || document.querySelector('form');
+                    const f = document.forms['aspnetForm']
+                              || document.querySelector('form');
                     if (f) f.submit();
                 }
             }""",
             token,
         )
-        _log("  CAPTCHA token set; postback fired for 'View Notice'...")
+        _log("  Turnstile token set; postback fired for 'View Notice'...")
         try:
             page.wait_for_load_state("domcontentloaded", timeout=20000)
         except Exception:
@@ -690,7 +669,7 @@ def _pdf_text(context, pdf_url: str) -> Optional[str]:
 
 def _fetch_full_notice(page, notice_id: str, context=None) -> Optional[str]:
     """Return the full notice text. Strategy:
-      1. Open Details.aspx; if reCAPTCHA-gated, solve it in place (the postback
+      1. Open Details.aspx; if Turnstile-gated, solve it in place (the postback
          reveals the notice AND populates the PDF download link).
       2. PREFER the complete-notice PDF: read the populated lnkDownload href and
          download+parse the PDF (full text even for the ~1000-char-capped
@@ -709,7 +688,8 @@ def _fetch_full_notice(page, notice_id: str, context=None) -> Optional[str]:
             b = page.inner_text("body")
         except Exception:
             b = ""
-        return ("complete the reCAPTCHA" in b) or bool(page.query_selector("[data-sitekey]"))
+        return ("complete the reCAPTCHA" in b) or ("Verifying you are human" in b) \
+            or bool(page.query_selector("[data-sitekey]"))
 
     def _try_pdf() -> Optional[str]:
         """Try to grab + parse the complete-notice PDF from the CURRENT page
