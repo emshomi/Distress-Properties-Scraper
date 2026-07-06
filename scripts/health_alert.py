@@ -167,21 +167,30 @@ def _classify(row: dict, stale_days: int) -> tuple[str, str]:
         # Failed state but no recognized signature -- still report it.
         return "broken", f"last run failed: {notes[:100] or 'no detail'}"
 
-    # Row is in a SUCCESS state. But a total-write-failure or validation note
-    # on a "successful" run is the is_healthy-lies case -- the run completed
-    # yet wrote nothing useful. Catch those even when not currently_failed,
-    # because they represent data we're silently missing.
-    if notes_lc.startswith("all ") and "failed" in notes_lc:
-        return "broken", f"total write failure (flagged healthy): {notes[:100]}"
-    if "validationerror" in notes_lc or "literal_error" in notes_lc:
-        return "broken", f"validation error dropping records: {notes[:100]}"
-    m = re.search(r"(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+records failed", notes_lc)
-    if m:
-        n = int(m.group(1).replace(",", ""))
-        total = int(m.group(2).replace(",", "")) or 1
-        frac = n / total
-        if frac > _MINOR_DROP_FRACTION:
-            return "broken", f"{n}/{total} records failed ({frac:.0%})"
+    # Row is in a SUCCESS state (last success newer than last failure, or no
+    # failure recorded). Historically notes were NOT cleared on success, so a
+    # recovered source can still carry an old "writes failed" / "404" message.
+    # We cannot reliably tell a stale note from a current one using timestamps
+    # (the tracker bumps updated_at on every success either way). The real fix
+    # is record_success() clearing notes -- after which healthy rows carry an
+    # empty note and there is nothing to misread. Until each source's next
+    # successful run clears its note, we surface a lingering failure-note on a
+    # healthy row as a soft "check" (not a hard break), so it neither hides a
+    # real issue nor cries wolf on a recovered one.
+    lingering = (
+        (notes_lc.startswith("all ") and "failed" in notes_lc)
+        or "validationerror" in notes_lc
+        or "literal_error" in notes_lc
+    )
+    if not lingering:
+        m = re.search(r"(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+records failed", notes_lc)
+        if m:
+            n = int(m.group(1).replace(",", ""))
+            total = int(m.group(2).replace(",", "")) or 1
+            if (n / total) > _MINOR_DROP_FRACTION:
+                lingering = True
+    if lingering:
+        return "check", f"healthy now, but carries a failure note: {notes[:90]}"
 
     # Stale: succeeded, recovered, but not recently.
     age_days = (_now() - last_ok).total_seconds() / 86400.0
@@ -195,6 +204,7 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
     """Return (subject, body, any_problem)."""
     broken: list[tuple[str, str]] = []
     stale: list[tuple[str, str]] = []
+    check: list[tuple[str, str]] = []
     healthy: list[str] = []
 
     for row in sorted(rows, key=lambda r: r.get("source_name", "")):
@@ -204,6 +214,8 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
             broken.append((name, reason))
         elif state == "stale":
             stale.append((name, reason))
+        elif state == "check":
+            check.append((name, reason))
         else:
             healthy.append(name)
 
@@ -217,6 +229,7 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
     lines.append(f"Total sources: {total}   "
                  f"Broken: {len(broken)}   "
                  f"Stale: {len(stale)}   "
+                 f"Check: {len(check)}   "
                  f"Healthy: {len(healthy)}")
     lines.append("")
 
@@ -229,6 +242,13 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
     if stale:
         lines.append(f"STALE (no success in > {stale_days} days):")
         for name, reason in stale:
+            lines.append(f"  - {name}: {reason}")
+        lines.append("")
+
+    if check:
+        lines.append("CHECK (running fine now; carries an old failure note "
+                     "that clears on its next run):")
+        for name, reason in check:
             lines.append(f"  - {name}: {reason}")
         lines.append("")
 
