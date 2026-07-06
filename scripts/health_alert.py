@@ -118,9 +118,18 @@ def _fetch_health(supabase_url: str, service_key: str) -> list[dict]:
 
 
 def _classify(row: dict, stale_days: int) -> tuple[str, str]:
-    """Return (state, reason). state is 'broken' | 'stale' | 'healthy'."""
+    """Return (state, reason). state is 'broken' | 'stale' | 'healthy'.
+
+    Key subtlety: the `notes` field is NOT cleared on a successful run -- it
+    holds whatever message was last written, success or failure. So a stale
+    error message can linger on a row that has since recovered. We therefore
+    only trust notes as a failure signal when the row is ACTUALLY in a failed
+    state: last failure newer than last success, or consecutive_failures > 0.
+    Otherwise the source recovered and the note is just history.
+    """
     name = row.get("source_name", "?")
     last_ok = _parse_ts(row.get("last_successful_run_at"))
+    last_fail = _parse_ts(row.get("last_failed_run_at"))
     consec = row.get("consecutive_failures") or 0
     notes = (row.get("notes") or "").strip()
     notes_lc = notes.lower()
@@ -129,17 +138,43 @@ def _classify(row: dict, stale_days: int) -> tuple[str, str]:
     if last_ok is None:
         return "broken", "never succeeded"
 
-    # Actively failing.
+    # Actively failing (the counter is authoritative and IS reset on success).
     if consec and consec > 0:
         return "broken", f"{consec} consecutive failure(s)"
 
-    # Total write failure: "all N record writes failed" -> broken, always.
-    if notes_lc.startswith("all ") and "failed" in notes_lc:
-        return "broken", f"total write failure: {notes[:100]}"
+    # Is the row currently in a failed state? Only then do notes/failure text
+    # count. If the last success is newer than the last failure, it recovered.
+    currently_failed = last_fail is not None and last_fail > last_ok
 
-    # Fractional drop: "<N> of <M> records failed". Only broken if the failed
-    # fraction is large; a handful of bad rows out of hundreds of thousands is
-    # a healthy run, not a break.
+    if currently_failed:
+        # Total write failure.
+        if notes_lc.startswith("all ") and "failed" in notes_lc:
+            return "broken", f"total write failure: {notes[:100]}"
+        # Fractional drop -- only broken if a large fraction failed.
+        m = re.search(r"(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+records failed", notes_lc)
+        if m:
+            n = int(m.group(1).replace(",", ""))
+            total = int(m.group(2).replace(",", "")) or 1
+            frac = n / total
+            if frac > _MINOR_DROP_FRACTION:
+                return "broken", f"{n}/{total} records failed ({frac:.0%})"
+        # Error signatures.
+        for sig in _ERROR_SIGNATURES:
+            if sig in notes_lc:
+                return "broken", f"error in notes: {notes[:100]}"
+        if "validationerror" in notes_lc or "literal_error" in notes_lc:
+            return "broken", f"validation error dropping records: {notes[:100]}"
+        # Failed state but no recognized signature -- still report it.
+        return "broken", f"last run failed: {notes[:100] or 'no detail'}"
+
+    # Row is in a SUCCESS state. But a total-write-failure or validation note
+    # on a "successful" run is the is_healthy-lies case -- the run completed
+    # yet wrote nothing useful. Catch those even when not currently_failed,
+    # because they represent data we're silently missing.
+    if notes_lc.startswith("all ") and "failed" in notes_lc:
+        return "broken", f"total write failure (flagged healthy): {notes[:100]}"
+    if "validationerror" in notes_lc or "literal_error" in notes_lc:
+        return "broken", f"validation error dropping records: {notes[:100]}"
     m = re.search(r"(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+records failed", notes_lc)
     if m:
         n = int(m.group(1).replace(",", ""))
@@ -147,18 +182,8 @@ def _classify(row: dict, stale_days: int) -> tuple[str, str]:
         frac = n / total
         if frac > _MINOR_DROP_FRACTION:
             return "broken", f"{n}/{total} records failed ({frac:.0%})"
-        # else: minor drop -> fall through, treat as healthy (subject to staleness)
 
-    # Error signature in notes even though it may look healthy.
-    for sig in _ERROR_SIGNATURES:
-        if sig in notes_lc:
-            return "broken", f"error in notes: {notes[:100]}"
-
-    # Validation errors that silently drop a whole category also count.
-    if "validationerror" in notes_lc or "literal_error" in notes_lc:
-        return "broken", f"validation error dropping records: {notes[:100]}"
-
-    # Stale: succeeded once, but not recently.
+    # Stale: succeeded, recovered, but not recently.
     age_days = (_now() - last_ok).total_seconds() / 86400.0
     if age_days > stale_days:
         return "stale", f"last success {age_days:.1f} days ago"
