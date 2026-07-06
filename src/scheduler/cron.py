@@ -38,7 +38,11 @@ _SCHEDULE_TIMEZONE = settings.scheduler_timezone
 
 _SCRAPER_SCHEDULES: tuple[tuple[type[BaseScraper], dict[str, Any]], ...] = (
     # Daily scrapers, staggered 06:00–08:00 CST
-    (MplsThreeOneOneScraper, {"hour": 6, "minute": 0}),
+    # SHELVED 2026-07-06: Minneapolis retired the Socrata dataset (rmpv-bp76);
+       # code-violation data now lives only in Tableau dashboards with no JSON/REST
+       # API. No scrapable endpoint exists. Re-enable if a violations Feature
+       # Service appears on services.arcgis.com/afSMGVsC7QlRK1kZ/.
+       # (MplsThreeOneOneScraper, {"hour": 6, "minute": 0}),
     (HennepinSheriffScraper, {"hour": 6, "minute": 15}),
     (MplsVacantBuildingScraper, {"hour": 7, "minute": 0}),
     (SaintPaulVacantBuildingScraper, {"hour": 7, "minute": 15}),
