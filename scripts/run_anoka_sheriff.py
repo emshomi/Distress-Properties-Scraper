@@ -21,6 +21,7 @@ import traceback
 # Import is at top level so a missing env var / config error fails fast
 # (before we waste time on imports inside main()).
 from src.scrapers.anoka_sheriff import AnokaSheriffScraper
+from src.services import source_health_tracker
 from src.utils.logger import logger
 
 
@@ -40,6 +41,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[anoka-runner] fetch: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"fetch failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
 
     # --- Parse ---
@@ -49,6 +53,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[anoka-runner] parse: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"parse failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
 
     # --- Write ---
@@ -61,6 +68,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[anoka-runner] write: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"write failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
 
     if failed > 0:
@@ -68,9 +78,18 @@ async def main() -> int:
             f"[anoka-runner] completed with {failed} failed events — exit 1",
             flush=True,
         )
+        source_health_tracker.record_failure(
+            scraper.source_name,
+            notes=f"{failed} of {new + updated + failed} record writes failed",
+        )
         return 1
 
-    print("[anoka-runner] done.", flush=True)
+    source_health_tracker.record_success(scraper.source_name)
+    print(
+        f"[anoka-runner] done. (health: success recorded, "
+        f"new={new} updated={updated})",
+        flush=True,
+    )
     return 0
 
 
