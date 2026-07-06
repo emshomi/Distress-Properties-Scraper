@@ -1530,6 +1530,90 @@ async def differentiator_stats() -> dict[str, Any]:
 
 
 # ============================================================
+# GET /stats/redemption — outcome-tracker aggregates (public)
+# ============================================================
+# Free-safe by construction: COUNTS ONLY, no parcels, no addresses, no
+# dates, no prices. Powers the homepage proof strip. Cached in-process for
+# 10 minutes — the underlying tracker changes at most daily.
+
+_REDEMPTION_STATS_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_REDEMPTION_STATS_TTL_S = 600
+
+
+@router.get(
+    "/stats/redemption",
+    status_code=http_status.HTTP_200_OK,
+    summary="Aggregate redemption-lifecycle stats (counts only; public).",
+)
+async def redemption_stats() -> dict[str, Any]:
+    import time as _time
+
+    now = _time.monotonic()
+    if (
+        _REDEMPTION_STATS_CACHE["data"] is not None
+        and now - _REDEMPTION_STATS_CACHE["at"] < _REDEMPTION_STATS_TTL_S
+    ):
+        return success_envelope(_REDEMPTION_STATS_CACHE["data"])
+
+    try:
+        rows = _fetch_all_rows_in_schema(
+            outcomes_table,
+            "redemption_tracker",
+            "redemption_expiry_date, outcome",
+        )
+    except Exception as e:
+        logger.warning(
+            "redemption stats fetch failed",
+            error_type=type(e).__name__,
+        )
+        rows = []
+
+    today = _date.today()
+    soon = today + _timedelta(days=30)
+    in_redemption = 0
+    closing_30d = 0
+    redeemed = 0
+    reo = 0
+    sold = 0
+    outcome_pending = 0
+    for r in rows:
+        outcome = r.get("outcome") or "pending"
+        expiry = _coerce_date(r.get("redemption_expiry_date"))
+        if outcome in ("pending", "unknown"):
+            if expiry is not None and expiry >= today:
+                in_redemption += 1
+                if expiry <= soon:
+                    closing_30d += 1
+            else:
+                outcome_pending += 1
+        elif outcome in ("redeemed_by_owner", "redeemed_by_junior"):
+            redeemed += 1
+        elif outcome == "foreclosed":
+            reo += 1
+        elif outcome == "foreclosed_sold":
+            sold += 1
+
+    resolved_total = redeemed + reo + sold
+    pct_sold_during_redemption = (
+        round(100 * redeemed / resolved_total) if resolved_total else None
+    )
+
+    data = {
+        "in_redemption": in_redemption,
+        "closing_within_30_days": closing_30d,
+        "outcome_pending": outcome_pending,
+        "resolved_total": resolved_total,
+        "resolved_redeemed": redeemed,
+        "resolved_reo": reo,
+        "resolved_sold": sold,
+        "pct_sold_during_redemption": pct_sold_during_redemption,
+    }
+    _REDEMPTION_STATS_CACHE["data"] = data
+    _REDEMPTION_STATS_CACHE["at"] = now
+    return success_envelope(data)
+
+
+# ============================================================
 # GET /properties — paginated property list
 # ============================================================
 
@@ -1737,10 +1821,24 @@ async def list_properties(
 
     redemption: Optional[str] = Query(
         default=None,
-        pattern="^(in_redemption|expiring_soon|expired)$",
+        pattern="^(in_redemption|expiring_soon|expired|outcome_pending|resolved)$",
         description=(
-            "Filter foreclosure rows by redemption-window state. Uses the "
-            "county-published date where present, else the sale+~182d estimate."
+            "Filter foreclosure rows by redemption lifecycle state. "
+            "'in_redemption'/'expiring_soon'/'expired' use DB-level date math "
+            "(county-published date where present, else sale+~182d). "
+            "'outcome_pending' and 'resolved' come from the outcome tracker, "
+            "so they route through the fetch-all + Python-filter path."
+        ),
+    ),
+
+    outcome: Optional[str] = Query(
+        default=None,
+        pattern="^(redeemed|reo|sold)$",
+        description=(
+            "PREMIUM: filter resolved foreclosures by confirmed outcome. "
+            "'redeemed' = owner/junior redeemed; 'reo' = lender took title; "
+            "'sold' = sold after foreclosure. Silently ignored below premium "
+            "(the outcome itself is premium data)."
         ),
     ),
 
@@ -2036,11 +2134,24 @@ async def list_properties(
         # about — sorting hundreds of dicts is instant.
         computed_sorts = {"equity", "redemption_urgency"}
 
+        # The outcome filter is PREMIUM data (which rows redeemed vs sold is
+        # itself the leverage) — silently neutralized below premium, matching
+        # the gate_filters_for_tier convention of not erroring on gated input.
+        if _ctx.tier not in ("premium", "admin"):
+            outcome = None
+
         # multi_signal requires the overlay map to filter, which only exists
         # after shaping — so it forces the fetch-all path too, exactly like
         # the computed sorts. Pagination then happens in Python on the
-        # filtered set.
-        needs_fetch_all = sort in computed_sorts or multi_signal is not None
+        # filtered set. The tracker-backed redemption states (outcome_pending
+        # / resolved) and the outcome filter also live on shaped rows only.
+        tracker_states = redemption in ("outcome_pending", "resolved")
+        needs_fetch_all = (
+            sort in computed_sorts
+            or multi_signal is not None
+            or tracker_states
+            or outcome is not None
+        )
 
         if needs_fetch_all:
 
@@ -2111,6 +2222,26 @@ async def list_properties(
                 # badge is preserved on whichever row represents it.
                 shaped = _dedupe_by_parcel(shaped)
 
+            # Tracker-backed lifecycle filters: these states/outcomes exist
+            # only on shaped rows (they come from outcomes.redemption_tracker
+            # during shaping), so they are applied here, never DB-side.
+            if tracker_states:
+                shaped = [
+                    s for s in shaped
+                    if s.get("redemption_state") == redemption
+                ]
+            if outcome is not None:
+                _OUTCOME_BUCKETS = {
+                    "redeemed": {"redeemed_by_owner", "redeemed_by_junior"},
+                    "reo": {"foreclosed"},
+                    "sold": {"foreclosed_sold"},
+                }
+                wanted = _OUTCOME_BUCKETS.get(outcome, set())
+                shaped = [
+                    s for s in shaped
+                    if s.get("redemption_outcome") in wanted
+                ]
+
             # 'sort' may be a normal column here (when multi_signal forced this
             # path); _sort_computed passes those through unchanged, so the rows
             # keep the DB order they arrived in. Computed sorts still sort.
@@ -2128,7 +2259,10 @@ async def list_properties(
             })
 
         # Fast DB-level column sort + pagination.
-        query = query.order(sort, desc=(order == "desc"))
+        # nullsfirst=False: Postgres floats NULLs to the top of DESC sorts by
+        # default, which put date-less legal notices above every dated sale on
+        # "latest first". Nulls belong at the end in both directions.
+        query = query.order(sort, desc=(order == "desc"), nullsfirst=False)
         query = query.range(offset, offset + limit - 1)
 
         result = query.execute()
