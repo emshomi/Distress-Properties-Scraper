@@ -20,6 +20,7 @@ import traceback
 # Import is at top level so a missing env var / config error fails fast
 # (before we waste time on imports inside main()).
 from src.scrapers.washington_sheriff import WashingtonSheriffScraper
+from src.services import source_health_tracker
 from src.utils.logger import logger
 async def main() -> int:
     trigger = sys.argv[1] if len(sys.argv) > 1 else "github_actions"
@@ -34,6 +35,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[washington-runner] fetch: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"fetch failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
     # --- Parse ---
     try:
@@ -42,6 +46,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[washington-runner] parse: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"parse failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
     # --- Write ---
     try:
@@ -53,14 +60,26 @@ async def main() -> int:
     except Exception as e:
         print(f"[washington-runner] write: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"write failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
     if failed > 0:
         print(
             f"[washington-runner] completed with {failed} failed events — exit 1",
             flush=True,
         )
+        source_health_tracker.record_failure(
+            scraper.source_name,
+            notes=f"{failed} of {new + updated + failed} record writes failed",
+        )
         return 1
-    print("[washington-runner] done.", flush=True)
+    source_health_tracker.record_success(scraper.source_name)
+    print(
+        f"[washington-runner] done. (health: success recorded, "
+        f"new={new} updated={updated})",
+        flush=True,
+    )
     return 0
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
