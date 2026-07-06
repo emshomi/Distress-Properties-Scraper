@@ -31,6 +31,11 @@ SETUP (one time)
         SUPABASE_SERVICE_KEY=<service_role key>
         ANTHROPIC_API_KEY=<anthropic key>
         TWOCAPTCHA_API_KEY=<2captcha key>
+     Optional (silent-failure email alerts via Resend -- if omitted, an
+     unhealthy run just logs a loud local ALERT line instead of emailing):
+        RESEND_API_KEY=<resend key>
+        ALERT_EMAIL_TO=<where alerts go, e.g. you@example.com>
+        ALERT_EMAIL_FROM=<verified Resend sender, e.g. alerts@govire.com>
   3. Install the browser binary once:  python -m playwright install chromium
   4. Test:    py govire_mnpn_browser.py --max 1
      Daily:   py govire_mnpn_browser.py --max 50 --headless
@@ -787,6 +792,89 @@ def _fetch_full_notice(page, notice_id: str, context=None) -> Optional[str]:
 
 
 # ============================================================
+# Alerting (silent-failure guard)
+# ============================================================
+
+def _maybe_alert(env: dict[str, str], stats: dict[str, int]) -> None:
+    """Email an alert via Resend when a run looks unhealthy, so a silent
+    failure (e.g. a captcha migration that makes every notice fail) surfaces
+    the same day instead of sitting unnoticed.
+
+    Alert conditions:
+      HARD  -- ids_found > 0 but stored == 0  (found notices, saved none).
+      SOFT  -- no_text > 0                     (some notices failed to yield text).
+    Either condition sends one email summarizing the RESULT counts.
+
+    Fails safe: any error here is logged and swallowed -- alerting must never
+    crash or block the scraper. If RESEND_API_KEY is absent, it logs a loud
+    local ALERT line instead so the signal still appears in the run output.
+    """
+    ids = stats.get("ids", 0)
+    stored = stats.get("stored", 0)
+    no_text = stats.get("no_text", 0)
+
+    hard = ids > 0 and stored == 0
+    soft = no_text > 0
+    if not (hard or soft):
+        return  # healthy run, nothing to do
+
+    severity = "HARD FAILURE" if hard else "PARTIAL FAILURE"
+    summary = (
+        f"[{severity}] govire mnpn scraper\n\n"
+        f"ids_found={ids}  stored={stored}  no_text={no_text}  "
+        f"extract_failed={stats.get('extract_fail', 0)}  "
+        f"already_staged={stats.get('already', 0)}\n\n"
+        + ("Found notices but stored NONE -- likely a site/captcha change "
+           "blocking extraction. Check the run log for the failure mode.\n"
+           if hard else
+           "Some notices produced no text -- possible partial site change or "
+           "flaky captcha solves. Check the run log.\n")
+        + f"\nRun finished {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} local."
+    )
+
+    # Always emit a loud local line so the signal is in the run output too.
+    _log("!" * 60)
+    _log(f"ALERT  {severity}: ids={ids} stored={stored} no_text={no_text}")
+    _log("!" * 60)
+
+    api_key = env.get("RESEND_API_KEY")
+    to_addr = env.get("ALERT_EMAIL_TO")
+    from_addr = env.get("ALERT_EMAIL_FROM")
+    if not api_key:
+        _log("  (no RESEND_API_KEY in .env; alert logged locally only)")
+        return
+    if not to_addr or not from_addr:
+        _log("  (RESEND_API_KEY set but ALERT_EMAIL_TO/ALERT_EMAIL_FROM missing; "
+             "alert logged locally only)")
+        return
+
+    try:
+        import requests
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": from_addr,
+                "to": [to_addr],
+                "subject": f"[{severity}] govire mnpn scraper -- "
+                           f"stored={stored}/ids={ids}",
+                "text": summary,
+            },
+            timeout=20,
+        )
+        if 200 <= resp.status_code < 300:
+            _log(f"  alert email sent via Resend to {to_addr}")
+        else:
+            _log(f"  Resend alert failed: HTTP {resp.status_code} "
+                 f"{resp.text[:160]}")
+    except Exception as e:
+        _log(f"  Resend alert error: {type(e).__name__}: {str(e)[:160]}")
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -868,6 +956,8 @@ def main() -> int:
          f"no_text={stats['no_text']}  extract_failed={stats['extract_fail']}")
     _log("RUN END")
     _log("=" * 60)
+
+    _maybe_alert(_ENV, stats)
     return 0
 
 
