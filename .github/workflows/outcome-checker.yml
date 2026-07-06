@@ -1,0 +1,41 @@
+# .github/workflows/outcome-checker.yml
+#
+# Daily outcome-capture check for outcomes.redemption_tracker.
+# ArcGIS open-data endpoints do not block datacenter IPs, so this runs
+# fine from GitHub Actions (unlike the mnpublicnotice scraper).
+#
+# IMPORTANT: verify the secret name below matches the one your existing
+# cloud-scraper workflows use for the Supabase connection string.
+# Check any current file in .github/workflows/ before committing.
+
+name: outcome-checker
+
+on:
+  schedule:
+    - cron: "0 14 * * *"   # 14:00 UTC = 8:00 AM Central (daily)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (1 = read-only, print decisions, write nothing)"
+        required: false
+        default: "1"
+
+jobs:
+  check-outcomes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Run outcome checker
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: python outcome_capture/outcome_checker.py
