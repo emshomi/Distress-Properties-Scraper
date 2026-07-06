@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status as http_status
 
-from src.db.supabase_client import core_table, signals_table
+from src.db.supabase_client import core_table, signals_table, outcomes_table
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
 from src.middleware.tier import TierResolved, TierContext
@@ -896,6 +896,146 @@ def _load_parcel_enrichment(county_code: str, parcel_id: str) -> Optional[dict[s
 
 
 # ============================================================
+# REDEMPTION OUTCOME TRACKER (outcomes.redemption_tracker)
+# ============================================================
+# The outcome-capture system (see BUILDLOG_outcome-capture.md) tracks every
+# sheriff sale's statutory redemption clock and — after expiry — its actual
+# ENDING: redeemed by the owner, taken by the lender (REO), or resold, with
+# the confirmed resale price from county/eCRV records. When a tracker row
+# exists it is the authoritative source for the redemption fields, replacing
+# the published-date / sale+182d guesswork below.
+#
+# JOIN KEY: (county_lower, effective_parcel_id, anchor_date). This is how the
+# tracker was seeded (eff_parcel_id + event/sale date) and it works on EVERY
+# endpoint path — the list endpoint selects from distress_with_parcel WITHOUT
+# the distress_events id, so a PK join would silently fail there. A secondary
+# (county, parcel)-keyed map catches rows whose event_date drifted from the
+# tracker's anchor (e.g. postponements), preferring the latest anchor.
+#
+# NOTE: requires the `outcomes` schema in Supabase's exposed schemas
+# (Settings -> API). If not exposed, the fetch fails and we degrade
+# gracefully to the estimate path (empty map).
+
+_OUTCOME_LABELS = {
+    "redeemed_by_owner": "Redeemed by owner",
+    "redeemed_by_junior": "Redeemed by junior lienholder",
+    "foreclosed": "Bank-owned (REO)",
+    "foreclosed_sold": "Sold after foreclosure",
+    "deed_in_lieu": "Deed in lieu of foreclosure",
+    "sale_cancelled": "Sale cancelled",
+    "unknown": "Outcome pending confirmation",
+}
+
+# Outcomes that mean the case is finished (countdown no longer meaningful).
+_RESOLVED_OUTCOMES = {
+    "redeemed_by_owner", "redeemed_by_junior", "foreclosed",
+    "foreclosed_sold", "deed_in_lieu", "sale_cancelled",
+}
+
+import re as _re
+
+# detection_notes formats written by the outcome checker / eCRV matcher:
+#   'eCRV: WARRNTY 2026-03-10 amt 310000.0 seller ...'
+#   'County last-sale 2026-03-17 (value 299900, ...) is after ...'
+_NOTES_PRICE_RE = _re.compile(r"(?:amt|\(value)\s+([0-9][0-9_.,]*)")
+_NOTES_DATE_RE = _re.compile(r"(?:eCRV:\s+\S+|last-sale)\s+(\d{4}-\d{2}-\d{2})")
+
+
+def _parse_resale_from_notes(notes: Optional[str]) -> tuple[Optional[float], Optional[str]]:
+    """Best-effort extraction of (resale_price, resale_date) from the
+    tracker's detection_notes. Returns (None, None) when absent/unparseable —
+    honest gaps, never guesses."""
+    if not notes:
+        return None, None
+    price = None
+    m = _NOTES_PRICE_RE.search(notes)
+    if m:
+        try:
+            price = float(m.group(1).replace(",", "").replace("_", ""))
+        except ValueError:
+            price = None
+    date_s = None
+    m = _NOTES_DATE_RE.search(notes)
+    if m:
+        date_s = m.group(1)
+    return price, date_s
+
+
+def _fetch_all_rows_in_schema(table_fn, table_name: str, columns: str) -> list[dict[str, Any]]:
+    """Schema-generic twin of _fetch_all_rows (which is signals-bound):
+    page through an entire table using the given schema accessor."""
+    _PAGE = 1000
+    _MAX_PAGES = 100
+    all_rows: list[dict[str, Any]] = []
+    page_idx = 0
+    while page_idx < _MAX_PAGES:
+        start = page_idx * _PAGE
+        end = start + _PAGE - 1
+        try:
+            result = (
+                table_fn(table_name)
+                .select(columns)
+                .range(start, end)
+                .execute()
+            )
+        except Exception as e:
+            logger.warning(
+                "paged schema fetch failed",
+                table=table_name,
+                page=page_idx,
+                error_type=type(e).__name__,
+            )
+            break
+        page_rows = result.data or []
+        all_rows.extend(page_rows)
+        if len(page_rows) < _PAGE:
+            break
+        page_idx += 1
+    return all_rows
+
+
+def _load_redemption_tracker_map() -> dict[str, dict[Any, dict[str, Any]]]:
+    """Fetch outcomes.redemption_tracker and index it two ways:
+
+      'exact'  : (county_lower, parcel_id, anchor_date_iso) -> tracker row
+      'parcel' : (county_lower, parcel_id) -> tracker row with LATEST anchor
+
+    Returns {'exact': {}, 'parcel': {}} on any failure (graceful degrade to
+    the estimate path — same philosophy as overlay/owner maps)."""
+    empty: dict[str, dict[Any, dict[str, Any]]] = {"exact": {}, "parcel": {}}
+    try:
+        rows = _fetch_all_rows_in_schema(
+            outcomes_table,
+            "redemption_tracker",
+            "county_code, parcel_id, anchor_date, redemption_expiry_date, "
+            "period_source, outcome, ambiguous, detection_source, detection_notes",
+        )
+    except Exception as e:
+        logger.warning(
+            "redemption tracker load failed (degrading to estimates)",
+            error_type=type(e).__name__,
+        )
+        return empty
+    if not rows:
+        return empty
+
+    exact: dict[Any, dict[str, Any]] = {}
+    by_parcel: dict[Any, dict[str, Any]] = {}
+    for r in rows:
+        county = (r.get("county_code") or "").lower()
+        pid = r.get("parcel_id")
+        anchor = r.get("anchor_date")
+        if not county or not pid or not anchor:
+            continue
+        exact[(county, pid, str(anchor))] = r
+        pk = (county, pid)
+        prev = by_parcel.get(pk)
+        if prev is None or str(anchor) > str(prev.get("anchor_date") or ""):
+            by_parcel[pk] = r
+    return {"exact": exact, "parcel": by_parcel}
+
+
+# ============================================================
 # REDEMPTION-WINDOW COMPUTATION
 # ============================================================
 # Minnesota sheriff sales carry a redemption period (typically 6 months)
@@ -955,17 +1095,39 @@ def _coerce_date(value: Any) -> Optional[_date]:
     return None
 
 
-def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
-    """Compute redemption_ends_at / days_left / redemption_state for a row.
+def _redemption_fields(
+    source: str,
+    raw: dict,
+    row: dict,
+    tracker_map: Optional[dict[str, dict[Any, dict[str, Any]]]] = None,
+) -> dict[str, Any]:
+    """Compute the redemption lifecycle fields for a row.
 
     Returns all-null fields for non-foreclosure sources.
 
-    Two date sources, in priority order:
+    THREE sources, in priority order:
+      0. The outcome tracker (outcomes.redemption_tracker) — authoritative.
+         Carries the statutorily computed expiry AND, once the window closes,
+         the confirmed OUTCOME (redeemed / REO / sold + resale price from
+         county & eCRV records). This is what replaces the old dead-end
+         'expired' state with an answer.
       1. A county-published redemption date (Hennepin / Ramsey expose
-         redemptionExpirationDate). Authoritative — used as-is, no guard.
+         redemptionExpirationDate). Authoritative for the date, silent on
+         the outcome.
       2. Otherwise, estimate sale_date + ~6 months — but ONLY for sales that
-         have actually COMPLETED. A redemption clock only starts once the
-         sheriff sale happens; an upcoming or postponed sale has none.
+         have actually COMPLETED (see COMPLETED-SALE GUARD below).
+
+    redemption_state values (safe for ALL tiers — never names the outcome):
+      in_redemption   — window open, > 90 days left
+      expiring_soon   — window open, <= 90 days left
+      outcome_pending — window closed, resolution not yet confirmed
+      resolved        — resolution confirmed (specifics are Premium fields)
+      expired         — legacy fallback ONLY (no tracker row exists)
+
+    Premium-gated outcome fields (locked in redaction._LEVERAGE_FIELDS):
+      redemption_outcome, redemption_outcome_label,
+      redemption_outcome_ambiguous, redemption_resale_price,
+      redemption_resale_date
 
     COMPLETED-SALE GUARD (the estimate path only):
       * Anoka publishes its PENDING sales list. Each row carries a status of
@@ -984,10 +1146,78 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
         "redemption_days_left": None,
         "redemption_state": None,
         "redemption_is_estimated": None,
+        "redemption_outcome": None,
+        "redemption_outcome_label": None,
+        "redemption_outcome_ambiguous": None,
+        "redemption_resale_price": None,
+        "redemption_resale_date": None,
     }
     if source not in _FORECLOSURE_SOURCES:
         return null_result
 
+    # ---- 0. Outcome tracker (authoritative when present) ----
+    tracker = None
+    if tracker_map:
+        county_lower = (_resolve_county(source, raw) or "").lower()
+        eff_pid = _effective_parcel_id(source, raw, row)
+        event_date = _coerce_date(row.get("event_date"))
+        if county_lower and eff_pid:
+            if event_date is not None:
+                tracker = tracker_map.get("exact", {}).get(
+                    (county_lower, eff_pid, event_date.isoformat())
+                )
+            if tracker is None:
+                tracker = tracker_map.get("parcel", {}).get(
+                    (county_lower, eff_pid)
+                )
+
+    if tracker is not None:
+        ends_at = _coerce_date(tracker.get("redemption_expiry_date"))
+        is_estimated = (tracker.get("period_source") or "") == "default_6mo"
+        outcome = tracker.get("outcome") or "pending"
+        days_left = (ends_at - _date.today()).days if ends_at else None
+
+        if outcome in _RESOLVED_OUTCOMES:
+            state = "resolved"
+            price, resale_date = _parse_resale_from_notes(
+                tracker.get("detection_notes")
+            )
+            return {
+                "redemption_ends_at": ends_at.isoformat() if ends_at else None,
+                "redemption_days_left": None,  # countdown is over
+                "redemption_state": state,
+                "redemption_is_estimated": is_estimated,
+                "redemption_outcome": outcome,
+                "redemption_outcome_label": _OUTCOME_LABELS.get(outcome),
+                "redemption_outcome_ambiguous": bool(tracker.get("ambiguous")),
+                "redemption_resale_price": price,
+                "redemption_resale_date": resale_date,
+            }
+
+        # pending / unknown: the window is either still open or closed
+        # without a confirmed resolution yet.
+        if days_left is None:
+            state = None
+        elif days_left < 0:
+            state = "outcome_pending"
+            days_left = None  # a negative countdown is noise, not information
+        elif days_left <= _REDEMPTION_EXPIRING_SOON_DAYS:
+            state = "expiring_soon"
+        else:
+            state = "in_redemption"
+        return {
+            "redemption_ends_at": ends_at.isoformat() if ends_at else None,
+            "redemption_days_left": days_left,
+            "redemption_state": state,
+            "redemption_is_estimated": is_estimated,
+            "redemption_outcome": None,
+            "redemption_outcome_label": None,
+            "redemption_outcome_ambiguous": None,
+            "redemption_resale_price": None,
+            "redemption_resale_date": None,
+        }
+
+    # ---- 1./2. No tracker row: original published-date / estimate logic ----
     ends_at: Optional[_date] = None
     is_estimated = False
 
@@ -1037,12 +1267,18 @@ def _redemption_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
         "redemption_days_left": days_left,
         "redemption_state": state,
         "redemption_is_estimated": is_estimated,
+        "redemption_outcome": None,
+        "redemption_outcome_label": None,
+        "redemption_outcome_ambiguous": None,
+        "redemption_resale_price": None,
+        "redemption_resale_date": None,
     }
 
 def _shape_property_row(
     row: dict[str, Any],
     overlay_map: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
     owner_map: Optional[dict[str, dict[str, Any]]] = None,
+    tracker_map: Optional[dict[str, dict[Any, dict[str, Any]]]] = None,
 ) -> dict[str, Any]:
     
     """Dispatch to the right per-source extractor and merge common fields.
@@ -1050,13 +1286,16 @@ def _shape_property_row(
     If an overlay_map is supplied, attach this parcel's cross-signal flags
     under a nested 'overlay' key (None when the parcel has no resolvable id
     or no overlay entry — the frontend shows no badge in that case).
+    If a tracker_map is supplied, redemption fields come from the outcome
+    tracker where a row exists (authoritative), else fall back to the
+    published-date / estimate logic.
     """
     source = row.get("source") or ""
     raw = row.get("raw_data") or {}
     extractor = _EXTRACTORS.get(source, _extract_generic)
     extracted = extractor(raw, row)
 
-    redemption = _redemption_fields(source, raw, row)
+    redemption = _redemption_fields(source, raw, row, tracker_map)
 
     shaped = {
         "source": source,
@@ -1844,7 +2083,11 @@ async def list_properties(
 
             overlay_map = _load_overlay_map()
             owner_map = _load_owner_map()
-            shaped = [_shape_property_row(r, overlay_map, owner_map) for r in rows]
+            tracker_map = _load_redemption_tracker_map()
+            shaped = [
+                _shape_property_row(r, overlay_map, owner_map, tracker_map)
+                for r in rows
+            ]
 
             
 
@@ -1894,10 +2137,12 @@ async def list_properties(
 
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
+        tracker_map = _load_redemption_tracker_map()
         return success_envelope({
             "properties": [
                 redact_property(
-                    _shape_property_row(r, overlay_map, owner_map), tier=_ctx.tier
+                    _shape_property_row(r, overlay_map, owner_map, tracker_map),
+                    tier=_ctx.tier,
                 )
                 for r in rows
             ],
@@ -1954,7 +2199,8 @@ async def get_property(
 
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
-        shaped = _shape_property_row(rows[0], overlay_map, owner_map)
+        tracker_map = _load_redemption_tracker_map()
+        shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map)
         shaped["raw"] = rows[0].get("raw_data") or {}
 
         # Attach enriched property characteristics from core.parcels, keyed by
@@ -2123,8 +2369,10 @@ async def owner_properties(
 
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
+        tracker_map = _load_redemption_tracker_map()
         shaped = [
-            _shape_property_row(r, overlay_map, owner_map) for r in matched
+            _shape_property_row(r, overlay_map, owner_map, tracker_map)
+            for r in matched
         ]
         # Drop the internal de-dup key before returning.
         for s in shaped:
