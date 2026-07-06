@@ -134,6 +134,14 @@ def _classify(row: dict, stale_days: int) -> tuple[str, str]:
     notes = (row.get("notes") or "").strip()
     notes_lc = notes.lower()
 
+    # Shelved sources: intentionally retired (source removed upstream, no API,
+    # etc.). Marked by a note beginning "SHELVED". These are excluded from the
+    # digest entirely so a deliberately-disabled source doesn't nag as "broken"
+    # (its last_successful_run_at may be null, which would otherwise trip the
+    # never-succeeded rule below).
+    if notes_lc.startswith("shelved"):
+        return "shelved", notes[:100]
+
     # Never succeeded.
     if last_ok is None:
         return "broken", "never succeeded"
@@ -205,6 +213,7 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
     broken: list[tuple[str, str]] = []
     stale: list[tuple[str, str]] = []
     check: list[tuple[str, str]] = []
+    shelved: list[str] = []
     healthy: list[str] = []
 
     for row in sorted(rows, key=lambda r: r.get("source_name", "")):
@@ -216,10 +225,14 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
             stale.append((name, reason))
         elif state == "check":
             check.append((name, reason))
+        elif state == "shelved":
+            shelved.append(name)
         else:
             healthy.append(name)
 
-    total = len(rows)
+    # Shelved sources are excluded from the active total -- they're
+    # intentionally retired, not part of the live fleet being monitored.
+    total = len(rows) - len(shelved)
     any_problem = bool(broken or stale)
 
     lines: list[str] = []
@@ -254,6 +267,10 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
 
     if healthy:
         lines.append(f"HEALTHY ({len(healthy)}): " + ", ".join(healthy))
+        lines.append("")
+
+    if shelved:
+        lines.append(f"Shelved (not monitored): " + ", ".join(shelved))
         lines.append("")
 
     if not any_problem:
