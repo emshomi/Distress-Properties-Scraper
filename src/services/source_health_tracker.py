@@ -75,14 +75,23 @@ def _upsert(payload: SourceHealthUpdate) -> None:
 
 
 def record_success(source_name: str, notes: str | None = None) -> None:
-    """Mark a scraper as having completed successfully. Resets consecutive failures."""
+    """Mark a scraper as having completed successfully. Resets consecutive failures.
+
+    IMPORTANT: on success we CLEAR notes (empty string) rather than leaving them
+    None. Because _upsert excludes None fields, passing None would leave whatever
+    error message was last written lingering on a now-healthy row -- a stale note
+    that misleads both the /status dashboard and the health-digest alert (a
+    recovered source kept showing an old 404 / "writes failed" message for weeks).
+    An explicit empty string overwrites and clears it. If a caller passes real
+    notes, we honor them.
+    """
     now = datetime.now(timezone.utc)
     payload = SourceHealthUpdate(
         source_name=source_name,
         last_successful_run_at=now,
         consecutive_failures=0,
         is_healthy=True,
-        notes=notes,
+        notes=notes if notes is not None else "",
         updated_at=now,
     )
     _upsert(payload)
