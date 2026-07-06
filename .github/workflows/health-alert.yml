@@ -1,0 +1,45 @@
+name: Scraper Health Digest
+
+# Daily digest of audit.source_health, emailed via Resend. Reports broken and
+# stale sources, or an all-healthy line when everything is fine. Manual trigger
+# is always available via the Actions UI.
+on:
+  workflow_dispatch:
+  schedule:
+    # 13:00 UTC = 7am Central (standard) / 8am Central (DST). Daily.
+    # Runs AFTER the morning scrapers (which fire ~12:00 UTC) so the digest
+    # reflects the current day's runs.
+    - cron: '0 13 * * *'
+
+jobs:
+  health-digest:
+    name: Run health digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install httpx
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx
+
+      - name: Run health digest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          # Optional: days without a successful run before a source is "stale".
+          HEALTH_STALE_DAYS: '3'
+        run: |
+          python -m scripts.health_alert
