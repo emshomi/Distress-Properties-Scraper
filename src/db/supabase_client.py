@@ -104,6 +104,13 @@ def ai_table(table_name: str) -> Any:
     return get_client().schema("ai").table(table_name)
 
 
+def outcomes_table(table_name: str) -> Any:
+    """Access a table in the `outcomes` schema (redemption_tracker,
+    owner_checks, checker_runs, ecrv_sales — the outcome-capture system).
+    NOTE: requires `outcomes` in Supabase's exposed schemas (Settings → API)."""
+    return get_client().schema("outcomes").table(table_name)
+
+
 # ============================================================
 # CONNECTIVITY CHECK
 # ============================================================
@@ -140,5 +147,6 @@ __all__ = [
     "scoring_table",
     "access_table",
     "ai_table",
+    "outcomes_table",
     "ping_supabase",
 ]
