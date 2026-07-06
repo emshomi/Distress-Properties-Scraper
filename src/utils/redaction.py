@@ -61,13 +61,16 @@ def equity_band(value: Optional[float]) -> Optional[str]:
 def redemption_relative(state: Optional[str]) -> Optional[str]:
     """Map an exact redemption_state to a non-locating relative cue.
     'expiring_soon' -> 'ending_soon', 'in_redemption' -> 'active',
-    'expired' -> 'expired'. None -> None."""
+    'outcome_pending'/'expired' -> 'expired', 'resolved' -> 'resolved'.
+    None -> None."""
     if not state:
         return None
     return {
         "expiring_soon": "ending_soon",
         "in_redemption": "active",
         "expired": "expired",
+        "outcome_pending": "expired",
+        "resolved": "resolved",
     }.get(state, None)
 
 
@@ -123,7 +126,16 @@ _LOCATOR_FIELDS = (
 _DATE_FIELDS = ("sale_date", "sale_time", "redemption_ends_at", "registered_date")
 
 # Tier 3 — LEVERAGE fields (locked below PREMIUM).
-_LEVERAGE_FIELDS = ("owner_portfolio", "overlay")
+# The redemption OUTCOME group is the substance behind the tier table's
+# "outcomes" lever: what actually happened after the redemption window
+# (redeemed / REO / sold) and at what price. Premium-only by design; to
+# loosen resale price to Standard later, move it out of this tuple.
+_LEVERAGE_FIELDS = (
+    "owner_portfolio", "overlay",
+    "redemption_outcome", "redemption_outcome_label",
+    "redemption_outcome_ambiguous",
+    "redemption_resale_price", "redemption_resale_date",
+)
 
 
 def _lock(payload: dict[str, Any], field: str) -> None:
