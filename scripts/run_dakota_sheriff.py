@@ -20,6 +20,7 @@ import traceback
 
 # Import at top level so a missing env var / config error fails fast.
 from src.scrapers.dakota_sheriff import DakotaSheriffScraper
+from src.services import source_health_tracker
 from src.utils.logger import logger
 
 
@@ -39,6 +40,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[dakota-runner] fetch: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"fetch failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
 
     # --- Parse ---
@@ -48,6 +52,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[dakota-runner] parse: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"parse failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
 
     # --- Write ---
@@ -60,6 +67,9 @@ async def main() -> int:
     except Exception as e:
         print(f"[dakota-runner] write: FAILED — {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
+        source_health_tracker.record_failure(
+            scraper.source_name, notes=f"write failed: {type(e).__name__}: {e}"[:500]
+        )
         return 1
 
     if failed > 0:
@@ -67,9 +77,22 @@ async def main() -> int:
             f"[dakota-runner] completed with {failed} failed events — exit 1",
             flush=True,
         )
+        source_health_tracker.record_failure(
+            scraper.source_name,
+            notes=f"{failed} of {new + updated + failed} record writes failed",
+        )
         return 1
 
-    print("[dakota-runner] done.", flush=True)
+    # Clean run: record success. This is the call the standalone runners were
+    # missing -- without it, source_health froze at whenever the scraper last
+    # went through BaseScraper.run(), even though the daily Actions run works.
+    # record_success clears notes, so a prior stale failure note is cleared too.
+    source_health_tracker.record_success(scraper.source_name)
+    print(
+        f"[dakota-runner] done. (health: success recorded, "
+        f"new={new} updated={updated})",
+        flush=True,
+    )
     return 0
 
 
