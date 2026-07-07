@@ -207,6 +207,11 @@ class SummaryBody(BaseModel):
     its natural key (source, source_id) — the same key /properties uses."""
     source: str = Field(..., max_length=100)
     source_id: str = Field(..., max_length=200)
+    # Optional disambiguator: (source, source_id) is NOT unique for every
+    # source (dakota_sheriff reuses counters; mpls_vbr reuses page indexes;
+    # saint_paul_vacant has nulls). The frontend sends the row's parcel_id
+    # so the summary describes the property the user actually clicked.
+    parcel_id: Optional[str] = Field(default=None, max_length=200)
 
 
 @router.post(
@@ -238,13 +243,17 @@ async def ai_summary(
     from src.routes.properties import (
         _load_overlay_map,
         _load_owner_map,
+        _load_redemption_tracker_map,
         _shape_property_row,
     )
     from src.db.supabase_client import signals_table
 
-    # Fetch the single row by its natural key.
+    # Fetch the row. (source, source_id) alone is NOT unique for every
+    # source — narrow by parcel_id when the frontend provides it, order
+    # deterministically, and log when ambiguity remains (a wrong-property
+    # summary is an accuracy-critical failure).
     try:
-        result = (
+        query = (
             signals_table("distress_events")
             .select(
                 "source_id, source, parcel_id, event_type, event_date, "
@@ -253,10 +262,23 @@ async def ai_summary(
             )
             .eq("source", body.source)
             .eq("source_id", body.source_id)
-            .limit(1)
+        )
+        if body.parcel_id:
+            query = query.eq("parcel_id", body.parcel_id)
+        result = (
+            query.order("event_date", desc=True, nullsfirst=False)
+            .limit(2)
             .execute()
         )
         rows = result.data or []
+        if len(rows) > 1:
+            logger.warning(
+                "ai_summary: ambiguous (source, source_id) — summarizing "
+                "the most recent event",
+                source=body.source,
+                source_id=body.source_id,
+                parcel_id=body.parcel_id,
+            )
     except Exception as e:
         logger.exception(
             "ai_summary: property fetch failed",
@@ -278,7 +300,8 @@ async def ai_summary(
     # Shape it (attaches overlay + owner portfolio), then summarize.
     overlay_map = _load_overlay_map()
     owner_map = _load_owner_map()
-    shaped = _shape_property_row(rows[0], overlay_map, owner_map)
+    tracker_map = _load_redemption_tracker_map()
+    shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map)
     shaped.pop("_eff_key", None)
 
     summary = summarize_property(shaped)
