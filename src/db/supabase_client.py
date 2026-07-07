@@ -104,6 +104,13 @@ def ai_table(table_name: str) -> Any:
     return get_client().schema("ai").table(table_name)
 
 
+def scoring_table(table_name: str) -> Any:
+    """Access a table/materialized view in the `scoring` schema
+    (comp_ratios, distress_multipliers — the deal-math calibration,
+    refreshed weekly by pg_cron after the Monday eCRV load)."""
+    return get_client().schema("scoring").table(table_name)
+
+
 def outcomes_table(table_name: str) -> Any:
     """Access a table in the `outcomes` schema (redemption_tracker,
     owner_checks, checker_runs, ecrv_sales — the outcome-capture system).
@@ -148,5 +155,6 @@ __all__ = [
     "access_table",
     "ai_table",
     "outcomes_table",
+    "scoring_table",
     "ping_supabase",
 ]
