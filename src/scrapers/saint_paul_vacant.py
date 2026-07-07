@@ -123,15 +123,27 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         boarded, condemned, category_label = _category_to_flags(raw_category)
 
         # --- Registration date ---
-        registered_date_str = arcgis_date_to_date_only(
-            attributes.get("VACANT_AS_OF")
-        )
+        # VACANT_AS_OF arrives as a STRING like "05/02/2024" on this service
+        # (not ArcGIS epoch-ms). The old epoch-only parse returned None for
+        # every row, and the event projection then fabricated scrape-day
+        # dates — the root of the ~38x Saint Paul duplication. Handle both.
+        raw_vacant_as_of = attributes.get("VACANT_AS_OF")
         registered_date: date | None = None
+        registered_date_str = arcgis_date_to_date_only(raw_vacant_as_of)
         if registered_date_str:
             try:
                 registered_date = date.fromisoformat(registered_date_str)
             except ValueError:
                 registered_date = None
+        if registered_date is None and raw_vacant_as_of:
+            for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+                try:
+                    registered_date = datetime.strptime(
+                        str(raw_vacant_as_of).strip(), fmt
+                    ).date()
+                    break
+                except ValueError:
+                    continue
 
         # --- Build the signal ---
         # Field names match signals.vacant_registrations columns directly.
@@ -152,7 +164,10 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             },
             observed_at=datetime.now(timezone.utc),
             source=self.source_name,
-            registration_number=None,  # Saint Paul doesn't publish a per-record ID
+            # Saint Paul publishes no per-record ID; the PIN is the stable
+            # identity (one active registration per parcel). NULL source_ids
+            # left 14,592 rows with no usable key before 2026-07-07.
+            registration_number=pid,
             boarded=boarded,
             condemned=condemned,
         )
@@ -220,7 +235,10 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         # signals.vacant_registrations: source, boarded, condemned,
         # registration_number. They live in raw_data already (under _source)
         # and drive the unified event_type / severity via to_event().
-        _IN_MEMORY_ONLY = {"source", "boarded", "condemned", "registration_number"}
+        _IN_MEMORY_ONLY = {
+            "source", "boarded", "condemned", "registration_number",
+            "condemned_date",  # in-memory projection field (2026-07-07)
+        }
         signal_rows = []
         for sig in signals:
             row = sig.model_dump(mode="json", exclude_none=True)
