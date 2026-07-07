@@ -135,6 +135,9 @@ _LEVERAGE_FIELDS = (
     "redemption_outcome", "redemption_outcome_label",
     "redemption_outcome_ambiguous",
     "redemption_resale_price", "redemption_resale_date",
+    # Deal math (payoff floor / calibrated value / negotiation band) is the
+    # sharpest leverage on the platform — premium only.
+    "deal_math",
 )
 
 
