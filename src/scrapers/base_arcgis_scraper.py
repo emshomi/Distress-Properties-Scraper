@@ -113,6 +113,9 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
     # Specific fields to fetch. Default '*' = all fields.
     # Subclasses can narrow this if a service has dozens of irrelevant fields.
     out_fields: ClassVar[str] = "*"
+    # Name of the layer's object-id field (rename per scraper if the layer
+    # uses e.g. FID/ESRI_OID). Used by keyset pagination.
+    objectid_field: ClassVar[str] = "OBJECTID"
 
     # Records per HTTP request. ArcGIS services typically cap at 1000-2000.
     page_size: ClassVar[int] = _DEFAULT_PAGE_SIZE
@@ -165,8 +168,21 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
         client: httpx.AsyncClient,
         offset: int,
         page_size: int,
+        after_object_id: int | None = None,
     ) -> dict[str, Any]:
-        """Fetch one page of features from the ArcGIS service."""
+        """Fetch one page of features from the ArcGIS service.
+
+        Two paging modes:
+          * OFFSET (default, after_object_id=None): resultOffset paging —
+            fine for small result sets, but ArcGIS servers scan past all
+            skipped rows, so deep pages get LINEARLY SLOWER and eventually
+            time out (seen live: hennepin_parcels died at page ~224 of 448
+            after pages degraded from ~7s to ~21s each; 2026-07-07).
+          * KEYSET (after_object_id set): WHERE {oid} > after ORDER BY {oid}
+            — constant-time at any depth. The standard ArcGIS deep-paging
+            pattern. Large streaming loaders should use this. Pass
+            after_object_id=0 for the first page.
+        """
         if not self.feature_service_url:
             raise ParseError(
                 f"feature_service_url not configured for {self.source_name}",
@@ -175,14 +191,21 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
 
         url = f"{self.feature_service_url}/query"
         params: dict[str, Any] = {
-            "where": self.where_clause,
             "outFields": self.out_fields,
             "returnGeometry": str(self.return_geometry).lower(),
             "outSR": 4326,  # WGS84 lat/lng
-            "resultOffset": offset,
             "resultRecordCount": page_size,
             "f": "json",  # ArcGIS REST JSON format
         }
+        if after_object_id is not None:
+            oid = self.objectid_field
+            params["where"] = (
+                f"({self.where_clause}) AND {oid} > {int(after_object_id)}"
+            )
+            params["orderByFields"] = f"{oid} ASC"
+        else:
+            params["where"] = self.where_clause
+            params["resultOffset"] = offset
 
         try:
             response = await client.get(url, params=params)
