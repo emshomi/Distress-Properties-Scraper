@@ -138,6 +138,10 @@ _LEVERAGE_FIELDS = (
     # Deal math (payoff floor / calibrated value / negotiation band) is the
     # sharpest leverage on the platform — premium only.
     "deal_math",
+    # Vacancy cost estimates (cumulative VBR fees + PVE exposure) are the
+    # motivated-seller leverage for vacant properties — premium only.
+    # (vacancy_years itself stays visible: it derives from a public date.)
+    "vacancy_est_fees_paid", "vacancy_est_pve_exposure", "vacancy_cost_basis",
 )
 
 
