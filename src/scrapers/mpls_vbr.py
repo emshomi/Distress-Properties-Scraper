@@ -200,11 +200,13 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             },
             observed_at=datetime.now(timezone.utc),
             source=self.source_name,
-            registration_number=(
-                str(attributes.get("FID")) if attributes.get("FID") is not None else None
-            ),
+            # Stable identity: the parcel id (or the MPLS-VBR-{fid} synthetic
+            # when no APN exists). FID is a layer ROW INDEX — using it as
+            # source_id gave 12 ids shared across 480 duplicate rows.
+            registration_number=parcel_id,
             boarded=boarded,
             condemned=condemned,
+            condemned_date=con_date,
         )
 
     # ---- Write ----
@@ -270,7 +272,10 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             resolve_parcel(parcel_payload)
 
         # --- Step 2: Write typed signals.vacant_registrations rows ---
-        _IN_MEMORY_ONLY = {"source", "boarded", "condemned", "registration_number"}
+        _IN_MEMORY_ONLY = {
+            "source", "boarded", "condemned", "registration_number",
+            "condemned_date",  # in-memory projection field (2026-07-07)
+        }
         signal_rows = []
         for sig in signals:
             row = sig.model_dump(mode="json", exclude_none=True)
