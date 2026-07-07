@@ -194,6 +194,31 @@ def _build_facts(p: dict[str, Any]) -> list[str]:
                 "appraisal; the payoff floor reflects the foreclosing debt "
                 "only and other liens may apply",
             )
+
+    # Vacancy escalation clock (mpls_vbr / saint_paul_vacant rows).
+    vyears = p.get("vacancy_years")
+    if vyears is not None:
+        add("Years on vacant-building registry", f"{vyears} years")
+        if p.get("vacancy_pve_active"):
+            add(
+                "Enforcement status",
+                "past the 2-year VBR cap - subject to Prolonged Vacancy "
+                "Enforcement (monthly citations up to $2,000)",
+            )
+        fees = p.get("vacancy_est_fees_paid")
+        if fees is not None:
+            add("Estimated cumulative VBR fees", _money(fees))
+        pve = p.get("vacancy_est_pve_exposure")
+        if pve:
+            add("Estimated PVE citations to date", _money(pve))
+        if p.get("vacancy_cost_basis"):
+            add("Vacancy cost note", p.get("vacancy_cost_basis"))
+        add(
+            "Vacancy note",
+            "long registry tenure signals a motivated or absent owner; "
+            "describe the escalating carrying costs factually, never as "
+            "advice to the owner",
+        )
         add("Redemption ends", p.get("redemption_ends_at"))
         days = p.get("redemption_days_left")
         if isinstance(days, int) and days >= 0:
