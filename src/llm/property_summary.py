@@ -120,24 +120,58 @@ def _build_facts(p: dict[str, Any]) -> list[str]:
     add("Sale date", p.get("sale_date"))
     add("Registered/observed date", p.get("registered_date"))
 
-    # Redemption window (foreclosure rows)
+    # Redemption lifecycle (foreclosure rows). Resolved cases get the
+    # OUTCOME, never a countdown — narrating "days remaining" for a
+    # foreclosure that already ended is fabrication by staleness.
     rstate = p.get("redemption_state")
-    if rstate:
-        label = {
-            "in_redemption": "in redemption",
-            "expiring_soon": "redemption expiring soon",
-            "expired": "redemption period expired",
-        }.get(rstate, rstate)
-        add("Redemption status", label)
-    add("Redemption ends", p.get("redemption_ends_at"))
-    days = p.get("redemption_days_left")
-    if isinstance(days, int) and days >= 0:
-        add("Days left in redemption", str(days))
-    if p.get("redemption_is_estimated") is True:
+    if rstate == "resolved":
+        outcome_label = p.get("redemption_outcome_label")
         add(
-            "Redemption note",
-            "redemption date is estimated (sale + ~6 months), not county-published",
+            "Redemption status",
+            "RESOLVED — this foreclosure has concluded"
+            + (f": {outcome_label}" if outcome_label else ""),
         )
+        add("Redemption window ended", p.get("redemption_ends_at"))
+        price = p.get("redemption_resale_price")
+        if price is not None:
+            add("Confirmed sale price", _money(price) or str(price))
+        add("Confirmed sale date", p.get("redemption_resale_date"))
+        add(
+            "Outcome note",
+            "the outcome is confirmed from county records and state deed "
+            "filings — describe the property as resolved, not as an active "
+            "opportunity, and do NOT mention days remaining",
+        )
+    elif rstate == "outcome_pending":
+        add(
+            "Redemption status",
+            "redemption window has CLOSED; the final outcome (redeemed vs "
+            "foreclosed) is still being confirmed from county records",
+        )
+        add("Redemption window ended", p.get("redemption_ends_at"))
+        add(
+            "Outcome note",
+            "do NOT describe a countdown or days remaining — the window is "
+            "over; say the resolution is pending confirmation",
+        )
+    else:
+        if rstate:
+            label = {
+                "in_redemption": "in redemption",
+                "expiring_soon": "redemption expiring soon",
+                "expired": "redemption period expired",
+            }.get(rstate, rstate)
+            add("Redemption status", label)
+        add("Redemption ends", p.get("redemption_ends_at"))
+        days = p.get("redemption_days_left")
+        if isinstance(days, int) and days >= 0:
+            add("Days left in redemption", str(days))
+        if p.get("redemption_is_estimated") is True:
+            add(
+                "Redemption note",
+                "redemption date is estimated (sale + ~6 months), not "
+                "county-published",
+            )
 
     # Multi-signal overlay — the cross-reference that is govire's differentiator
     overlay = p.get("overlay") or {}
