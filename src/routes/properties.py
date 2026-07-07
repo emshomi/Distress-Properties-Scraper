@@ -1104,6 +1104,103 @@ def _load_deal_calibration() -> Optional[dict[str, Any]]:
     return data
 
 
+# ============================================================
+# VACANCY ESCALATION CLOCK (mpls_vbr / saint_paul_vacant)
+# ============================================================
+# Pure read-time date math on the TRUE registry/condemnation dates (real
+# since the 2026-07-07 repair — never trust stored countdowns, they go
+# stale; same lesson as the redemption clock).
+#
+# Fee model — Minneapolis ONLY, and explicitly estimated:
+#   * VBR annual fee $7,228.70 (2024+ schedule; applied at the current
+#     rate — historical rates differed, hence "estimated").
+#   * Prolonged Vacancy Enforcement: monthly citations up to $2,000 once
+#     a property passes the 2-year VBR cap. PVE began Dec 2024, so
+#     exposure accrues from max(2-year anniversary, 2024-12-01).
+# Saint Paul publishes no fee schedule in our sources -> time + Category
+# only, fees honestly null. Never invent a fee.
+
+from datetime import date as _date  # (re-imported later too; harmless)
+
+_VACANCY_SOURCES = {"mpls_vbr", "saint_paul_vacant"}
+_MPLS_VBR_ANNUAL_FEE = 7228.70
+_MPLS_PVE_MONTHLY = 2000.0
+_MPLS_PVE_PROGRAM_START = _date(2024, 12, 1)
+
+
+def _vacancy_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
+    """Compute the vacancy escalation clock for a row.
+
+    Returns all-null fields for non-vacancy sources or undated rows.
+    Fields:
+      vacancy_years        float, years since registration/condemnation (ALL tiers
+                           — derivable from the public date)
+      vacancy_pve_active   bool, Minneapolis 2-year cap passed (ALL tiers)
+      vacancy_est_fees_paid      PREMIUM — estimated cumulative VBR fees (MPLS only)
+      vacancy_est_pve_exposure   PREMIUM — estimated PVE citations to date (MPLS only)
+      vacancy_cost_basis         PREMIUM — one honest sentence on the estimate
+    """
+    null_result = {
+        "vacancy_years": None,
+        "vacancy_pve_active": None,
+        "vacancy_est_fees_paid": None,
+        "vacancy_est_pve_exposure": None,
+        "vacancy_cost_basis": None,
+    }
+    if source not in _VACANCY_SOURCES:
+        return null_result
+
+    anchor_date = _coerce_date(row.get("event_date"))
+    if anchor_date is None:
+        return null_result
+    today = _date.today()
+    days = (today - anchor_date).days
+    if days < 0:
+        return null_result
+    years = round(days / 365.25, 1)
+
+    if source == "saint_paul_vacant":
+        return {
+            "vacancy_years": years,
+            "vacancy_pve_active": None,   # PVE is a Minneapolis program
+            "vacancy_est_fees_paid": None,  # SP fee schedule not in our sources
+            "vacancy_est_pve_exposure": None,
+            "vacancy_cost_basis": None,
+        }
+
+    # Minneapolis
+    pve_active = years >= 2.0
+    est_fees = round(years * _MPLS_VBR_ANNUAL_FEE)
+    pve_exposure = None
+    if pve_active:
+        pve_start = max(
+            _date(anchor_date.year + 2, anchor_date.month, min(anchor_date.day, 28)),
+            _MPLS_PVE_PROGRAM_START,
+        )
+        pve_months = max(
+            0,
+            (today.year - pve_start.year) * 12 + (today.month - pve_start.month),
+        )
+        pve_exposure = round(pve_months * _MPLS_PVE_MONTHLY) if pve_months > 0 else 0
+    return {
+        "vacancy_years": years,
+        "vacancy_pve_active": pve_active,
+        "vacancy_est_fees_paid": est_fees,
+        "vacancy_est_pve_exposure": pve_exposure,
+        "vacancy_cost_basis": (
+            "Estimated at the current $7,228.70/yr VBR fee over %.1f years%s. "
+            "Actual billed amounts may differ - historical rates varied. "
+            "Not a statement of account." % (
+                years,
+                (
+                    "; PVE citations estimated at $2,000/month since the "
+                    "2-year cap (program began Dec 2024)"
+                ) if pve_active else "",
+            )
+        ),
+    }
+
+
 def _compute_deal_math(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Deal math for ONE shaped row, or None when it doesn't apply.
 
@@ -1457,6 +1554,10 @@ def _shape_property_row(
     shaped["deal_math"] = (
         _compute_deal_math(shaped) if tracker_map is not None else None
     )
+
+    # Vacancy escalation clock: pure date math on the true registry/
+    # condemnation date (fees Premium-gated in redaction).
+    shaped.update(_vacancy_fields(source, raw, row))
 
     overlay = None
     if overlay_map is not None and _eff_pid:
