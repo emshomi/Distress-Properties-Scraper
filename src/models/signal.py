@@ -78,7 +78,11 @@ class DistressEventInsert(BaseModel):
     parcel_id: str = Field(..., min_length=1, max_length=100)
     event_type: DistressEventType
     event_subtype: str | None = Field(default=None, max_length=100)
-    event_date: date
+    # Nullable by design: when a source doesn't publish the true event date,
+    # the honest value is NULL — NEVER the scrape date (fabricated dates
+    # inflated vacant counts ~30x before 2026-07-07; see BUILDLOG).
+    # Requires the NULLS NOT DISTINCT dedup index on distress_events.
+    event_date: date | None = None
     event_value: Decimal | None = None
     source: str = Field(..., min_length=1, max_length=100)
     source_id: str | None = Field(default=None, max_length=200)
@@ -236,6 +240,10 @@ class VbrListingInsert(BaseModel):
     registration_number: str | None = Field(default=None, max_length=100)
     boarded: bool = Field(default=False)
     condemned: bool = Field(default=False)
+    # In-memory only: the condemnation date (Minneapolis Day_of_CON). Used by
+    # to_event() so a condemned_building event carries the CONDEMNATION date,
+    # not the (often blank) registry date. Stripped before typed-table write.
+    condemned_date: date | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -255,11 +263,21 @@ class VbrListingInsert(BaseModel):
             label = self.registry_type or "registered"
             title = f"Vacant building registry: {label}"
 
+        # THE date rule: use the true date from the source — the condemnation
+        # date for condemned events, else the registry-entry date. If the
+        # source doesn't publish one, event_date is honestly NULL. The old
+        # `or self.observed_at.date()` fallback stamped scrape-day, which
+        # made every daily run a "new" event and inflated counts ~30x.
+        if event_type == "condemned_building":
+            true_date = self.condemned_date or self.date_entered_registry
+        else:
+            true_date = self.date_entered_registry
+
         return DistressEventInsert(
             parcel_id=self.parcel_id,
             event_type=event_type,
             event_subtype=self.registry_type,
-            event_date=self.date_entered_registry or self.observed_at.date(),
+            event_date=true_date,
             severity=severity,
             source=self.source,
             source_id=self.registration_number,
