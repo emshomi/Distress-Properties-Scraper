@@ -1,0 +1,63 @@
+name: Hennepin Parcels Loader
+# Manual + quarterly. The 448K-parcel Hennepin roll is the platform's
+# geographic backbone; assessor values/owners change slowly, so a quarterly
+# refresh keeps estimated_market_value and ownership current without
+# hammering the county endpoint. Manual trigger always available.
+#
+# HISTORY: loaded once on 2026-05-28 and never scheduled — the health digest
+# (correctly) flagged it 40 days stale on 2026-07-07. This workflow is the fix.
+on:
+  workflow_dispatch:
+  schedule:
+    # 13:00 UTC on the 4th of Mar/Jun/Sep/Dec — offset from the Washington
+    # loader (6th) and the monthly tax_forfeit (1st) so heavy jobs never overlap.
+    - cron: '0 13 4 3,6,9,12 *'
+jobs:
+  scrape:
+    name: Run Hennepin parcels loader
+    runs-on: ubuntu-latest
+    # ~448K records — the biggest load in the fleet. Generous timeout.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Hennepin parcels loader
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (not used by this loader, but config may require it) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable only Hennepin parcels, leave rest off ---
+          SCRAPER_WASHINGTON_PARCELS_ENABLED: 'false'
+          SCRAPER_WASHINGTON_SHERIFF_ENABLED: 'false'
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        run: |
+          python -m scripts.run_hennepin_parcels github_actions
