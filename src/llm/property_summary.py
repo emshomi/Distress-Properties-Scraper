@@ -92,7 +92,15 @@ def _build_facts(p: dict[str, Any]) -> list[str]:
     add("Status", p.get("status"))
 
     # Owner + portfolio context
-    add("Owner of record", p.get("owner"))
+    if p.get("redemption_state") == "resolved":
+        add(
+            "Current owner of record",
+            (p.get("owner") or "")
+            + " (post-resolution owner of record — likely the BUYER, not "
+            "the foreclosed owner; do not describe them as having redeemed)",
+        )
+    else:
+        add("Owner of record", p.get("owner"))
     portfolio = p.get("owner_portfolio") or {}
     if portfolio:
         otype = _OWNER_TYPE_LABEL.get(portfolio.get("owner_type"))
@@ -131,7 +139,7 @@ def _build_facts(p: dict[str, Any]) -> list[str]:
             "RESOLVED — this foreclosure has concluded"
             + (f": {outcome_label}" if outcome_label else ""),
         )
-        add("Redemption window ended", p.get("redemption_ends_at"))
+        add("Redemption window end date", p.get("redemption_ends_at"))
         price = p.get("redemption_resale_price")
         if price is not None:
             add("Confirmed sale price", _money(price) or str(price))
@@ -148,7 +156,7 @@ def _build_facts(p: dict[str, Any]) -> list[str]:
             "redemption window has CLOSED; the final outcome (redeemed vs "
             "foreclosed) is still being confirmed from county records",
         )
-        add("Redemption window ended", p.get("redemption_ends_at"))
+        add("Redemption window end date", p.get("redemption_ends_at"))
         add(
             "Outcome note",
             "do NOT describe a countdown or days remaining — the window is "
@@ -162,6 +170,30 @@ def _build_facts(p: dict[str, Any]) -> list[str]:
                 "expired": "redemption period expired",
             }.get(rstate, rstate)
             add("Redemption status", label)
+        # Deal math (open windows only; premium payloads). Every number
+        # arrives with its sample size — pass that honesty through.
+        dm = p.get("deal_math") or {}
+        if dm:
+            add("Payoff floor", _money(dm.get("payoff_floor")))
+            add(
+                "Estimated market value",
+                (_money(dm.get("est_market_value")) or "")
+                + f" (assessed value calibrated by {dm.get('ratio_n')} recent "
+                f"{dm.get('ratio_scope')} sales)",
+            )
+            add(
+                "Confirmed in-window sale band",
+                f"{_money(dm.get('inwindow_band_low'))} to "
+                f"{_money(dm.get('inwindow_band_high'))} "
+                f"(from {dm.get('inwindow_n')} confirmed sales during "
+                "redemption windows)",
+            )
+            add(
+                "Deal math note",
+                "these are calibrated estimates with sample sizes, not an "
+                "appraisal; the payoff floor reflects the foreclosing debt "
+                "only and other liens may apply",
+            )
         add("Redemption ends", p.get("redemption_ends_at"))
         days = p.get("redemption_days_left")
         if isinstance(days, int) and days >= 0:
