@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status as http_status
 
-from src.db.supabase_client import core_table, signals_table, outcomes_table
+from src.db.supabase_client import core_table, signals_table, outcomes_table, scoring_table
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
 from src.middleware.tier import TierResolved, TierContext
@@ -1036,6 +1036,138 @@ def _load_redemption_tracker_map() -> dict[str, dict[Any, dict[str, Any]]]:
 
 
 # ============================================================
+# DEAL MATH (scoring.comp_ratios + scoring.distress_multipliers)
+# ============================================================
+# The negotiation-math engine: for a foreclosure whose redemption window is
+# still OPEN, compute the payoff floor, the locally calibrated market value,
+# and the empirically observed in-window sale band — every number carrying
+# its sample size and scope, never a naked point prediction.
+#
+# Calibration sources (materialized views, refreshed Mondays by pg_cron):
+#   scoring.comp_ratios          — median sale/assessed ratio per city (12mo
+#                                  WARRNTY comps, outliers trimmed), with
+#                                  county and metro fallbacks
+#   scoring.distress_multipliers — what confirmed in-window sales
+#                                  (redeemed_by_owner) and REO resales
+#                                  (foreclosed_sold) actually closed at as a
+#                                  fraction of assessed value (p25/median/p75)
+#
+# The multipliers were measured against RAW assessed value, so the band is
+# raw_emv x quartiles (same basis); the local ratio calibrates the market-
+# value CONTEXT number. Loaded lazily with a 10-minute in-process cache —
+# graceful degrade: no calibration -> no deal_math (None), never a guess.
+
+import time as _time_mod
+
+_DEAL_CALIBRATION_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_DEAL_CALIBRATION_TTL_S = 600
+
+
+def _load_deal_calibration() -> Optional[dict[str, Any]]:
+    now = _time_mod.monotonic()
+    if (
+        _DEAL_CALIBRATION_CACHE["data"] is not None
+        and now - _DEAL_CALIBRATION_CACHE["at"] < _DEAL_CALIBRATION_TTL_S
+    ):
+        return _DEAL_CALIBRATION_CACHE["data"]
+    try:
+        ratio_rows = _fetch_all_rows_in_schema(
+            scoring_table, "comp_ratios", "scope, county_code, city_norm, n, ratio"
+        )
+        mult_rows = _fetch_all_rows_in_schema(
+            scoring_table, "distress_multipliers", "outcome, n, p25, median, p75"
+        )
+    except Exception as e:
+        logger.warning(
+            "deal calibration load failed (deal_math disabled this request)",
+            error_type=type(e).__name__,
+        )
+        return _DEAL_CALIBRATION_CACHE["data"]  # stale-if-error
+    if not ratio_rows or not mult_rows:
+        return None
+    city = {}
+    county = {}
+    metro = None
+    for r in ratio_rows:
+        if r["scope"] == "city":
+            city[(r["county_code"], r["city_norm"])] = r
+        elif r["scope"] == "county":
+            county[r["county_code"]] = r
+        elif r["scope"] == "metro":
+            metro = r
+    mult = {m["outcome"]: m for m in mult_rows}
+    if "redeemed_by_owner" not in mult:
+        return None
+    data = {"city": city, "county": county, "metro": metro, "mult": mult}
+    _DEAL_CALIBRATION_CACHE["data"] = data
+    _DEAL_CALIBRATION_CACHE["at"] = now
+    return data
+
+
+def _compute_deal_math(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Deal math for ONE shaped row, or None when it doesn't apply.
+
+    Applies only to foreclosure rows whose redemption window is OPEN
+    (in_redemption / expiring_soon) — a resolved or closed window has no
+    negotiation left; the outcome fields tell that story instead. Requires
+    both the debt amount and an assessed market value; missing either means
+    no math, never a fabricated side."""
+    if shaped.get("redemption_state") not in ("in_redemption", "expiring_soon"):
+        return None
+    amount = shaped.get("amount")
+    raw_emv = shaped.get("market_value")
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        return None
+    if not isinstance(raw_emv, (int, float)) or raw_emv <= 0:
+        return None
+
+    calib = _load_deal_calibration()
+    if calib is None:
+        return None
+
+    county_lower = (shaped.get("county") or "").lower()
+    city_norm = (shaped.get("city") or "").lower()
+    ratio_row = calib["city"].get((county_lower, city_norm))         or calib["county"].get(county_lower)         or calib["metro"]
+    if ratio_row is None:
+        return None
+    scope = "city" if (county_lower, city_norm) in calib["city"] else (
+        "county" if county_lower in calib["county"] else "metro"
+    )
+
+    inwin = calib["mult"]["redeemed_by_owner"]
+    reo = calib["mult"].get("foreclosed_sold")
+
+    est_market = round(raw_emv * float(ratio_row["ratio"]))
+    band_low = round(raw_emv * float(inwin["p25"]))
+    band_high = round(raw_emv * float(inwin["p75"]))
+    seller_net = round(raw_emv * float(inwin["median"]) - amount)
+    equity_spread = round(est_market - amount)
+
+    return {
+        "payoff_floor": round(amount),
+        "payoff_is_partial": True,  # foreclosing debt only; other liens may exist
+        "est_market_value": est_market,
+        "local_ratio": float(ratio_row["ratio"]),
+        "ratio_scope": scope,
+        "ratio_n": int(ratio_row["n"]),
+        "inwindow_band_low": band_low,
+        "inwindow_band_high": band_high,
+        "inwindow_n": int(inwin["n"]),
+        "seller_net_estimate": seller_net,
+        "equity_spread": equity_spread,
+        "reo_benchmark": round(raw_emv * float(reo["median"])) if reo else None,
+        "reo_n": int(reo["n"]) if reo else None,
+        "basis": (
+            "Assessed value calibrated by the median of %d recent %s-level "
+            "sales; band from %d confirmed in-window foreclosure sales "
+            "(25th-75th pct). Floor is the foreclosing debt only - other "
+            "liens may apply. Not an appraisal."
+            % (int(ratio_row["n"]), scope, int(inwin["n"]))
+        ),
+    }
+
+
+# ============================================================
 # REDEMPTION-WINDOW COMPUTATION
 # ============================================================
 # Minnesota sheriff sales carry a redemption period (typically 6 months)
@@ -1318,6 +1450,13 @@ def _shape_property_row(
     _eff_pid = _effective_parcel_id(source, raw, row)
     _county_lower = (_resolve_county(source, raw) or "").lower()
     shaped["_eff_key"] = (_county_lower, _eff_pid) if _eff_pid else None
+
+    # Deal math: only meaningful while the redemption window is open, and
+    # only when a tracker_map was supplied (list/detail paths) — computed
+    # from the fields already on the shaped row. Premium-gated in redaction.
+    shaped["deal_math"] = (
+        _compute_deal_math(shaped) if tracker_map is not None else None
+    )
 
     overlay = None
     if overlay_map is not None and _eff_pid:
@@ -2311,6 +2450,15 @@ async def list_properties(
 async def get_property(
     source: str,
     source_id: str,
+    parcel_id: Optional[str] = Query(
+        default=None,
+        max_length=200,
+        description=(
+            "Optional disambiguator: (source, source_id) is not unique for "
+            "every source (reused counters / page indexes / nulls). Pass the "
+            "row's parcel_id to guarantee the right property."
+        ),
+    ),
     _ctx: TierContext = TierResolved,
 ) -> dict[str, Any]:
     """Return the full record for one property identified by its
@@ -2321,10 +2469,23 @@ async def get_property(
             .select("*")
             .eq("source", source)
             .eq("source_id", source_id)
-            .limit(1)
+        )
+        if parcel_id:
+            result = result.eq("parcel_id", parcel_id)
+        result = (
+            result.order("event_date", desc=True, nullsfirst=False)
+            .limit(2)
             .execute()
         )
         rows = result.data or []
+        if len(rows) > 1:
+            logger.warning(
+                "get_property: ambiguous (source, source_id) — returning "
+                "the most recent event",
+                source=source,
+                source_id=source_id,
+                parcel_id=parcel_id,
+            )
         if not rows:
             raise HTTPException(
                 status_code=404,
