@@ -402,9 +402,13 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 timeout=settings.scraper_request_timeout_seconds,
                 headers={"User-Agent": "DistressProperties/1.0"},
             ) as client:
+                # KEYSET pagination (2026-07-07): WHERE OBJECTID > last
+                # ORDER BY OBJECTID — constant-time pages at any depth.
+                # The old offset paging degraded linearly on the county's
+                # server (~7s/page at the start, ~21s/page by page 220) and
+                # died with connection errors at page ~224 of 448.
+                last_oid = 0
                 for page in range(max_pages):
-                    offset = page * page_size
-
                     # Stop if record cap reached
                     if record_cap is not None and total_fetched >= record_cap:
                         break
@@ -414,15 +418,38 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                         remaining = record_cap - total_fetched
                         effective_page_size = min(page_size, remaining)
 
-                    # --- FETCH one page ---
+                    # --- FETCH one page (keyset) ---
                     data = await self._fetch_page(
-                        client, offset, effective_page_size
+                        client, 0, effective_page_size,
+                        after_object_id=last_oid,
                     )
                     features = data.get("features") or []
                     if not features:
                         break
 
                     total_fetched += len(features)
+
+                    # Advance the keyset cursor. Fail LOUD if the layer
+                    # stops returning the object id — silently reusing the
+                    # old cursor would loop on the same page forever.
+                    oid_field = self.objectid_field
+                    page_oids = [
+                        f.get("attributes", {}).get(oid_field)
+                        for f in features
+                    ]
+                    page_oids = [o for o in page_oids if isinstance(o, int)]
+                    if not page_oids:
+                        raise ParseError(
+                            f"keyset pagination: no {oid_field} values in "
+                            "page — cannot advance cursor",
+                            source=self.source_name,
+                        )
+                    new_last = max(page_oids)
+                    if new_last <= last_oid:
+                        # Cursor didn't move — server misbehaving; stop
+                        # rather than spin.
+                        break
+                    last_oid = new_last
 
                     # --- PARSE this page ---
                     page_signals: list[dict[str, Any]] = []
@@ -464,12 +491,10 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                             next_progress += self.progress_log_every
 
                     # --- Stop conditions ---
+                    # With keyset ordering, a short page is the definitive
+                    # end signal (exceededTransferLimit is an offset-paging
+                    # concept and no longer applies).
                     if len(features) < effective_page_size:
-                        break
-                    if (
-                        not data.get("exceededTransferLimit", False)
-                        and len(features) == 0
-                    ):
                         break
 
             # Determine final status
