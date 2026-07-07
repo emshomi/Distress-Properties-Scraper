@@ -38,7 +38,13 @@ ENV VARS (set as GitHub Actions repo secrets)
   ALERT_EMAIL_FROM             verified Resend sender (e.g. noreply@govire.com)
 
 Optional:
-  HEALTH_STALE_DAYS            days without success before "stale" (default 3)
+  HEALTH_STALE_DAYS            fallback days without success before "stale"
+                               (default 3). Per-source cadence OVERRIDES this:
+                               if audit.source_health.expected_interval_days is
+                               set for a row, its stale threshold is
+                               ceil(interval * 1.5), min 2 days — so a monthly
+                               scraper isn't nagged 27 days a month and a daily
+                               one is flagged within ~2 days. (2026-07-07)
 
 Exit code is always 0 on a completed run (a broken *scraper* is not a failure
 of this *alert*). It exits non-zero only if it cannot reach Supabase or Resend,
@@ -200,10 +206,22 @@ def _classify(row: dict, stale_days: int) -> tuple[str, str]:
     if lingering:
         return "check", f"healthy now, but carries a failure note: {notes[:90]}"
 
-    # Stale: succeeded, recovered, but not recently.
+    # Stale: succeeded, recovered, but not recently — judged against THIS
+    # source's expected cadence when known (daily scrapers within ~2 days,
+    # weekly within ~10, monthly within ~46, quarterly loads within ~138),
+    # falling back to the flat HEALTH_STALE_DAYS when no cadence is recorded.
+    interval = row.get("expected_interval_days")
+    if isinstance(interval, (int, float)) and interval > 0:
+        threshold = max(2.0, float(interval) * 1.5)
+        cadence_note = f"expected every {int(interval)}d"
+    else:
+        threshold = float(stale_days)
+        cadence_note = f"no cadence set; default {stale_days}d"
     age_days = (_now() - last_ok).total_seconds() / 86400.0
-    if age_days > stale_days:
-        return "stale", f"last success {age_days:.1f} days ago"
+    if age_days > threshold:
+        return "stale", (
+            f"last success {age_days:.1f} days ago ({cadence_note})"
+        )
 
     return "healthy", "ok"
 
@@ -253,7 +271,7 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
         lines.append("")
 
     if stale:
-        lines.append(f"STALE (no success in > {stale_days} days):")
+        lines.append("STALE (past its expected cadence):")
         for name, reason in stale:
             lines.append(f"  - {name}: {reason}")
         lines.append("")
