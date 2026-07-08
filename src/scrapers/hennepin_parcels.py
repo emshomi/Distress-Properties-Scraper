@@ -30,6 +30,9 @@ The streaming run still works fine for small test runs (max_records=100/5000).
 
 What it writes:
   - core.parcels rows + raw_data JSONB (all 80+ Hennepin attributes preserved)
+  - core.owners rows (owner projection, 2026-07-09): assessor
+    owner-of-record + mailing + absentee/out-of-state flags, upserted on
+    (parcel_id, source) so each quarterly run refreshes the owner set
 What it does NOT write:
   - signals.distress_events (parcel existence isn't a distress signal;
     distress mining happens later via raw_data queries)
@@ -37,6 +40,7 @@ What it does NOT write:
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -173,6 +177,128 @@ def _clean_raw_data(attributes: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+# ============================================================
+# OWNER PROJECTION (2026-07-09)
+# ============================================================
+# The Hennepin roll carries the county assessor's owner-of-record on
+# every feature (OWNER_NM / TAXPAYER_NM + TAXPAYER_NM_1..3 mailing
+# lines). This projection writes core.owners alongside core.parcels on
+# every quarterly run, keeping the 2026-07-09 backfill (443,603 owners)
+# permanently fresh. Classification uses the SAME vocabulary + patterns
+# as ramsey_parcels._classify_owner / signals.owner_distress_summary:
+# government / bank_lender / llc_business / individual.
+#
+# Hennepin mailing-line semantics (verified against live raw_data):
+# TAXPAYER_NM_1..3 are ADDRESS LINES, positional FROM THE END — the
+# last line matching "CITY ST 55435[-1234]" is city/state/zip; the line
+# immediately before it is the mailing street. When three lines exist,
+# line 1 is typically a C/O or second-name line. No CSZ line anywhere
+# -> honest NULL mailing (never guessed).
+#
+# is_absentee: unlike Ramsey (exact compare of two same-format county
+# fields), Hennepin's mailing line carries the unit ("#127") while the
+# composed site address never does — an exact compare would false-flag
+# every owner-occupied condo. Both sides are therefore normalized
+# (strip trailing unit token, collapse whitespace) before comparing.
+# Matches MIGRATION_hennepin_owners_2026-07-09.sql exactly.
+
+_OWNER_TYPE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("government", re.compile(
+        r"(SECRETARY OF|VETERANS AFFAIRS|\bHUD\b|HOUSING & URBAN|"
+        r"HOUSING AND URBAN|COUNTY OF|STATE OF MINNESOTA|CITY OF)")),
+    ("bank_lender", re.compile(
+        r"(BANK|MORTGAGE|\bMTGE\b|\bMTG\b|LENDING|FINANCIAL|"
+        r"CREDIT UNION|NATIONSTAR|FREDDIE|FANNIE|MIDFIRST|BANKUNITED|"
+        r"FEDERAL HOME LOAN|FEDERAL NAT|SERVBANK|CITIMORTGAGE)")),
+    ("bank_lender", re.compile(
+        r"(\bLOAN\b|NATIONAL ASSOC|\bNA\b|\bN A\b|\bN\.A\.|TRUSTEE)")),
+    ("llc_business", re.compile(
+        r"(\bLLC\b|L\.?L\.?C|\bINC\b|\bLTD\b|HOLDINGS|VENTURES|"
+        r"PROPERTIES|RENOVATION|REALTY|GROUP|COMPANY|\bCO\b)")),
+]
+_LENDER_TRUST = re.compile(
+    r"(MORTGAGE|\bMTG\b|\bLOAN\b|PARTIC|POINT|FUNDING|CAPITAL|MASTER|"
+    r"TITLE TRUST|TRUST [0-9])")
+_CSZ_RE = re.compile(r"^(?P<city>.*?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s*$")
+_UNIT_HASH_RE = re.compile(r"\s*#\s*\S+$")
+_UNIT_WORD_RE = re.compile(r"\s+(UNIT|APT|STE|SUITE)\s+\S+$")
+_MULTI_WS_RE = re.compile(r"\s+")
+
+
+def _classify_owner(name: str) -> str:
+    up = name.upper()
+    for otype, pat in _OWNER_TYPE_PATTERNS:
+        if pat.search(up):
+            return otype
+    if "TRUST" in up and _LENDER_TRUST.search(up):
+        return "bank_lender"
+    return "individual"
+
+
+def _norm_street(value: str | None) -> str | None:
+    """Normalize a street line for the absentee comparison: upper,
+    strip a trailing unit token (#127 / UNIT 4 / APT B / STE 200),
+    collapse whitespace. Mirrors the migration's mail_norm/site_norm."""
+    if not value:
+        return None
+    s = value.strip().upper()
+    s = _UNIT_HASH_RE.sub("", s)
+    s = _UNIT_WORD_RE.sub("", s)
+    s = _MULTI_WS_RE.sub(" ", s).strip()
+    return s or None
+
+
+def _build_owner_row(
+    parcel_id: str,
+    attrs: dict[str, Any],
+    site_address: str | None,
+    now_iso: str,
+) -> dict[str, Any] | None:
+    """Project one Hennepin feature's owner fields into a core.owners row.
+    Returns None when the source publishes no owner (honest absence)."""
+    owner_name = _safe_str(attrs.get("OWNER_NM")) or _safe_str(attrs.get("TAXPAYER_NM"))
+    if not owner_name:
+        return None
+    l1 = _safe_str(attrs.get("TAXPAYER_NM_1"))
+    l2 = _safe_str(attrs.get("TAXPAYER_NM_2"))
+    l3 = _safe_str(attrs.get("TAXPAYER_NM_3"))
+    m3 = _CSZ_RE.match(l3) if l3 else None
+    m2 = _CSZ_RE.match(l2) if l2 else None
+    if m3 is not None:
+        mailing_address, m = l2, m3
+    elif m2 is not None:
+        mailing_address, m = l1, m2
+    else:
+        mailing_address, m = None, None
+    mailing_city = m.group("city").strip() if m else None
+    mailing_state = m.group("state") if m else None
+    mailing_zip = m.group("zip") if m else None
+    mail_norm = _norm_street(mailing_address)
+    site_norm = _norm_street(site_address)
+    # Absentee: mailing differs from the property itself. NULL when
+    # either side is missing — unknown is unknown, never guessed.
+    is_absentee: bool | None = None
+    if mail_norm and site_norm:
+        is_absentee = mail_norm != site_norm
+    is_out_of_state: bool | None = (
+        (mailing_state != "MN") if mailing_state else None
+    )
+    return {
+        "parcel_id": parcel_id,
+        "owner_name": owner_name,
+        "owner_type": _classify_owner(owner_name),
+        "mailing_address": mailing_address,
+        "mailing_city": mailing_city,
+        "mailing_state": mailing_state,
+        "mailing_zip": mailing_zip,
+        "is_absentee": is_absentee,
+        "is_out_of_state": is_out_of_state,
+        "is_current": True,
+        "source": "hennepin_parcels",
+        "observed_at": now_iso,
+    }
+
+
 class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     """Hennepin County parcels — streaming foundation loader."""
 
@@ -255,6 +381,7 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         records_new = 0
         records_failed = 0
         batch: list[dict[str, Any]] = []
+        owner_batch: list[dict[str, Any]] = []
 
         for sig in signals:
             try:
@@ -288,16 +415,31 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             row["last_observed_at"] = now_iso
             batch.append(row)
 
+            # Owner projection: rides alongside, never blocks parcels.
+            owner_row = _build_owner_row(
+                sig["parcel_id"],
+                sig.get("raw_data") or {},
+                sig.get("address"),
+                now_iso,
+            )
+            if owner_row is not None:
+                owner_batch.append(owner_row)
+
             if len(batch) >= _DB_BATCH_SIZE:
                 n, f = self._upsert_batch(batch)
                 records_new += n
                 records_failed += f
                 batch = []
+            if len(owner_batch) >= _DB_BATCH_SIZE:
+                self._upsert_owner_batch(owner_batch)
+                owner_batch = []
 
         if batch:
             n, f = self._upsert_batch(batch)
             records_new += n
             records_failed += f
+        if owner_batch:
+            self._upsert_owner_batch(owner_batch)
 
         return records_new, 0, records_failed
 
@@ -320,6 +462,26 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 error=str(e)[:500],
             )
             return 0, len(batch)
+
+    def _upsert_owner_batch(self, batch: list[dict[str, Any]]) -> None:
+        """Upsert owner rows (one current owner per parcel per source).
+        Failures are logged but NEVER fail the run — owners are enrichment;
+        the parcel write is the source of truth for run status."""
+        if not batch:
+            return
+        try:
+            (
+                core_table("owners")
+                .upsert(batch, on_conflict="parcel_id,source")
+                .execute()
+            )
+        except Exception as e:
+            logger.warning(
+                "Owner batch upsert failed (parcels unaffected)",
+                source=self.source_name,
+                batch_size=len(batch),
+                error=str(e)[:500],
+            )
 
     # ---- STREAMING run() override ----
 
