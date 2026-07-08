@@ -241,6 +241,7 @@ async def ai_summary(
         })
 
     from src.routes.properties import (
+        _apply_assessor_owners,
         _load_overlay_map,
         _load_owner_map,
         _load_redemption_tracker_map,
@@ -302,6 +303,7 @@ async def ai_summary(
     owner_map = _load_owner_map()
     tracker_map = _load_redemption_tracker_map()
     shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map)
+    _apply_assessor_owners([shaped])
     shaped.pop("_eff_key", None)
 
     summary = summarize_property(shaped)
