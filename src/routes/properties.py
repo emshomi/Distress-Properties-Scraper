@@ -1228,6 +1228,16 @@ _VACANCY_SOURCES = {"mpls_vbr", "saint_paul_vacant"}
 _MPLS_VBR_ANNUAL_FEE = 7228.70
 _MPLS_PVE_MONTHLY = 2000.0
 _MPLS_PVE_PROGRAM_START = _date(2024, 12, 1)
+# Saint Paul DSI vacant-building fees — CATEGORY-BASED, confirmed from the
+# city's official program page/packet + the May 2025 council rate increase:
+#   Category I:  $2,705/yr
+#   Category II: $2,705 first year, then $5,410/yr
+#   Category III:$5,410/yr
+# Historical rates were lower ($2,127 -> $2,459 -> current), so estimates
+# are labeled "at current rates". Official packet: outstanding fees must
+# be paid before the property can be sold.
+_SP_CAT1_ANNUAL = 2705.0
+_SP_CAT23_ANNUAL = 5410.0
 
 
 def _vacancy_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
@@ -1262,12 +1272,40 @@ def _vacancy_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
     years = round(days / 365.25, 1)
 
     if source == "saint_paul_vacant":
+        # Category from the registry payload ("1"/"2"/"3"). No category ->
+        # no fee math (honest null); years still shown.
+        cat = str(
+            ((raw.get("attributes") or {}).get("VB_CATEGORY")) or ""
+        ).strip()
+        sp_fees: Optional[int] = None
+        sp_basis: Optional[str] = None
+        if cat == "1":
+            sp_fees = round(years * _SP_CAT1_ANNUAL)
+            rate_desc = "$2,705/yr (Category I)"
+        elif cat == "2":
+            sp_fees = round(
+                _SP_CAT1_ANNUAL + max(0.0, years - 1.0) * _SP_CAT23_ANNUAL
+            )
+            rate_desc = "$2,705 first year + $5,410/yr after (Category II)"
+        elif cat == "3":
+            sp_fees = round(years * _SP_CAT23_ANNUAL)
+            rate_desc = "$5,410/yr (Category III)"
+        else:
+            rate_desc = ""
+        if sp_fees is not None:
+            sp_basis = (
+                "Estimated at Saint Paul's current registration rates - "
+                "%s - over %.1f years. Historical rates were lower; actual "
+                "billed amounts may differ. Outstanding vacant-building "
+                "fees must be paid before the property can be sold. Not a "
+                "statement of account." % (rate_desc, years)
+            )
         return {
             "vacancy_years": years,
             "vacancy_pve_active": None,   # PVE is a Minneapolis program
-            "vacancy_est_fees_paid": None,  # SP fee schedule not in our sources
+            "vacancy_est_fees_paid": sp_fees,
             "vacancy_est_pve_exposure": None,
-            "vacancy_cost_basis": None,
+            "vacancy_cost_basis": sp_basis,
         }
 
     # Minneapolis
