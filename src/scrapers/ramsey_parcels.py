@@ -46,6 +46,7 @@ What it does NOT write:
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -196,6 +197,86 @@ def _clean_raw_data(attributes: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+# ============================================================
+# OWNER PROJECTION (2026-07-08)
+# ============================================================
+# The Ramsey roll carries the county assessor's owner-of-record on every
+# feature (OwnerName / TaxName1 + mailing + site address). This projection
+# writes core.owners alongside core.parcels on every weekly run, keeping
+# the 2026-07-08 backfill (163,880 owners) permanently fresh.
+# Classification uses the SAME vocabulary + patterns as
+# signals.owner_distress_summary: government / bank_lender /
+# llc_business / individual.
+
+_OWNER_TYPE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("government", re.compile(
+        r"(SECRETARY OF|VETERANS AFFAIRS|\bHUD\b|HOUSING & URBAN|"
+        r"HOUSING AND URBAN|COUNTY OF|STATE OF MINNESOTA|CITY OF)")),
+    ("bank_lender", re.compile(
+        r"(BANK|MORTGAGE|\bMTGE\b|\bMTG\b|LENDING|FINANCIAL|"
+        r"CREDIT UNION|NATIONSTAR|FREDDIE|FANNIE|MIDFIRST|BANKUNITED|"
+        r"FEDERAL HOME LOAN|FEDERAL NAT|SERVBANK|CITIMORTGAGE)")),
+    ("bank_lender", re.compile(
+        r"(\bLOAN\b|NATIONAL ASSOC|\bNA\b|\bN A\b|\bN\.A\.|TRUSTEE)")),
+    ("llc_business", re.compile(
+        r"(\bLLC\b|L\.?L\.?C|\bINC\b|\bLTD\b|HOLDINGS|VENTURES|"
+        r"PROPERTIES|RENOVATION|REALTY|GROUP|COMPANY|\bCO\b)")),
+]
+_LENDER_TRUST = re.compile(
+    r"(MORTGAGE|\bMTG\b|\bLOAN\b|PARTIC|POINT|FUNDING|CAPITAL|MASTER|"
+    r"TITLE TRUST|TRUST [0-9])")
+_CSZ_RE = re.compile(r"^(?P<city>.*?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s*$")
+
+
+def _classify_owner(name: str) -> str:
+    up = name.upper()
+    for otype, pat in _OWNER_TYPE_PATTERNS:
+        if pat.search(up):
+            return otype
+    if "TRUST" in up and _LENDER_TRUST.search(up):
+        return "bank_lender"
+    return "individual"
+
+
+def _build_owner_row(
+    parcel_id: str, attrs: dict[str, Any], now_iso: str
+) -> dict[str, Any] | None:
+    """Project one Ramsey feature's owner fields into a core.owners row.
+    Returns None when the source publishes no owner (honest absence)."""
+    owner_name = _safe_str(attrs.get("OwnerName")) or _safe_str(attrs.get("TaxName1"))
+    if not owner_name:
+        return None
+    mailing_address = _safe_str(attrs.get("OwnerAddress1"))
+    csz = _safe_str(attrs.get("OwnerCityStateZIP")) or ""
+    m = _CSZ_RE.match(csz)
+    mailing_city = m.group("city").strip() if m else None
+    mailing_state = m.group("state") if m else None
+    mailing_zip = m.group("zip") if m else None
+    site_address = _safe_str(attrs.get("SiteAddress"))
+    # Absentee: mailing differs from the property itself. NULL when either
+    # side is missing — unknown is unknown, never guessed.
+    is_absentee: bool | None = None
+    if mailing_address and site_address:
+        is_absentee = mailing_address.strip().upper() != site_address.strip().upper()
+    is_out_of_state: bool | None = (
+        (mailing_state != "MN") if mailing_state else None
+    )
+    return {
+        "parcel_id": parcel_id,
+        "owner_name": owner_name,
+        "owner_type": _classify_owner(owner_name),
+        "mailing_address": mailing_address,
+        "mailing_city": mailing_city,
+        "mailing_state": mailing_state,
+        "mailing_zip": mailing_zip,
+        "is_absentee": is_absentee,
+        "is_out_of_state": is_out_of_state,
+        "is_current": True,
+        "source": "ramsey_parcels",
+        "observed_at": now_iso,
+    }
+
+
 class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     """Ramsey County parcels — streaming foundation loader."""
 
@@ -291,6 +372,7 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         records_new = 0
         records_failed = 0
         batch: list[dict[str, Any]] = []
+        owner_batch: list[dict[str, Any]] = []
 
         for sig in signals:
             try:
@@ -324,16 +406,28 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             row["last_observed_at"] = now_iso
             batch.append(row)
 
+            # Owner projection: rides alongside, never blocks parcels.
+            owner_row = _build_owner_row(
+                sig["parcel_id"], sig.get("raw_data") or {}, now_iso
+            )
+            if owner_row is not None:
+                owner_batch.append(owner_row)
+
             if len(batch) >= _DB_BATCH_SIZE:
                 n, f = self._upsert_batch(batch)
                 records_new += n
                 records_failed += f
                 batch = []
+            if len(owner_batch) >= _DB_BATCH_SIZE:
+                self._upsert_owner_batch(owner_batch)
+                owner_batch = []
 
         if batch:
             n, f = self._upsert_batch(batch)
             records_new += n
             records_failed += f
+        if owner_batch:
+            self._upsert_owner_batch(owner_batch)
 
         return records_new, 0, records_failed
 
@@ -356,6 +450,26 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 error=str(e)[:500],
             )
             return 0, len(batch)
+
+    def _upsert_owner_batch(self, batch: list[dict[str, Any]]) -> None:
+        """Upsert owner rows (one current owner per parcel per source).
+        Failures are logged but NEVER fail the run — owners are enrichment;
+        the parcel write is the source of truth for run status."""
+        if not batch:
+            return
+        try:
+            (
+                core_table("owners")
+                .upsert(batch, on_conflict="parcel_id,source")
+                .execute()
+            )
+        except Exception as e:
+            logger.warning(
+                "Owner batch upsert failed (parcels unaffected)",
+                source=self.source_name,
+                batch_size=len(batch),
+                error=str(e)[:500],
+            )
 
     # ---- STREAMING run() override ----
 
