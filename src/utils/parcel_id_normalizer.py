@@ -28,12 +28,23 @@ def _normalize_hennepin(raw: str) -> str:
     """
     Hennepin: 13-digit PID. Source data may have dashes, dots, spaces.
 
+    LEADING-ZERO RECOVERY (2026-07-08): a 12-digit value is a 13-digit PID
+    with its leading zero dropped — the classic spreadsheet/shapefile
+    export defect (same class as the Dakota TAXPIN 12-vs-13 bridge).
+    Hennepin PIDs legitimately begin with 0 (section numbers 01-09), so a
+    12-digit input is unambiguous and is left-padded back to 13. Verified
+    empirically on the mpls_vbr snapshot: 117/118 padded APNs join real
+    assessor parcels in core.parcels.
+
     Examples:
         "01-029-24-13-0001" → "0102924130001"
         "0102924130001"     → "0102924130001"
         "01.029.24.13.0001" → "0102924130001"
+        "902924220131"      → "0902924220131"  (dropped leading zero)
     """
     cleaned = re.sub(r"[^0-9]", "", raw)
+    if len(cleaned) == 12:
+        cleaned = cleaned.zfill(13)
     if len(cleaned) != 13:
         raise ValueError(
             f"Hennepin PID must be 13 digits after normalization; got {len(cleaned)} from {raw!r}"
