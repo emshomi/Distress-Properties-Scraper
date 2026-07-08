@@ -145,9 +145,12 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
 
         # --- Parcel ID ---
         # Prefer the real Hennepin PID from APN_Txt so these link to the
-        # 448K Hennepin parcels we already loaded. If the APN is missing or
-        # not a valid 13-digit Hennepin PID, synthesize a stable id from the
-        # source OID so the record is still loadable and dedupes cleanly.
+        # 448K Hennepin parcels we already loaded. The normalizer recovers
+        # 12-digit APNs (dropped leading zero — 2026-07-08 fix), which
+        # covers 117 of the 118 rows that previously fell through. If the
+        # APN is missing or still not a valid Hennepin PID, synthesize a
+        # stable id from the source OID so the record is still loadable
+        # and dedupes cleanly.
         parcel_id: str | None = None
         raw_apn = attributes.get("APN_Txt")
         if raw_apn and str(raw_apn).strip():
@@ -252,7 +255,14 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                 lng_f = None
 
             address = raw_attributes.get("Address")
-            zip_code = raw_attributes.get("Zip")
+            # NOTE (2026-07-08): do NOT write Zip from this feed. In the
+            # VBR_MPLS snapshot the Zip/City/State attribute fields are the
+            # OWNER's mailing address, not the property's (e.g. Atlanta GA
+            # 30312 on a Logan Ave N property). resolve_parcel's fill-in
+            # semantics meant this only polluted parcels THIS scraper
+            # created; the assessor layer (hennepin_parcels) is the
+            # authority for property zips. Owner mailing data is preserved
+            # in raw_data.owner_address.
 
             unique_parcels[sig.parcel_id] = ParcelUpsert(
                 parcel_id=sig.parcel_id,
@@ -260,7 +270,6 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                 state="MN",
                 address=str(address).strip() if address else None,
                 city="Minneapolis",
-                zip=str(zip_code).strip() if zip_code else None,
                 lat=lat_f,
                 lng=lng_f,
                 vacancy_status="vacant",
