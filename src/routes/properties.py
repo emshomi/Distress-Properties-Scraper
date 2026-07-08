@@ -1063,6 +1063,72 @@ _DEAL_CALIBRATION_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
 _DEAL_CALIBRATION_TTL_S = 600
 
 
+# ============================================================
+# ASSESSOR OWNERS (core.owners — backfilled 2026-07-08, 163,880 Ramsey
+# owners from the county assessor roll; kept fresh by the weekly
+# ramsey_parcels run)
+# ============================================================
+# Some sources publish no owner (Saint Paul DSI most notably: all 384
+# vacant buildings showed em-dash). When a shaped row lacks an owner but
+# its parcel exists in core.owners, patch in the ASSESSOR owner-of-record
+# + mailing address. Applied BEFORE redaction, so the existing tier rules
+# (owner locked below basic+, mailing below standard+) govern it
+# automatically. Honest sourcing: this is the county assessor's
+# owner-of-record, same provenance as every other owner on the platform.
+
+def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
+    """Fill owner/owner_mailing on shaped rows from core.owners, in ONE
+    batched fetch. No-ops on failure (rows keep their honest em-dash)."""
+    need: dict[str, list[dict[str, Any]]] = {}
+    for s in shaped_rows:
+        if s.get("owner"):
+            continue
+        pid = s.get("parcel_id")
+        if not pid:
+            continue
+        need.setdefault(pid, []).append(s)
+    if not need:
+        return
+    try:
+        result = (
+            core_table("owners")
+            .select(
+                "parcel_id, owner_name, owner_type, mailing_address, "
+                "mailing_city, mailing_state, mailing_zip, is_absentee"
+            )
+            .in_("parcel_id", list(need.keys()))
+            .eq("is_current", True)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.warning(
+            "assessor owner patch failed (rows keep em-dash)",
+            error_type=type(e).__name__,
+        )
+        return
+    for o in rows:
+        pid = o.get("parcel_id")
+        name = o.get("owner_name")
+        if not pid or not name:
+            continue
+        mailing_bits = [
+            o.get("mailing_address"),
+            " ".join(
+                b for b in [
+                    o.get("mailing_city"),
+                    o.get("mailing_state"),
+                    o.get("mailing_zip"),
+                ] if b
+            ) or None,
+        ]
+        mailing = ", ".join(b for b in mailing_bits if b) or None
+        for s in need.get(pid, []):
+            s["owner"] = name
+            if not s.get("owner_mailing"):
+                s["owner_mailing"] = mailing
+
+
 def _load_deal_calibration() -> Optional[dict[str, Any]]:
     now = _time_mod.monotonic()
     if (
@@ -2439,6 +2505,7 @@ async def list_properties(
                 _shape_property_row(r, overlay_map, owner_map, tracker_map)
                 for r in rows
             ]
+            _apply_assessor_owners(shaped)
 
             
 
@@ -2512,13 +2579,15 @@ async def list_properties(
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         tracker_map = _load_redemption_tracker_map()
+        _shaped_page = [
+            _shape_property_row(r, overlay_map, owner_map, tracker_map)
+            for r in rows
+        ]
+        _apply_assessor_owners(_shaped_page)
         return success_envelope({
             "properties": [
-                redact_property(
-                    _shape_property_row(r, overlay_map, owner_map, tracker_map),
-                    tier=_ctx.tier,
-                )
-                for r in rows
+                redact_property(s, tier=_ctx.tier)
+                for s in _shaped_page
             ],
             "total": total,
             "limit": limit,
@@ -2597,6 +2666,7 @@ async def get_property(
         owner_map = _load_owner_map()
         tracker_map = _load_redemption_tracker_map()
         shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map)
+        _apply_assessor_owners([shaped])
         shaped["raw"] = rows[0].get("raw_data") or {}
 
         # Attach enriched property characteristics from core.parcels, keyed by
