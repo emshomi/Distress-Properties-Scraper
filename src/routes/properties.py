@@ -1077,8 +1077,44 @@ _DEAL_CALIBRATION_TTL_S = 600
 # owner-of-record, same provenance as every other owner on the platform.
 
 def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
-    """Fill owner/owner_mailing on shaped rows from core.owners, in ONE
-    batched fetch. No-ops on failure (rows keep their honest em-dash)."""
+    """Fill owner/owner_mailing (from core.owners) AND market_value (from
+    core.parcels.estimated_market_value) on shaped rows whose SOURCE
+    published none — batched fetches, strictly additive, never overwrites
+    a source-published value. No-ops on failure (honest em-dash stays).
+
+    2026-07-08: values half added — the vacant tab (SP DSI publishes no
+    values) gains est. market value the same way it gained owners."""
+    # ---- Market values from the parcel foundation ----
+    val_need: dict[str, list[dict[str, Any]]] = {}
+    for s in shaped_rows:
+        mv = s.get("market_value")
+        if isinstance(mv, (int, float)) and mv > 0:
+            continue
+        pid = s.get("parcel_id")
+        if not pid:
+            continue
+        val_need.setdefault(pid, []).append(s)
+    if val_need:
+        try:
+            vres = (
+                core_table("parcels")
+                .select("parcel_id, estimated_market_value")
+                .in_("parcel_id", list(val_need.keys()))
+                .execute()
+            )
+            for p in (vres.data or []):
+                emv = p.get("estimated_market_value")
+                if not isinstance(emv, (int, float)) or emv <= 0:
+                    continue
+                for s in val_need.get(p.get("parcel_id"), []):
+                    s["market_value"] = float(emv)
+        except Exception as e:
+            logger.warning(
+                "assessor value patch failed (rows keep em-dash)",
+                error_type=type(e).__name__,
+            )
+
+    # ---- Owners ----
     need: dict[str, list[dict[str, Any]]] = {}
     for s in shaped_rows:
         if s.get("owner"):
