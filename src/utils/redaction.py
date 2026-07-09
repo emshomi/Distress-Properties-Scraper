@@ -381,6 +381,9 @@ def gate_filters_for_tier(tier: str, params: dict[str, Any]) -> dict[str, Any]:
         "price_min", "price_max",
         "sale_date_from", "sale_date_to",
         "redemption",
+        # Owner filters (2026-07-09): hunting by the current owner's
+        # classification / absentee status — premium leverage.
+        "owner_type", "absentee",
     )
     for k in _GATED_FILTER_KEYS:
         if k in gated:
