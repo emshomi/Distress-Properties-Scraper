@@ -1088,18 +1088,33 @@ _DEAL_CALIBRATION_TTL_S = 600
 # owner-of-record, same provenance as every other owner on the platform.
 
 def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
-    """Fill owner/owner_mailing (from core.owners) AND market_value (from
-    core.parcels.estimated_market_value) on shaped rows whose SOURCE
-    published none — batched fetches, strictly additive, never overwrites
-    a source-published value. No-ops on failure (honest em-dash stays).
+    """Fill owner/owner_mailing (from core.owners) AND parcel foundation
+    fields (from core.parcels) on shaped rows whose SOURCE published
+    none — batched fetches, strictly additive, never overwrites a
+    source-published value. No-ops on failure (honest em-dash stays).
 
     2026-07-08: values half added — the vacant tab (SP DSI publishes no
-    values) gains est. market value the same way it gained owners."""
-    # ---- Market values from the parcel foundation ----
+    values) gains est. market value the same way it gained owners.
+    2026-07-09: forfeit-land surfacing — the same single parcels query
+    now also fills lat/lng, lot_sqft, and the assessor's property-type
+    name (PR_TYP_NM1), so unaddressed forfeit land can render as
+    "a 2.4-acre vacant-land dot on the map" instead of "ADDRESS
+    UNASSIGNED / $0". Generic: vacant + foreclosure rows inherit map
+    data for free. Tier safety: lat/lng were already _LOCATOR_FIELDS;
+    lot_sqft/property_type_name added to redaction (STANDARD+)."""
+    # ---- Parcel foundation: values, coords, lot size, type name ----
+    def _missing_mv(s: dict[str, Any]) -> bool:
+        mv = s.get("market_value")
+        return not (isinstance(mv, (int, float)) and mv > 0)
+
+    def _missing_coords(s: dict[str, Any]) -> bool:
+        return s.get("lat") is None or s.get("lng") is None
+
     val_need: dict[str, list[dict[str, Any]]] = {}
     for s in shaped_rows:
-        mv = s.get("market_value")
-        if isinstance(mv, (int, float)) and mv > 0:
+        if not (_missing_mv(s) or _missing_coords(s)
+                or s.get("lot_sqft") is None
+                or s.get("property_type_name") is None):
             continue
         pid = s.get("parcel_id")
         if not pid:
@@ -1109,19 +1124,31 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
         try:
             vres = (
                 core_table("parcels")
-                .select("parcel_id, estimated_market_value")
+                .select(
+                    "parcel_id, estimated_market_value, lat, lng, "
+                    "lot_sqft, prop_type_name:raw_data->>PR_TYP_NM1"
+                )
                 .in_("parcel_id", list(val_need.keys()))
                 .execute()
             )
             for p in (vres.data or []):
                 emv = p.get("estimated_market_value")
-                if not isinstance(emv, (int, float)) or emv <= 0:
-                    continue
+                plat, plng = p.get("lat"), p.get("lng")
+                plot = p.get("lot_sqft")
+                ptype = (p.get("prop_type_name") or "").strip() or None
                 for s in val_need.get(p.get("parcel_id"), []):
-                    s["market_value"] = float(emv)
+                    if _missing_mv(s) and isinstance(emv, (int, float)) and emv > 0:
+                        s["market_value"] = float(emv)
+                    if _missing_coords(s) and plat is not None and plng is not None:
+                        s["lat"] = plat
+                        s["lng"] = plng
+                    if s.get("lot_sqft") is None and isinstance(plot, (int, float)) and plot > 0:
+                        s["lot_sqft"] = plot
+                    if s.get("property_type_name") is None and ptype:
+                        s["property_type_name"] = ptype
         except Exception as e:
             logger.warning(
-                "assessor value patch failed (rows keep em-dash)",
+                "assessor parcel patch failed (rows keep em-dash)",
                 error_type=type(e).__name__,
             )
 
