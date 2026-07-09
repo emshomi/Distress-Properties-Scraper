@@ -57,6 +57,7 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
     "tax_forfeit": [
         {"source": "hennepin_tax_roll", "event_type": "tax_forfeit"},
         {"source": "ramsey_tax_roll", "event_type": "tax_forfeit"},
+        {"source": "ramsey_tfl"},
         {"source": "mn_dor_red_book"},
     ],
     "vacant": [
@@ -89,6 +90,7 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     "saint_paul_dsi": "Ramsey",
     "hennepin_tax_roll": "Hennepin",
     "ramsey_tax_roll": "Ramsey",
+    "ramsey_tfl": "Ramsey",
     "mn_dor_red_book": "Statewide",
 }
 
@@ -685,6 +687,50 @@ def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+def _extract_ramsey_tfl(raw: dict, row: dict) -> dict[str, Any]:
+    """ramsey_tfl — county tax-forfeited land auction/OTC lists. raw_data
+    is flat (written by the scraper 2026-07-09). The county's APPRAISED
+    value (the minimum bid) is surfaced as `amount`; market_value stays
+    None so the assessor patch fills the EMV — showing both lets a buyer
+    see minimum bid vs assessed worth side by side. Status carries the
+    sale channel (auction list vs available over the counter)."""
+    appraised = raw.get("appraised_value")
+    try:
+        appraised_f = float(appraised) if appraised is not None else None
+    except (TypeError, ValueError):
+        appraised_f = None
+    status = (
+        "Available over the counter"
+        if raw.get("sale_status") == "otc_available"
+        else "On auction list"
+    )
+    return {
+        "address": raw.get("property_address"),
+        "city": raw.get("property_city"),
+        "zip": None,
+        "owner": None,  # forfeited: assessor patch fills the state/county owner
+        "sale_date": None,
+        "sale_time": None,
+        "amount": appraised_f,
+        "status": status,
+        "tax_parcel_no": row.get("parcel_id"),
+        "original_principal": None,
+        "municipality": raw.get("property_city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": raw.get("list_date"),
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": raw.get("property_type"),
+        "ward": None,
+        "owner_mailing": None,
+        "is_absentee": None,
+        "annual_tax": None,
+        "special_assessment_due": None,
+    }
+
+
 _EXTRACTORS: dict[str, Any] = {
     "anoka_sheriff": _extract_anoka,
     "hennepin_sheriff": _extract_hennepin_sheriff,
@@ -696,6 +742,7 @@ _EXTRACTORS: dict[str, Any] = {
     "saint_paul_dsi": _extract_saint_paul_vacant,
     "hennepin_tax_roll": _extract_hennepin_tax,
     "ramsey_tax_roll": _extract_hennepin_tax,
+    "ramsey_tfl": _extract_ramsey_tfl,
 }
 
 # ============================================================
