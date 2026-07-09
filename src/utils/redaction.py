@@ -125,6 +125,14 @@ _LOCATOR_FIELDS = (
 # Tier 2 — exact dates are locators too (locked below STANDARD).
 _DATE_FIELDS = ("sale_date", "sale_time", "redemption_ends_at", "registered_date")
 
+# Tier 2 — parcel attributes patched from core.parcels (2026-07-09:
+# forfeit-land surfacing — lot size + property-type name). Not strictly
+# locators, but the enrichment policy in redact_detail_extras already
+# treats fine-grained parcel attributes as STANDARD+ ("aids
+# locating/valuation"), so these follow the same line. lat/lng are NOT
+# here — they were already in _LOCATOR_FIELDS.
+_PARCEL_ATTR_FIELDS = ("lot_sqft", "property_type_name")
+
 # Tier 3 — LEVERAGE fields (locked below PREMIUM).
 # The redemption OUTCOME group is the substance behind the tier table's
 # "outcomes" lever: what actually happened after the redemption window
@@ -203,6 +211,8 @@ def redact_property(
         for f in _LOCATOR_FIELDS:
             _lock(p, f)
         for f in _DATE_FIELDS:
+            _lock(p, f)
+        for f in _PARCEL_ATTR_FIELDS:
             _lock(p, f)
         # Exact redemption day-count is a near-locator; keep only the relative
         # cue and the state, drop the precise countdown.
