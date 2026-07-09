@@ -1,0 +1,66 @@
+name: Ramsey TFL Scraper
+# Manual + weekly. Ramsey publishes tax-forfeited land in sale cycles: an
+# auction list per cycle (e.g. Spring 2026, list dated March 13) and an
+# over-the-counter "immediate purchase" list that fills after auctions and
+# empties between cycles. Weekly polling catches new cycles and OTC changes
+# without hammering the county site; an EMPTY result between cycles is
+# honest state (exit 0), not a failure.
+on:
+  workflow_dispatch:
+  schedule:
+    # Tuesdays 14:00 UTC = 8am Central (standard) / 9am (DST).
+    # Offset from the daily sheriff jobs (12:00-12:20 UTC) and the monthly
+    # Ramsey tax job (1st, 13:30 UTC) so nothing overlaps.
+    - cron: '0 14 * * 2'
+jobs:
+  scrape:
+    name: Run Ramsey TFL (auction + OTC lists)
+    runs-on: ubuntu-latest
+    # Two-to-four small HTML pages via httpx; stdlib parsing, no Playwright.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Ramsey TFL scraper
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable ONLY this job ---
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_RAMSEY_TFL_ENABLED: 'true'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        run: |
+          python -m scripts.run_ramsey_tfl github_actions
