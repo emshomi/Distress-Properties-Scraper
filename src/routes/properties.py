@@ -298,13 +298,24 @@ def _extract_dakota(raw: dict, row: dict) -> dict[str, Any]:
 
 
 def _extract_mpls_vbr(raw: dict, row: dict) -> dict[str, Any]:
-    """mpls_vbr — VBR_MPLS feature service: attributes + top-level owner_name."""
+    """mpls_vbr — VBR_MPLS feature service: attributes + top-level owner_name.
+
+    2026-07-09 (owner freshness): the feed is a 2023 snapshot
+    (raw_data._data_vintage) and its owner_name is stale — 129 of 187
+    numeric-PIN rows differ from the CURRENT assessor owner. Owner is
+    deliberately left None here so _apply_assessor_owners() fills the
+    current owner-of-record (same mechanism that fixed Saint Paul); the
+    2023 owner stays in raw_data as provenance. Likewise the feed's
+    City/State/Zip attributes are the OWNER's mailing address, not the
+    property's (Atlanta GA on a Logan Ave N row) — every property in
+    this registry is in Minneapolis, so city/municipality are fixed and
+    zip is an honest None (assessor value patch does not cover zip)."""
     attrs = raw.get("attributes") or {}
     return {
         "address": attrs.get("Address"),
-        "city": attrs.get("City"),
-        "zip": attrs.get("Zip"),
-        "owner": raw.get("owner_name") or attrs.get("Property_O"),
+        "city": "Minneapolis",
+        "zip": None,
+        "owner": None,
         "sale_date": None,
         "sale_time": None,
         # event_value here is the VBR annual fee, not a sale price.
@@ -312,7 +323,7 @@ def _extract_mpls_vbr(raw: dict, row: dict) -> dict[str, Any]:
         "status": attrs.get("Property_s"),
         "tax_parcel_no": attrs.get("APN_Txt"),
         "original_principal": None,
-        "municipality": attrs.get("City"),
+        "municipality": "Minneapolis",
         "lat": attrs.get("Latitude"),
         "lng": attrs.get("Longitude"),
         "neighborhood": raw.get("neighborhood"),
