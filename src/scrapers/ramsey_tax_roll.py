@@ -112,10 +112,14 @@ _RESIDENTIAL_LAND_USE_CODES: frozenset[str] = frozenset({
 })
 _LAND_USE_FIELD = "LandUseCode"
 
-# Stable event_date. The assessment signal has no natural date in the parcel
-# data, and event_date is part of the dedup key, so it MUST be constant across
-# runs for re-mining to be idempotent. A fixed sentinel guarantees that.
-_ASSESSMENT_SENTINEL_DATE = date(2000, 1, 1)
+# HONEST NULL event_date (2026-07-09). The assessment signal has no natural
+# date in the parcel data — the roll says THAT an assessment is due, not
+# WHEN it was levied. The old 2000-01-01 sentinel existed only because
+# event_date is in the dedup key and NULL used to break re-mining
+# idempotency; since the 2026-07-07 index fix the key is NULLS NOT
+# DISTINCT, so NULL dedups exactly like a constant. Unknown is NULL,
+# never a fabricated date. (Existing sentinel rows converted by
+#  MIGRATION_tax_roll_honest_null_dates_2026-07-09.sql.)
 
 # Read paging. We page the full Ramsey parcel set (~163,880) and filter in
 # Python, because Ramsey raw_data has no JSON index to filter server-side.
@@ -310,10 +314,10 @@ class RamseyTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 parcel_id=parcel_id,
                 event_type="tax_assessment",
                 event_subtype="special_assessment_burden",
-                # Stable sentinel — the assessment has no date in the parcel
-                # data, and event_date is part of the dedup key, so it must be
-                # constant across runs for re-mining to be idempotent.
-                event_date=_ASSESSMENT_SENTINEL_DATE,
+                # Honest NULL — the roll carries no assessment date. Dedup
+                # key is NULLS NOT DISTINCT (2026-07-07), so re-mining
+                # stays idempotent.
+                event_date=None,
                 event_value=assessment,
                 source=self.source_name,
                 source_id=parcel_id,
