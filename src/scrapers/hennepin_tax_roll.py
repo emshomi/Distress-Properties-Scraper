@@ -94,10 +94,14 @@ _TAXPAYER_NAME_FIELD = "TAXPAYER_NM"
 # pretending there's an address.
 _ADDR_UNASSIGNED = "ADDRESS UNASSIGNED"
 
-# Stable event_date for forfeit rows (no date in the parcel data). The dedup
-# key includes event_date, so this MUST be constant across runs or re-mining
-# would insert duplicates every time. A fixed sentinel guarantees idempotency.
-_FORFEIT_SENTINEL_DATE = date(2000, 1, 1)
+# HONEST NULL event_date for forfeit rows (2026-07-09). Forfeiture has no
+# date in the parcel data — the county flag says THAT it forfeited, not
+# WHEN. The old 2000-01-01 sentinel existed only because event_date is in
+# the dedup key and NULL used to break re-mining idempotency; since the
+# 2026-07-07 index fix the key is NULLS NOT DISTINCT, so NULL dedups
+# exactly like a constant. Unknown is NULL, never a fabricated date.
+# (Existing sentinel rows converted by
+#  MIGRATION_tax_roll_honest_null_dates_2026-07-09.sql.)
 
 # Read paging. We pull the union of (forfeited OR has delinquency year),
 # which is ~4,251 of 448K — small, but page defensively.
@@ -138,18 +142,24 @@ def _safe_decimal(value: Any) -> Decimal | None:
 
 
 def _expand_delq_year(raw_yr: str | None) -> int | None:
-    """Convert Hennepin's 2-digit delinquency year ('25') to 2025.
+    """Convert Hennepin's 2-digit delinquency year ('25') to a full year.
 
-    All observed values are recent 2-digit years. We map '00'-'99' to
-    2000-2099, which is correct for the delinquency horizon this data covers.
-    """
+    Century pivot (2026-07-09): map '00'-'99' to 20xx, EXCEPT that a
+    delinquency cannot begin in the future — a 2-digit year that would
+    land past the current year is a 19xx year ('84' = 1984, a parcel
+    delinquent for decades, not one delinquent in 2084). Live data
+    disproved the earlier "all observed values are recent" assumption:
+    one '84' row existed, dated 2084 and mis-scored low severity."""
     s = _safe_str(raw_yr)
     if s is None:
         return None
     digits = s.zfill(2)[-2:]
     if not digits.isdigit():
         return None
-    return 2000 + int(digits)
+    year = 2000 + int(digits)
+    if year > date.today().year:
+        year -= 100
+    return year
 
 
 def _compose_property_address(raw: dict[str, Any]) -> str | None:
@@ -344,10 +354,10 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     parcel_id=parcel_id,
                     event_type="tax_forfeit",
                     event_subtype="state_forfeited_land",
-                    # Stable sentinel — forfeiture has no date in parcel data,
-                    # and event_date is part of the dedup key, so it must be
-                    # constant across runs for re-mining to be idempotent.
-                    event_date=_FORFEIT_SENTINEL_DATE,
+                    # Honest NULL — the county flag carries no forfeiture
+                    # date. Dedup key is NULLS NOT DISTINCT (2026-07-07),
+                    # so re-mining stays idempotent.
+                    event_date=None,
                     event_value=market_value,
                     source=self.source_name,
                     source_id=parcel_id,
@@ -397,12 +407,12 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
 
                 # Stable, meaningful event_date: Jan 1 of the delinquency year.
                 # Same value every run (idempotent dedup) AND it represents
-                # when the delinquency began. Fallback to the sentinel only if
-                # the year somehow won't parse (verified: 0 such rows).
+                # when the delinquency began. Honest NULL only if the year
+                # somehow won't parse (verified: 0 such rows).
                 delq_event_date = (
                     date(delq_year, 1, 1)
                     if delq_year is not None
-                    else _FORFEIT_SENTINEL_DATE
+                    else None
                 )
 
                 signals.append(DistressEventInsert(
