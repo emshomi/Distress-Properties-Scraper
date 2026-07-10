@@ -1,34 +1,47 @@
 """
 Olmsted Tyler-portal (iasWorld) per-parcel tax detail scraper.
 
-THE YEARS-BEHIND BUILD (specced from live recon, 2026-07-10): the annual
-delinquent-tax list (signals.distress_events, source='olmsted_delq_list',
-502 parcels) is a snapshot with no per-year breakdown — a parcel owing
-$8k could be in year 1 of the ~3-year forfeiture clock or months from
-judgment expiry. The county's Tyler iasWorld portal
-(publicaccess.co.olmsted.mn.us) carries the authoritative per-parcel,
-PER-YEAR delinquency detail. This scraper visits each listed parcel and
-extracts it, turning the flat list into a ranked closest-to-forfeiture
-view — plus list hygiene (recon found the top-2 parcels by amount owed
-had BOTH redeemed since the list published) and owner mailing addresses.
+THE YEARS-BEHIND BUILD (specced from live recon 2026-07-10; v2 after the
+first Actions test): the annual delinquent-tax list
+(signals.distress_events, source='olmsted_delq_list', 502 parcels) is a
+snapshot with no per-year breakdown — a parcel owing $8k could be in
+year 1 of the ~3-year forfeiture clock or months from judgment expiry.
+The county's Tyler iasWorld portal (publicaccess.co.olmsted.mn.us)
+carries the authoritative per-parcel, PER-YEAR delinquency detail. This
+scraper reads it for each listed parcel, turning the flat list into a
+ranked closest-to-forfeiture view — plus list hygiene (recon found the
+top-2 parcels by amount owed had BOTH redeemed since the list published)
+and owner mailing addresses.
 
-=== SOURCE (reverse-engineered live, 2026-07-10, screenshots on file) ===
-Search:  /search/CommonSearch.aspx?mode=REALPROP
-         - "Parcel ID" input accepts our bare 12-digit PARID verbatim
-         - shorter input prefix-matches (11 digits returned 2 rows)
-         - results land either on a grid (click the exact-PARID row) or
-           directly on the record
-Record:  /Datalets/Datalet.aspx?sIndex=..&idx=..   (SESSION-scoped —
-         no deep-linking; must replay search each parcel)
-         - left-nav links swap datalet mode within the session:
-           Property Overview (default) -> Parcel Status flags
-             (In Forfeiture / COJ / In Bankruptcy / Delinquent / Homestead)
-           Property Taxes Due (mode=tax_all) -> "Current Taxes Due" and
-             "Delinquent Taxes" tables, PER PAY YEAR:
-             Pay Year | Base Taxes | Penalty Due | Fees Due | Interest Due
-             | Total Amnt Paid | Date Last Paid | Total Due
-           Ownership (mode=owner) -> owner name(s) + MAILING address
-             (recon: distinct from property address — the skip-trace field)
+=== SOURCE — v2: DIRECT DEEP LINKS, NO BROWSER ===
+v1 replayed the interactive search per parcel with Playwright and died
+in the portal's disclaimer-redirect/frameset maze (5/5 parcels,
+2026-07-10 17:53 UTC Actions run). The fix came from the portal itself:
+datalet pages accept DIRECT per-PIN URLs that render with NO session,
+NO disclaimer, NO JavaScript (verified live 2026-07-10 with a plain
+HTTP GET):
+
+  /datalets/datalet.aspx?mode=<MODE>&UseSearch=no&pin=<PARID>
+      &jur=055&taxyr=<ASMT_YEAR>&LMparent=20
+
+Modes used (the datalet left-nav enumerates them all):
+  profileall -> Property Overview: Parcel Status flags
+               (In Forfeiture / COJ / In Bankruptcy / Delinquent /
+               Homestead)
+  tax_all    -> Property Taxes Due: "Current Taxes Due" and
+               "Delinquent Taxes" tables, PER PAY YEAR:
+               Pay Year | Base Taxes | Penalty Due | Fees Due
+               | Interest Due | Total Amnt Paid | Date Last Paid
+               | Total Due
+  owner      -> Ownership: owner name(s) + MAILING address (recon:
+               distinct from property address — the skip-trace field)
+
+taxyr is the ASSESSMENT year and lags the pay year by one: taxyr=2025
+serves Pay Year 2026 (current) + the delinquent history; taxyr=2026
+serves the not-yet-certified Pay Year 2027 as $.00 (verified live). So
+ASMT_YEAR = today.year - 1.
+
+So: 3 plain httpx GETs per parcel, BeautifulSoup parsing. No Playwright.
 
 === VERIFICATION PARCELS (from recon; the 5-PIN test plan) ===
   743544075694  HP PB LLC            2025 delq REDEEMED 22-APR-2026
@@ -39,9 +52,11 @@ Record:  /Datalets/Datalet.aspx?sIndex=..&idx=..   (SESSION-scoped —
                 3123 SHERBURN PL SW ROCHESTER MN 55902
 
 === HONESTY RULES ===
-- Parcels not found in the portal are logged and skipped — NEVER a
-  synthetic row (the MPLS-VBR lesson). They count toward records_failed
-  so the run reports partial, not a false success.
+- Parcels whose datalet does not echo their PARID are logged and
+  skipped — NEVER a synthetic row (the MPLS-VBR lesson). They count
+  toward records_failed so the run reports partial, not a false success.
+- A portal-wide maintenance banner with no parcel data raises
+  SourceUnavailableError (fail loud, don't write garbage).
 - estimated_judgment_date / estimated_forfeiture_date are COMPUTED from
   the statutory sequence (delinquency -> judgment 2nd Monday of May of
   the following year -> 3-year redemption) and ALWAYS carry
@@ -62,16 +77,6 @@ Record:  /Datalets/Datalet.aspx?sIndex=..&idx=..   (SESSION-scoped —
     status flags, owner mailing fields.
 Both via write_typed_signals_dedup (upsert-update), so weekly re-runs
 refresh in place.
-
-=== RUNNER NOTES ===
-Playwright/Chromium (session-based ASP.NET portal; requirements.txt
-already pins playwright==1.49.0). First scheduled home: GitHub Actions
-(~502 parcels x ~3.5s ≈ 30-35 min). iasWorld is not Cloudflare-fronted,
-but if the county blocks datacenter IPs this ports to the local-runner
-pattern (mnpublicnotice lesson) — the first Actions run is the test.
-Selectors were written from recon screenshots plus iasWorld conventions;
-the 5-PIN test run exists precisely to shake them out before the full
-502.
 """
 
 from __future__ import annotations
@@ -83,6 +88,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
 
+import httpx
 from bs4 import BeautifulSoup
 
 from src.db.supabase_client import signals_table
@@ -92,17 +98,21 @@ from src.utils.errors import SourceUnavailableError
 from src.utils.logger import logger
 
 _BASE_URL = "https://publicaccess.co.olmsted.mn.us"
-_SEARCH_URL = f"{_BASE_URL}/search/CommonSearch.aspx?mode=REALPROP"
+_DATALET_URL = f"{_BASE_URL}/datalets/datalet.aspx"
+_JUR = "055"  # Olmsted County jurisdiction code (from the portal's own links)
 _COUNTY_SLUG = "olmsted"
 _LIST_SOURCE = "olmsted_delq_list"
 
-_NAV_TIMEOUT_MS = 30_000
+_REQUEST_TIMEOUT = 30.0
 _PER_PARCEL_ATTEMPTS = 2
-_POLITE_DELAY_SECONDS = 2.0  # between parcels; keep the county happy
+_POLITE_DELAY_SECONDS = 1.0  # between parcels (3 GETs each); keep the county happy
 
-# Left-nav link texts (exact, from recon screenshots)
-_NAV_TAXES_DUE = "Property Taxes Due"
-_NAV_OWNERSHIP = "Ownership"
+_MAINTENANCE_MARKER = "currently unavailable due to maintenance"
+
+# Datalet modes (verified live 2026-07-10 from the portal's own nav links)
+_MODE_OVERVIEW = "profileall"
+_MODE_TAXES_DUE = "tax_all"
+_MODE_OWNER = "owner"
 
 # Parcel Status labels on the Property Overview datalet
 _STATUS_LABELS = {
@@ -115,8 +125,16 @@ _STATUS_LABELS = {
 _RE_YEAR = re.compile(r"^(19|20)\d{2}$")
 
 
+def assessment_year(today: date | None = None) -> int:
+    """taxyr for datalet URLs. The portal's taxyr is the ASSESSMENT year
+    and lags the pay year by one (verified live: taxyr=2025 -> Pay Year
+    2026 with real amounts; taxyr=2026 -> Pay Year 2027 all $.00)."""
+    d = today or date.today()
+    return d.year - 1
+
+
 # ============================================================
-# PARSING HELPERS (pure functions — unit-testable without a browser)
+# PARSING HELPERS (pure functions — unit-testable without the network)
 # ============================================================
 
 
@@ -180,10 +198,16 @@ def _find_section_table(soup: BeautifulSoup, heading: str) -> Any | None:
     """Find the data <table> that follows the section heading text
     (e.g. 'Delinquent Taxes') and whose header row contains 'Pay Year'.
     iasWorld nests tables heavily, so we search all tables after the
-    heading node rather than trusting sibling structure."""
+    heading node rather than trusting sibling structure. Exact-match
+    first, contains-match fallback (live headings can carry &nbsp;
+    padding)."""
     marker = soup.find(
         string=lambda t: isinstance(t, str) and t.strip() == heading
     )
+    if marker is None:
+        marker = soup.find(
+            string=lambda t: isinstance(t, str) and heading in t
+        )
     if marker is None:
         return None
     for table in marker.find_all_next("table"):
@@ -213,13 +237,9 @@ def parse_tax_table(soup: BeautifulSoup, heading: str) -> list[dict[str, Any]]:
         vals = _cells(tr)
         if not vals:
             continue
-        first = vals[0].rstrip(":").strip().lower()
-        if first == "total" or (vals[0].strip() == "" and "total" in " ".join(vals).lower()[:20]):
-            continue
-        # Data rows start with a 4-digit pay year; anything else (spacer
-        # rows, the Total row with a blank lead cell) is skipped.
-        year_cell = next((v for v in vals if v.strip()), "")
-        if not _RE_YEAR.match(vals[0].strip()) and not _RE_YEAR.match(year_cell):
+        # Data rows start with a 4-digit pay year; anything else (the
+        # Total row, spacer rows) is skipped.
+        if not _RE_YEAR.match(vals[0].strip()):
             continue
         row: dict[str, Any] = {}
         for i, h in enumerate(headers):
@@ -363,127 +383,47 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
             )
         return pins
 
-    # ---- Browser plumbing ----
+    # ---- HTTP plumbing (v2: direct deep links, no browser) ----
 
     @staticmethod
-    async def _maybe_accept_disclaimer(page: Any) -> None:
-        """iasWorld portals often gate the first search behind a
-        disclaimer. Click through if present; silently continue if not."""
-        for selector in (
-            'input[value*="Agree" i]',
-            'input[id*="Agree" i]',
-            'button:has-text("Agree")',
-            'a:has-text("Agree")',
-        ):
-            try:
-                loc = page.locator(selector).first
-                if await loc.count() and await loc.is_visible():
-                    await loc.click()
-                    await page.wait_for_load_state("domcontentloaded")
-                    logger.info("Portal disclaimer accepted")
-                    return
-            except Exception:
-                continue
+    def _datalet_params(mode: str, pin: str, taxyr: int) -> dict[str, str]:
+        return {
+            "mode": mode,
+            "UseSearch": "no",
+            "pin": pin,
+            "jur": _JUR,
+            "taxyr": str(taxyr),
+            "LMparent": "20",
+        }
 
-    @staticmethod
-    async def _fill_parcel_search(page: Any, pin: str) -> None:
-        """Fill the Parcel ID input and submit. iasWorld's canonical input
-        is name=inpParid; fall back to the first text input on the form
-        (the Parcel ID box is first, per recon screenshot)."""
-        filled = False
-        for selector in (
-            'input[name="inpParid"]',
-            'input[id*="parid" i]',
-            'input[type="text"]',
-        ):
-            try:
-                loc = page.locator(selector).first
-                if await loc.count():
-                    await loc.fill(pin)
-                    filled = True
-                    break
-            except Exception:
-                continue
-        if not filled:
-            raise RuntimeError("Parcel ID input not found on search page")
-        for selector in (
-            'input[id="btSearch"]',
-            'input[value="Search"]',
-            'button:has-text("Search")',
-        ):
-            try:
-                loc = page.locator(selector).first
-                if await loc.count():
-                    await loc.click()
-                    await page.wait_for_load_state("domcontentloaded")
-                    return
-            except Exception:
-                continue
-        await page.keyboard.press("Enter")
-        await page.wait_for_load_state("domcontentloaded")
+    async def _get_datalet(
+        self, client: httpx.AsyncClient, mode: str, pin: str, taxyr: int
+    ) -> str:
+        resp = await client.get(
+            _DATALET_URL, params=self._datalet_params(mode, pin, taxyr)
+        )
+        resp.raise_for_status()
+        return resp.text
 
-    @staticmethod
-    async def _on_record(page: Any) -> bool:
-        try:
-            return "PARID:" in (await page.content())
-        except Exception:
-            return False
-
-    async def _open_record(self, page: Any, pin: str) -> bool:
-        """From the search page: search the PIN and land on its record.
-        Handles both direct-to-record and results-grid paths. Returns
-        False (honest not-found) when the portal has no such parcel."""
-        await page.goto(_SEARCH_URL, timeout=_NAV_TIMEOUT_MS)
-        await page.wait_for_load_state("domcontentloaded")
-        await self._maybe_accept_disclaimer(page)
-        # The disclaimer may have redirected; ensure we're on the form.
-        if "CommonSearch" not in page.url:
-            await page.goto(_SEARCH_URL, timeout=_NAV_TIMEOUT_MS)
-            await page.wait_for_load_state("domcontentloaded")
-        await self._fill_parcel_search(page, pin)
-
-        if await self._on_record(page):
-            return True
-        content = await page.content()
-        if "did not return any" in content.lower() or "no records" in content.lower():
-            return False
-        # Results grid: click the row carrying the exact PARID.
-        try:
-            row = page.locator(f'tr:has-text("{pin}")').first
-            if await row.count():
-                await row.click()
-                await page.wait_for_load_state("domcontentloaded")
-                return await self._on_record(page)
-        except Exception:
-            pass
-        return False
-
-    @staticmethod
-    async def _open_nav(page: Any, link_text: str) -> str | None:
-        """Click a left-nav datalet link and return the resulting HTML;
-        None when the link is absent (honest: e.g. no tax page)."""
-        try:
-            loc = page.locator(f'a:has-text("{link_text}")').first
-            if not await loc.count():
-                return None
-            await loc.click()
-            await page.wait_for_load_state("domcontentloaded")
-            return await page.content()
-        except Exception as e:
-            logger.warning(
-                "Datalet nav failed", link=link_text, error=str(e)[:200]
-            )
-            return None
-
-    async def _scrape_parcel(self, page: Any, pin: str) -> dict[str, Any]:
-        """One parcel: search -> overview -> taxes-due -> ownership.
-        Raw HTML captured per datalet; parsing happens in parse()."""
-        found = await self._open_record(page, pin)
-        if not found:
+    async def _scrape_parcel(
+        self, client: httpx.AsyncClient, pin: str, taxyr: int
+    ) -> dict[str, Any]:
+        """One parcel: three direct datalet GETs. A datalet that does not
+        echo the PARID means the portal has no such parcel (honest
+        not-found). A maintenance page with no parcel data anywhere is a
+        source outage, surfaced upward."""
+        overview_html = await self._get_datalet(
+            client, _MODE_OVERVIEW, pin, taxyr
+        )
+        if f"PARID: {pin}" not in overview_html and pin not in overview_html:
+            if _MAINTENANCE_MARKER in overview_html.lower():
+                raise SourceUnavailableError(
+                    "Portal is in maintenance mode (no parcel data served)",
+                    source=self.source_name,
+                )
             return {"pin": pin, "found": False}
-        overview_html = await page.content()
-        tax_html = await self._open_nav(page, _NAV_TAXES_DUE)
-        owner_html = await self._open_nav(page, _NAV_OWNERSHIP)
+        tax_html = await self._get_datalet(client, _MODE_TAXES_DUE, pin, taxyr)
+        owner_html = await self._get_datalet(client, _MODE_OWNER, pin, taxyr)
         return {
             "pin": pin,
             "found": True,
@@ -496,63 +436,47 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
 
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         pins = self._load_pins()
+        taxyr = assessment_year()
         logger.info(
             "Tyler-portal scrape starting",
-            source=self.source_name, parcels=len(pins),
+            source=self.source_name, parcels=len(pins), taxyr=taxyr,
         )
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as e:  # pragma: no cover
-            raise SourceUnavailableError(
-                "playwright is not installed in this environment",
-                source=self.source_name,
-            ) from e
-
         raw: list[dict[str, Any]] = []
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=(
+        async with httpx.AsyncClient(
+            timeout=_REQUEST_TIMEOUT,
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/126.0 Safari/537.36"
-                )
-            )
-            page = await context.new_page()
-            page.set_default_timeout(_NAV_TIMEOUT_MS)
-            try:
-                for n, pin in enumerate(pins, start=1):
-                    record: dict[str, Any] | None = None
-                    for attempt in range(1, _PER_PARCEL_ATTEMPTS + 1):
-                        try:
-                            record = await self._scrape_parcel(page, pin)
-                            break
-                        except Exception as e:
-                            logger.warning(
-                                "Parcel scrape attempt failed",
-                                source=self.source_name, pin=pin,
-                                attempt=attempt, error=str(e)[:300],
-                            )
-                            # Fresh page for the retry — a wedged session
-                            # is the usual failure mode on ASP.NET portals.
-                            try:
-                                await page.close()
-                            except Exception:
-                                pass
-                            page = await context.new_page()
-                            page.set_default_timeout(_NAV_TIMEOUT_MS)
-                    if record is None:
-                        record = {"pin": pin, "found": False, "error": True}
-                    raw.append(record)
-                    if n % 25 == 0:
-                        logger.info(
-                            "Tyler-portal scrape progress",
-                            source=self.source_name,
-                            done=n, total=len(pins),
+                ),
+            },
+        ) as client:
+            for n, pin in enumerate(pins, start=1):
+                record: dict[str, Any] | None = None
+                for attempt in range(1, _PER_PARCEL_ATTEMPTS + 1):
+                    try:
+                        record = await self._scrape_parcel(client, pin, taxyr)
+                        break
+                    except SourceUnavailableError:
+                        raise  # portal-wide outage: fail the run loudly
+                    except Exception as e:
+                        logger.warning(
+                            "Parcel scrape attempt failed",
+                            source=self.source_name, pin=pin,
+                            attempt=attempt, error=str(e)[:300],
                         )
-                    await asyncio.sleep(_POLITE_DELAY_SECONDS)
-            finally:
-                await browser.close()
+                        await asyncio.sleep(1.5 * attempt)
+                if record is None:
+                    record = {"pin": pin, "found": False, "error": True}
+                raw.append(record)
+                if n % 25 == 0:
+                    logger.info(
+                        "Tyler-portal scrape progress",
+                        source=self.source_name, done=n, total=len(pins),
+                    )
+                await asyncio.sleep(_POLITE_DELAY_SECONDS)
 
         logger.info(
             "Tyler-portal fetch complete",
