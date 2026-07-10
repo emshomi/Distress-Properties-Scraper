@@ -9,6 +9,12 @@ name: Olmsted Tax Detail (Tyler portal)
 # session, no disclaimer. Datacenter access verified live the same day.
 # ~502 parcels x ~2s ≈ 20-25 min.
 #
+# v2.1 (2026-07-10): the portal enforces a rolling request quota — after
+# ~100 rapid parcels it redirects to OverLimit.aspx. The scraper now
+# treats that as a cooldown signal (90s wait + retry, 4 attempts), not a
+# parcel failure. Full run: ~45-75 min depending on how often the quota
+# trips.
+#
 # The manual dispatch takes an optional comma-separated PIN list — the
 # 5-PIN verification path. ALWAYS run that first after any change.
 on:
@@ -29,8 +35,8 @@ jobs:
   scrape:
     name: Run Olmsted Tyler-portal tax detail
     runs-on: ubuntu-latest
-    # Full list ≈ 20-25 min at the polite per-parcel delay.
-    timeout-minutes: 60
+    # Full list ≈ 45-75 min with rate-limit cooldowns.
+    timeout-minutes: 150
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
