@@ -104,19 +104,26 @@ _COUNTY_SLUG = "olmsted"
 _LIST_SOURCE = "olmsted_delq_list"
 
 _REQUEST_TIMEOUT = 30.0
-_PER_PARCEL_ATTEMPTS = 4          # generous: OverLimit retries need headroom
-_POLITE_DELAY_SECONDS = 1.5       # between parcels (3 GETs each)
-_RATE_LIMIT_COOLDOWN_SECONDS = 90  # iasWorld OverLimit.aspx rolling quota
-                                   # (observed live 2026-07-10: bursts of
-                                   # rejections after ~100 parcels, then
-                                   # recovery — wait it out, don't fail)
+_PER_PARCEL_ATTEMPTS = 4
+_POLITE_DELAY_SECONDS = 1.5        # between parcels (3 GETs each)
+
+# --- Quota management (v2.2, tuned from the 2026-07-10 evening runs) ---
+# The portal's rolling quota trips after ~60-100 parcels of sustained
+# requests, and short (90s) retries DURING the lockout keep the penalty
+# alive — the failed v2.1 run knocked every 90s for 45 minutes and never
+# got back in. v2.2 therefore:
+#   (a) rests proactively BEFORE the quota trips, and
+#   (b) on OverLimit, goes fully silent with escalating waits.
+_BATCH_SIZE = 40                    # parcels between proactive rests
+_BATCH_REST_SECONDS = 300           # 5-min proactive rest per batch
+_OVERLIMIT_BACKOFFS = (300, 600, 900)  # escalating silence on OverLimit
 
 _MAINTENANCE_MARKER = "currently unavailable due to maintenance"
 
 
 class _RateLimitedError(Exception):
     """The portal redirected to OverLimit.aspx — rolling request quota
-    tripped. Not a parcel failure; cool down and retry."""
+    tripped. Not a parcel failure; go silent and retry."""
 
 # Datalet modes (verified live 2026-07-10 from the portal's own nav links)
 _MODE_OVERVIEW = "profileall"
@@ -474,26 +481,23 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                         break
                     except SourceUnavailableError:
                         raise  # portal-wide outage: fail the run loudly
-                    except _RateLimitedError:
-                        logger.info(
-                            "Portal rate limit hit (OverLimit) — cooling down",
-                            source=self.source_name, pin=pin,
-                            attempt=attempt,
-                            cooldown_seconds=_RATE_LIMIT_COOLDOWN_SECONDS,
+                    except (_RateLimitedError, httpx.HTTPStatusError) as e:
+                        is_overlimit = isinstance(e, _RateLimitedError) or (
+                            "overlimit" in str(e).lower()
                         )
-                        await asyncio.sleep(_RATE_LIMIT_COOLDOWN_SECONDS)
-                    except httpx.HTTPStatusError as e:
-                        # Belt: OverLimit sometimes surfaces as the 404 on
-                        # the redirect target rather than via resp.url.
-                        if "overlimit" in str(e).lower():
+                        if is_overlimit:
+                            # Full silence, escalating — retrying early
+                            # keeps the penalty alive (v2.1 lesson).
+                            wait = _OVERLIMIT_BACKOFFS[
+                                min(attempt - 1, len(_OVERLIMIT_BACKOFFS) - 1)
+                            ]
                             logger.info(
-                                "Portal rate limit hit (OverLimit 404) — "
-                                "cooling down",
+                                "Portal rate limit hit (OverLimit) — going "
+                                "silent",
                                 source=self.source_name, pin=pin,
-                                attempt=attempt,
-                                cooldown_seconds=_RATE_LIMIT_COOLDOWN_SECONDS,
+                                attempt=attempt, silence_seconds=wait,
                             )
-                            await asyncio.sleep(_RATE_LIMIT_COOLDOWN_SECONDS)
+                            await asyncio.sleep(wait)
                         else:
                             logger.warning(
                                 "Parcel scrape attempt failed",
@@ -516,7 +520,18 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                         "Tyler-portal scrape progress",
                         source=self.source_name, done=n, total=len(pins),
                     )
-                await asyncio.sleep(_POLITE_DELAY_SECONDS)
+                # Proactive rest BEFORE the quota trips (v2.2): the
+                # portal tolerates ~60-100 sustained parcels; rest well
+                # inside that.
+                if n % _BATCH_SIZE == 0 and n < len(pins):
+                    logger.info(
+                        "Proactive quota rest",
+                        source=self.source_name, done=n, total=len(pins),
+                        rest_seconds=_BATCH_REST_SECONDS,
+                    )
+                    await asyncio.sleep(_BATCH_REST_SECONDS)
+                else:
+                    await asyncio.sleep(_POLITE_DELAY_SECONDS)
 
         logger.info(
             "Tyler-portal fetch complete",
