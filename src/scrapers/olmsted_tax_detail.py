@@ -104,10 +104,19 @@ _COUNTY_SLUG = "olmsted"
 _LIST_SOURCE = "olmsted_delq_list"
 
 _REQUEST_TIMEOUT = 30.0
-_PER_PARCEL_ATTEMPTS = 2
-_POLITE_DELAY_SECONDS = 1.0  # between parcels (3 GETs each); keep the county happy
+_PER_PARCEL_ATTEMPTS = 4          # generous: OverLimit retries need headroom
+_POLITE_DELAY_SECONDS = 1.5       # between parcels (3 GETs each)
+_RATE_LIMIT_COOLDOWN_SECONDS = 90  # iasWorld OverLimit.aspx rolling quota
+                                   # (observed live 2026-07-10: bursts of
+                                   # rejections after ~100 parcels, then
+                                   # recovery — wait it out, don't fail)
 
 _MAINTENANCE_MARKER = "currently unavailable due to maintenance"
+
+
+class _RateLimitedError(Exception):
+    """The portal redirected to OverLimit.aspx — rolling request quota
+    tripped. Not a parcel failure; cool down and retry."""
 
 # Datalet modes (verified live 2026-07-10 from the portal's own nav links)
 _MODE_OVERVIEW = "profileall"
@@ -402,6 +411,10 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
         resp = await client.get(
             _DATALET_URL, params=self._datalet_params(mode, pin, taxyr)
         )
+        # iasWorld's rolling request quota redirects to OverLimit.aspx
+        # (which then 404s). That's a rate limit, not a parcel problem.
+        if "overlimit" in str(resp.url).lower():
+            raise _RateLimitedError(str(resp.url))
         resp.raise_for_status()
         return resp.text
 
@@ -461,6 +474,33 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                         break
                     except SourceUnavailableError:
                         raise  # portal-wide outage: fail the run loudly
+                    except _RateLimitedError:
+                        logger.info(
+                            "Portal rate limit hit (OverLimit) — cooling down",
+                            source=self.source_name, pin=pin,
+                            attempt=attempt,
+                            cooldown_seconds=_RATE_LIMIT_COOLDOWN_SECONDS,
+                        )
+                        await asyncio.sleep(_RATE_LIMIT_COOLDOWN_SECONDS)
+                    except httpx.HTTPStatusError as e:
+                        # Belt: OverLimit sometimes surfaces as the 404 on
+                        # the redirect target rather than via resp.url.
+                        if "overlimit" in str(e).lower():
+                            logger.info(
+                                "Portal rate limit hit (OverLimit 404) — "
+                                "cooling down",
+                                source=self.source_name, pin=pin,
+                                attempt=attempt,
+                                cooldown_seconds=_RATE_LIMIT_COOLDOWN_SECONDS,
+                            )
+                            await asyncio.sleep(_RATE_LIMIT_COOLDOWN_SECONDS)
+                        else:
+                            logger.warning(
+                                "Parcel scrape attempt failed",
+                                source=self.source_name, pin=pin,
+                                attempt=attempt, error=str(e)[:300],
+                            )
+                            await asyncio.sleep(1.5 * attempt)
                     except Exception as e:
                         logger.warning(
                             "Parcel scrape attempt failed",
