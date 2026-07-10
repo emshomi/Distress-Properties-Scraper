@@ -128,6 +128,50 @@ _RE_SALE = re.compile(
 _RE_POSTPONED = re.compile(
     r"postponed (?:until|to)\s+([A-Z][a-z]+ \d{1,2}, \d{4})", re.I
 )
+# Redemption period as STATED in the notice. MN is usually 6 months but can
+# be 12 (and other values); the notice text carries the real figure, e.g.
+# "subject to redemption within 6 Months from the date of said sale" or the
+# tax variant "The time allowed for redemption ... is six (6) months". We
+# extract it rather than assume, so the redemption-expiry clock is honest.
+_RE_REDEMPTION = re.compile(
+    r"redemption[^.]{0,80}?(?:within|is|of|allowed[^.]{0,20}?is)?\s*"
+    r"(\d{1,2}|one|two|three|six|twelve)\s*(?:\(\s*\d{1,2}\s*\))?\s*months?",
+    re.I,
+)
+_WORD_MONTHS = {
+    "one": 1, "two": 2, "three": 3, "six": 6, "twelve": 12,
+}
+
+
+def _add_months(d: date, months: int) -> date:
+    """Add whole months to a date using stdlib only (no dateutil dep).
+    Clamps the day to the target month's length (e.g. Aug 31 + 6mo ->
+    Feb 28/29). Adequate for redemption-expiry dates."""
+    import calendar
+    m0 = d.month - 1 + months
+    year = d.year + m0 // 12
+    month = m0 % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _extract_redemption_months(text: str) -> int | None:
+    """Months of redemption as stated in the notice; None if not stated
+    (caller decides the fallback, and flags that it was a fallback)."""
+    m = _RE_REDEMPTION.search(text)
+    if not m:
+        return None
+    tok = m.group(1).strip().lower()
+    if tok.isdigit():
+        val = int(tok)
+    else:
+        val = _WORD_MONTHS.get(tok)
+    # Sanity: MN redemption is 6 or 12 (occasionally other small values);
+    # reject nonsense captures.
+    if val is not None and 1 <= val <= 36:
+        return val
+    return None
+
 _RE_CITY_ZIP = re.compile(
     r"([A-Za-z .]+?),?\s*(?:MN|Minnesota)\s*,?\s*(\d{5})", re.I
 )
@@ -352,6 +396,7 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
                 address_block = _clean_ws(" ".join(street_lines)) or None
 
             mortgagor_m = _RE_MORTGAGOR.search(text)
+            redemption_months = _extract_redemption_months(text)
             amount_due = _safe_money(
                 (_RE_AMOUNT_DUE.search(text) or [None, None])[1]
                 if _RE_AMOUNT_DUE.search(text) else None
@@ -393,6 +438,16 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
                     ),
                     "sale_date": sale_date.isoformat() if sale_date else None,
                     "sale_time": sale_time,
+                    # Redemption period AS STATED in the notice (months);
+                    # None when the notice is silent. The expiry clock is
+                    # computed downstream: stated period -> exact date;
+                    # silent -> a flagged 6-month default (never a guess
+                    # presented as fact).
+                    "redemption_months": redemption_months,
+                    "redemption_expires": (
+                        _add_months(sale_date, redemption_months).isoformat()
+                        if (sale_date and redemption_months) else None
+                    ),
                     "postponed": bool(postponements),
                     "notice_id": notice_id,
                     "newspaper": _NEWSPAPER,
