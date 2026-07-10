@@ -140,6 +140,7 @@ class Settings(BaseSettings):
     scraper_ramsey_tax_roll_enabled: bool = Field(default=True)
     scraper_ramsey_tfl_enabled: bool = Field(default=True)
     scraper_olmsted_parcels_enabled: bool = Field(default=True)
+    scraper_olmsted_tax_detail_enabled: bool = Field(default=True)
     scraper_postbulletin_legal_enabled: bool = Field(default=True)
     scraper_anoka_sheriff_enabled: bool = Field(default=True)
     scraper_washington_sheriff_enabled: bool = Field(default=True)
