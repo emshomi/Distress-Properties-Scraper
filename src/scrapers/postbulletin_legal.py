@@ -141,6 +141,22 @@ _RE_REDEMPTION = re.compile(
 _WORD_MONTHS = {
     "one": 1, "two": 2, "three": 3, "six": 6, "twelve": 12,
 }
+# The notice often states the redemption/vacate DEADLINE outright, e.g.
+# "DATE TO VACATE PROPERTY: ... is January 27, 2027 at 11:59 p.m." This
+# authoritative date beats any computed sale_date+period, so we prefer it.
+_RE_VACATE_DATE = re.compile(
+    r"(?:DATE TO VACATE|MUST VACATE)"
+    r"(?:(?!DATE AND TIME OF SALE|MORTGAGOR\(S\) RELEASED).){0,300}?"
+    r"\bis\s+([A-Z][a-z]+ \d{1,2}, \d{4})",
+    re.I | re.S,
+)
+# Some notices warn redemption may be cut to 5 weeks if the property is
+# judicially determined abandoned (Minn. Stat. 582.032). We flag this so
+# the displayed clock can carry the caveat rather than overstate the time.
+_RE_ABANDON_CAVEAT = re.compile(
+    r"REDUCED TO FIVE WEEKS.*?ABANDONED", re.I | re.S,
+)
+
 
 
 def _add_months(d: date, months: int) -> date:
@@ -397,6 +413,27 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
 
             mortgagor_m = _RE_MORTGAGOR.search(text)
             redemption_months = _extract_redemption_months(text)
+            # Prefer the notice's EXPLICITLY STATED vacate/redemption
+            # deadline over any computed date — it's authoritative.
+            vacate_m = _RE_VACATE_DATE.search(text)
+            stated_expiry = _parse_long_date(vacate_m.group(1)) if vacate_m else None
+            abandon_caveat = bool(_RE_ABANDON_CAVEAT.search(text))
+            # Resolve the redemption-expiry date, honestly labeling basis:
+            #   'stated'   -> the notice printed the date (best)
+            #   'computed' -> sale_date + stated period
+            #   'default'  -> sale_date + 6mo fallback (period not stated)
+            if stated_expiry:
+                redemption_expires = stated_expiry
+                redemption_basis = "stated"
+            elif sale_date and redemption_months:
+                redemption_expires = _add_months(sale_date, redemption_months)
+                redemption_basis = "computed"
+            elif sale_date:
+                redemption_expires = _add_months(sale_date, 6)
+                redemption_basis = "default_6mo"
+            else:
+                redemption_expires = None
+                redemption_basis = None
             amount_due = _safe_money(
                 (_RE_AMOUNT_DUE.search(text) or [None, None])[1]
                 if _RE_AMOUNT_DUE.search(text) else None
@@ -438,16 +475,19 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
                     ),
                     "sale_date": sale_date.isoformat() if sale_date else None,
                     "sale_time": sale_time,
-                    # Redemption period AS STATED in the notice (months);
-                    # None when the notice is silent. The expiry clock is
-                    # computed downstream: stated period -> exact date;
-                    # silent -> a flagged 6-month default (never a guess
-                    # presented as fact).
+                    # Redemption clock, extracted honestly from the notice:
+                    #   redemption_months  = period stated in text (or null)
+                    #   redemption_expires = the deadline; basis says how we
+                    #     got it (stated in notice / computed / 6mo default)
+                    #   redemption_abandonment_caveat = true if the notice
+                    #     warns the period may drop to 5 weeks if abandoned
                     "redemption_months": redemption_months,
                     "redemption_expires": (
-                        _add_months(sale_date, redemption_months).isoformat()
-                        if (sale_date and redemption_months) else None
+                        redemption_expires.isoformat()
+                        if redemption_expires else None
                     ),
+                    "redemption_basis": redemption_basis,
+                    "redemption_abandonment_caveat": abandon_caveat,
                     "postponed": bool(postponements),
                     "notice_id": notice_id,
                     "newspaper": _NEWSPAPER,
