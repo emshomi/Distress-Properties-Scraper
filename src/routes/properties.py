@@ -53,6 +53,9 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         # Extracted legal-notice foreclosures (statewide, from published
         # Notice-of-Sale documents via the LLM extraction pipeline).
         {"source": "startribune_legal"},
+        # Rochester Post Bulletin foreclosure notices (Column API) — the
+        # Olmsted pilot's first signal source (2026-07-09).
+        {"source": "postbulletin_legal"},
     ],
     "tax_forfeit": [
         {"source": "hennepin_tax_roll", "event_type": "tax_forfeit"},
@@ -91,6 +94,7 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     "hennepin_tax_roll": "Hennepin",
     "ramsey_tax_roll": "Ramsey",
     "ramsey_tfl": "Ramsey",
+    "postbulletin_legal": "Olmsted",
     "mn_dor_red_book": "Statewide",
 }
 
@@ -731,6 +735,48 @@ def _extract_ramsey_tfl(raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+def _extract_postbulletin_legal(raw: dict, row: dict) -> dict[str, Any]:
+    """postbulletin_legal — Rochester Post Bulletin foreclosure notices
+    (Column API, 2026-07-09). Flat raw_data written by the scraper. These
+    are SCHEDULED (future) sheriff sales — status says so, never 'Sold'.
+    The notice's own TAX PARCEL NO. is the parcel id (direct Olmsted spine
+    join), so owner/EMV/coords/lot arrive via the generic assessor patch —
+    owner is left None here on purpose (the CURRENT owner beats the notice
+    mortgagor; the mortgagor is preserved in raw_data and the drawer)."""
+    def _f(key: str) -> float | None:
+        v = raw.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    return {
+        "address": raw.get("property_address"),
+        "city": raw.get("property_city"),
+        "zip": raw.get("property_zip"),
+        "owner": None,  # assessor patch fills the current owner
+        "sale_date": raw.get("sale_date") or row.get("event_date"),
+        "sale_time": raw.get("sale_time"),
+        "amount": _f("amount_due"),
+        "status": ("Scheduled sale (postponed)" if raw.get("postponed")
+                   else "Scheduled sale"),
+        "tax_parcel_no": row.get("parcel_id"),
+        "original_principal": _f("original_principal"),
+        "municipality": raw.get("property_city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": None,
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+        "owner_mailing": None,
+        "is_absentee": None,
+        "annual_tax": None,
+        "special_assessment_due": None,
+    }
+
+
 _EXTRACTORS: dict[str, Any] = {
     "anoka_sheriff": _extract_anoka,
     "hennepin_sheriff": _extract_hennepin_sheriff,
@@ -743,6 +789,7 @@ _EXTRACTORS: dict[str, Any] = {
     "hennepin_tax_roll": _extract_hennepin_tax,
     "ramsey_tax_roll": _extract_hennepin_tax,
     "ramsey_tfl": _extract_ramsey_tfl,
+    "postbulletin_legal": _extract_postbulletin_legal,
 }
 
 # ============================================================
