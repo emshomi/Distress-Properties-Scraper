@@ -70,6 +70,10 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
     ],
     "tax_delinquent": [
         {"source": "hennepin_tax_roll", "event_type": "tax_delinquent"},
+        # Olmsted 2026 statutory Delinquent Tax List (bulk-loaded
+        # 2026-07-10 from the Post Bulletin publication, OCR + spine-
+        # validated; see MIGRATION_olmsted_delq_list_2026-07-10.sql).
+        {"source": "olmsted_delq_list"},
         {"source": "ramsey_tax_roll", "event_type": "tax_delinquent"},
     ],
     "tax_assessment": [
@@ -95,6 +99,7 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     "ramsey_tax_roll": "Ramsey",
     "ramsey_tfl": "Ramsey",
     "postbulletin_legal": "Olmsted",
+    "olmsted_delq_list": "Olmsted",
     "mn_dor_red_book": "Statewide",
 }
 
@@ -777,6 +782,45 @@ def _extract_postbulletin_legal(raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+def _extract_olmsted_delq(raw: dict, row: dict) -> dict[str, Any]:
+    """olmsted_delq_list — the county's statutory Delinquent Tax List
+    (bulk migration, 2026-07-10). The list publishes legal descriptions,
+    not situs addresses, so address/city/zip are left None for the
+    assessor patch to fill from the Olmsted spine — along with owner,
+    EMV, coords, and lot size. Amount = total tax + penalties to clear
+    the list; earliest_delq_year = the delinquent pay year."""
+    amt = raw.get("total_tax_penalties")
+    try:
+        amt_f = float(amt) if amt is not None else None
+    except (TypeError, ValueError):
+        amt_f = None
+    return {
+        "address": None,   # spine fills (list has legal descriptions only)
+        "city": None,
+        "zip": None,
+        "owner": None,     # assessor patch fills the current owner
+        "sale_date": None,
+        "sale_time": None,
+        "amount": amt_f,
+        "status": "On the delinquent tax list",
+        "tax_parcel_no": row.get("parcel_id"),
+        "original_principal": None,
+        "municipality": raw.get("city_section"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": raw.get("published"),
+        "market_value": None,
+        "earliest_delq_year": raw.get("pay_year"),
+        "dwelling_type": None,
+        "ward": None,
+        "owner_mailing": None,
+        "is_absentee": None,
+        "annual_tax": None,
+        "special_assessment_due": None,
+    }
+
+
 _EXTRACTORS: dict[str, Any] = {
     "anoka_sheriff": _extract_anoka,
     "hennepin_sheriff": _extract_hennepin_sheriff,
@@ -790,6 +834,7 @@ _EXTRACTORS: dict[str, Any] = {
     "ramsey_tax_roll": _extract_hennepin_tax,
     "ramsey_tfl": _extract_ramsey_tfl,
     "postbulletin_legal": _extract_postbulletin_legal,
+    "olmsted_delq_list": _extract_olmsted_delq,
 }
 
 # ============================================================
@@ -1208,7 +1253,8 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
     for s in shaped_rows:
         if not (_missing_mv(s) or _missing_coords(s)
                 or s.get("lot_sqft") is None
-                or s.get("property_type_name") is None):
+                or s.get("property_type_name") is None
+                or s.get("address") is None):
             continue
         pid = s.get("parcel_id")
         if not pid:
@@ -1220,7 +1266,8 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
                 core_table("parcels")
                 .select(
                     "parcel_id, estimated_market_value, lat, lng, "
-                    "lot_sqft, prop_type_name:raw_data->>PR_TYP_NM1"
+                    "lot_sqft, prop_type_name:raw_data->>PR_TYP_NM1, "
+                    "address, city, zip"
                 )
                 .in_("parcel_id", list(val_need.keys()))
                 .execute()
@@ -1230,7 +1277,19 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
                 plat, plng = p.get("lat"), p.get("lng")
                 plot = p.get("lot_sqft")
                 ptype = (p.get("prop_type_name") or "").strip() or None
+                paddr = (p.get("address") or "").strip() or None
+                pcity = (p.get("city") or "").strip() or None
+                pzip = (p.get("zip") or "").strip() or None
                 for s in val_need.get(p.get("parcel_id"), []):
+                    if s.get("address") is None and paddr:
+                        # Source published no address (e.g. the delinquent
+                        # tax list carries legal descriptions only) — the
+                        # spine supplies the situs address. Additive only.
+                        s["address"] = paddr
+                        if s.get("city") is None and pcity:
+                            s["city"] = pcity
+                        if s.get("zip") is None and pzip:
+                            s["zip"] = pzip
                     if _missing_mv(s) and isinstance(emv, (int, float)) and emv > 0:
                         s["market_value"] = float(emv)
                     if _missing_coords(s) and plat is not None and plng is not None:
