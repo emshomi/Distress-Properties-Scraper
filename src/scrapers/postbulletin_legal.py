@@ -91,7 +91,11 @@ _DESC = (
 # ---- Notice-text field extraction (built from live notices) ----
 
 _RE_PIN = re.compile(
-    r"TAX PARCEL(?:\s+I\.?D\.?)?\s+NO\.?\s*:?\s*([0-9.\- ]{8,30})", re.I
+    # Label variants seen live: "TAX PARCEL NO.:", "TAX PARCEL I.D. NO.:",
+    # and the older "PROPERTY IDENTIFICATION NUMBER:" (sometimes with an
+    # RP prefix on the value). Non-digits are stripped afterwards.
+    r"(?:TAX PARCEL(?:\s+I\.?D\.?)?\s+NO\.?|PROPERTY IDENTIFICATION NUMBER)"
+    r"\s*:?\s*([A-Z]{0,3}[0-9.\- ]{8,30})", re.I
 )
 _RE_ADDRESS = re.compile(
     # Both label variants seen live: "ADDRESS OF PROPERTY:" (newer, multi-
