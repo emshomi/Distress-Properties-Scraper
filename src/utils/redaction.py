@@ -152,6 +152,61 @@ _LEVERAGE_FIELDS = (
     "vacancy_est_fees_paid", "vacancy_est_pve_exposure", "vacancy_cost_basis",
 )
 
+# ------------------------------------------------------------------
+# Tyler-portal tax-delinquency status (the nested `tax_status` block on
+# olmsted_delq_list rows, from signals.tax_delinquency_status — 2026-07-12).
+#
+# Tier policy (per HANDOFF_2026-07-11 Priority 1a):
+#   - redeemed_since_list       : EVERY tier, free included. It is the list-
+#                                 hygiene hook (50.6% of the county's annual
+#                                 list had already redeemed at scrape time) —
+#                                 a boolean, non-locating, and the platform's
+#                                 headline differentiator.
+#   - clock + amounts           : STANDARD+. first/years delinquent, the
+#                                 estimated judgment/forfeiture dates WITH
+#                                 their basis (the date never ships without
+#                                 the basis — it is a computed estimate,
+#                                 never county-stated), totals, and the
+#                                 statutory flags.
+#   - owner mailing block       : PREMIUM only. The skip-trace value
+#                                 (owner_name/_2, mailing address lines).
+# ------------------------------------------------------------------
+
+# Premium-only keys inside the tax_status block.
+_TAX_STATUS_OWNER_KEYS = (
+    "owner_name", "owner_name_2",
+    "owner_mailing_address", "owner_mailing_city_state_zip",
+)
+
+
+def _redact_tax_status(p: dict[str, Any], rank: int) -> None:
+    """Tier-redact the nested tax_status block in place on the COPIED payload.
+
+    Only called below premium (redact_property returns early for
+    premium/admin). The nested dict is re-copied before mutation because
+    redact_property's dict(shaped) copy is shallow — mutating the nested
+    block directly would corrupt the caller's unredacted original.
+    """
+    block = p.get("tax_status")
+    if not isinstance(block, dict):
+        return
+
+    block = dict(block)  # never mutate the original nested dict
+    p["tax_status"] = block
+
+    # STANDARD and below: strip the premium owner/skip-trace keys.
+    for k in _TAX_STATUS_OWNER_KEYS:
+        if k in block:
+            block[k] = None
+    block["owner_locked"] = True
+
+    # BELOW STANDARD: collapse to the hygiene hook alone.
+    if rank < _TIER_RANK["standard"]:
+        p["tax_status"] = {
+            "redeemed_since_list": block.get("redeemed_since_list"),
+            "locked": True,
+        }
+
 
 def _lock(payload: dict[str, Any], field: str) -> None:
     """Null a field and flag it locked, only if the key is present."""
@@ -196,6 +251,11 @@ def redact_property(
     # (rank < premium already true here)
     for f in _LEVERAGE_FIELDS:
         _lock(p, f)
+
+    # ---- Tyler tax-delinquency status block (nested, tiered internally:
+    #      owner keys premium-only; below standard only the redeemed flag
+    #      survives). No-op for rows without a tax_status block. ----
+    _redact_tax_status(p, rank)
 
     # ---- BELOW STANDARD: lock locators + exact dates ----
     if rank < _TIER_RANK["standard"]:
