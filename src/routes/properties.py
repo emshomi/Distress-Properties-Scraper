@@ -2532,6 +2532,22 @@ async def list_properties(
         ),
     ),
 
+    redeemed: Optional[bool] = Query(
+        default=None,
+        description=(
+            "Tyler tax-status filter (tax_delinquent view). false = hide "
+            "parcels that have REDEEMED since the annual list published (the "
+            "default list-hygiene view — 254 of Olmsted's 502 had already "
+            "cured at first scrape); true = only redeemed parcels; absent = "
+            "all rows. Rows without a tax_status block (e.g. Hennepin "
+            "roll-mined delinquencies) always pass — the filter never hides "
+            "rows it has no verdict for. Navigation-level (not tier-gated): "
+            "the redeemed flag itself is free-tier data. Routes through the "
+            "fetch-all path because the verdict joins from "
+            "signals.tax_delinquency_status during shaping, never DB-side."
+        ),
+    ),
+
     multi_signal: Optional[int] = Query(
         default=None,
         ge=2,
@@ -2864,6 +2880,7 @@ async def list_properties(
             or outcome is not None
             or owner_type is not None
             or absentee is not None
+            or redeemed is not None
         )
 
         if needs_fetch_all:
@@ -2973,6 +2990,29 @@ async def list_properties(
                     if s.get("is_absentee") is absentee
                 ]
 
+            # Tyler redeemed filter (2026-07-12): the verdict lives in the
+            # nested tax_status block attached during shaping — never
+            # DB-side. The PRE-filter redeemed count ships in the envelope
+            # so the frontend toggle can label itself with the live number
+            # ("show redeemed (254)") instead of a hardcode. Rows WITHOUT a
+            # tax_status block always pass: no verdict, no hiding.
+            redeemed_count: Optional[int] = None
+            if redeemed is not None:
+                redeemed_count = sum(
+                    1 for s in shaped
+                    if (s.get("tax_status") or {}).get("redeemed_since_list") is True
+                )
+                if redeemed is False:
+                    shaped = [
+                        s for s in shaped
+                        if (s.get("tax_status") or {}).get("redeemed_since_list") is not True
+                    ]
+                else:
+                    shaped = [
+                        s for s in shaped
+                        if (s.get("tax_status") or {}).get("redeemed_since_list") is True
+                    ]
+
             # 'sort' may be a normal column here (when multi_signal forced this
             # path); _sort_computed passes those through unchanged, so the rows
             # keep the DB order they arrived in. Computed sorts still sort.
@@ -2982,12 +3022,15 @@ async def list_properties(
             total = len(shaped)  # filtered count, so pagination + "X of Y" stay honest
             page = shaped[offset:offset + limit]
             
-            return success_envelope({
+            _envelope: dict[str, Any] = {
                 "properties": [redact_property(_r, tier=_ctx.tier) for _r in page],
                 "total": total,
                 "limit": limit,
                 "offset": offset,
-            })
+            }
+            if redeemed_count is not None:
+                _envelope["redeemed_count"] = redeemed_count
+            return success_envelope(_envelope)
 
         # Fast DB-level column sort + pagination.
         # nullsfirst=False: Postgres floats NULLs to the top of DESC sorts by
