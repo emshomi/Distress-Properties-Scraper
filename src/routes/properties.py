@@ -779,6 +779,15 @@ def _extract_postbulletin_legal(raw: dict, row: dict) -> dict[str, Any]:
         "is_absentee": None,
         "annual_tax": None,
         "special_assessment_due": None,
+        # Redemption clock written by the scraper (2026-07-10/11 session):
+        # basis is 'stated' (period read from the notice text) or 'computed'
+        # (statutory default applied). The caveat flags the MN abandonment
+        # exception (5-week window if abandoned). Passed through verbatim so
+        # the frontend can show the clock WITH its provenance — the date
+        # never ships without its basis.
+        "redemption_basis": raw.get("redemption_basis"),
+        "redemption_abandonment_caveat": raw.get("redemption_abandonment_caveat"),
+        "redemption_months": raw.get("redemption_months"),
     }
 
 
@@ -1183,6 +1192,58 @@ def _load_redemption_tracker_map() -> dict[str, dict[Any, dict[str, Any]]]:
         if prev is None or str(anchor) > str(prev.get("anchor_date") or ""):
             by_parcel[pk] = r
     return {"exact": exact, "parcel": by_parcel}
+
+
+# ------------------------------------------------------------------
+# Tyler-portal tax-delinquency status (signals.tax_delinquency_status,
+# written weekly by olmsted_tax_detail v2.2 — 2026-07-12).
+# One row per delinquent-list parcel: the current verdict (254/502 REDEEMED
+# since the annual list published vs 248 true delinquents), the forfeiture
+# clock (ALWAYS a computed estimate — ships with forfeiture_basis), and the
+# county owner-of-record mailing (premium skip-trace value; gated in
+# redaction, never here). Attached to olmsted_delq_list rows as a nested
+# `tax_status` block, same convention as overlay / owner_portfolio.
+# ------------------------------------------------------------------
+
+# The exact keys the API exposes from a status row — raw_data stays behind
+# (heavy, and the detail `raw` field is premium-gated separately anyway).
+_TAX_STATUS_KEYS = (
+    "redeemed_since_list",
+    "first_delinquent_year", "years_delinquent",
+    "total_delinquent_due", "current_year_due",
+    "estimated_judgment_date", "estimated_forfeiture_date", "forfeiture_basis",
+    "in_forfeiture", "coj", "in_bankruptcy", "homestead",
+    "owner_name", "owner_name_2",
+    "owner_mailing_address", "owner_mailing_city_state_zip",
+)
+
+
+def _load_delq_status_map() -> dict[tuple[str, str], dict[str, Any]]:
+    """Fetch signals.tax_delinquency_status and index by
+    (county_slug_lower, parcel_id) — the table's natural PK.
+
+    Small table (502 rows for the Olmsted pilot), one paged fetch per
+    request, mirroring the overlay/owner/tracker map convention. Returns {}
+    on any failure — graceful degrade: rows simply carry tax_status=None,
+    the frontend shows no badge/clock (honest gap, never a guess)."""
+    try:
+        rows = _fetch_all_rows(
+            "tax_delinquency_status",
+            "parcel_id, county_slug, " + ", ".join(_TAX_STATUS_KEYS),
+        )
+    except Exception as e:
+        logger.warning(
+            "tax delinquency status load failed (rows degrade to no block)",
+            error_type=type(e).__name__,
+        )
+        return {}
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        pid = r.get("parcel_id")
+        county = (r.get("county_slug") or "").lower()
+        if pid and county:
+            out[(county, pid)] = r
+    return out
 
 
 # ============================================================
@@ -1647,6 +1708,16 @@ _FORECLOSURE_SOURCES = {
     "startribune_legal",
 }
 
+# Sources that carry a redemption window in _redemption_fields. This is
+# _FORECLOSURE_SOURCES plus postbulletin_legal — postbulletin is deliberately
+# NOT added to _FORECLOSURE_SOURCES itself, because that set also drives
+# _effective_parcel_id's gis_pid extraction (sheriff rows store a synthetic
+# case-number parcel_id; their real pid lives in raw_data.detail.gis_pid).
+# Postbulletin raw_data is FLAT with no detail key, and its stored parcel_id
+# is ALREADY the real Olmsted PIN — putting it in _FORECLOSURE_SOURCES would
+# null its parcel resolution and silently break overlay/enrichment joins.
+_REDEMPTION_SOURCES = _FORECLOSURE_SOURCES | {"postbulletin_legal"}
+
 
 def _coerce_date(value: Any) -> Optional[_date]:
     """Parse a date or ISO datetime string into a date. Tolerant of the
@@ -1730,7 +1801,7 @@ def _redemption_fields(
         "redemption_resale_price": None,
         "redemption_resale_date": None,
     }
-    if source not in _FORECLOSURE_SOURCES:
+    if source not in _REDEMPTION_SOURCES:
         return null_result
 
     # ---- 0. Outcome tracker (authoritative when present) ----
@@ -1801,6 +1872,16 @@ def _redemption_fields(
 
     # 1. County-published exact date (Hennepin / Ramsey). Authoritative.
     published = raw.get("redemptionExpirationDate")
+    if published is None:
+        # postbulletin_legal (2026-07-10/11): the scraper writes
+        # redemption_expires = scheduled sale date + the redemption period,
+        # with redemption_basis 'stated' (period read from the notice text —
+        # treated as published/authoritative) or 'computed' (statutory
+        # default applied — tagged estimated, same honesty rule as the
+        # sale+182d path).
+        published = raw.get("redemption_expires")
+        if published is not None:
+            is_estimated = (raw.get("redemption_basis") or "") == "computed"
     ends_at = _coerce_date(published)
 
     # 2. Estimate from sale date — only for COMPLETED sales.
@@ -1818,9 +1899,12 @@ def _redemption_fields(
             # Anoka pulls a PENDING list; a null status means the sale has
             # not been confirmed completed. No redemption window.
             sale_completed = False
-        elif source == "startribune_legal":
+        elif source in ("startribune_legal", "postbulletin_legal"):
             # Extracted notices are SCHEDULED future sales — not completed,
             # so no redemption window until the sale actually occurs.
+            # (postbulletin only reaches here when the scraper wrote no
+            # redemption_expires; estimating sale+182d for a sale that has
+            # not happened would invent data.)
             sale_completed = False
 
         if sale_completed:
@@ -1857,6 +1941,7 @@ def _shape_property_row(
     overlay_map: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
     owner_map: Optional[dict[str, dict[str, Any]]] = None,
     tracker_map: Optional[dict[str, dict[Any, dict[str, Any]]]] = None,
+    delq_map: Optional[dict[tuple[str, str], dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     
     """Dispatch to the right per-source extractor and merge common fields.
@@ -1867,6 +1952,9 @@ def _shape_property_row(
     If a tracker_map is supplied, redemption fields come from the outcome
     tracker where a row exists (authoritative), else fall back to the
     published-date / estimate logic.
+    If a delq_map is supplied, olmsted_delq_list rows get a nested
+    'tax_status' block (Tyler-portal verdict: redeemed vs true delinquent,
+    forfeiture clock + basis, owner mailing) — tier-gated in redaction.
     """
     source = row.get("source") or ""
     raw = row.get("raw_data") or {}
@@ -1912,6 +2000,19 @@ def _shape_property_row(
     if overlay_map is not None and _eff_pid:
         overlay = overlay_map.get((_county_lower, _eff_pid))
     shaped["overlay"] = overlay
+
+    # Tyler tax-delinquency status: the per-parcel verdict from the weekly
+    # portal scrape. Only delq-list rows carry it; keyed on the row's OWN
+    # parcel_id (the list's PINs are real — the status table was built from
+    # them, verified 502/502). None when absent — no badge, honest gap.
+    tax_status = None
+    if delq_map is not None and source == "olmsted_delq_list":
+        _pid = row.get("parcel_id")
+        if _pid and _county_lower:
+            s_row = delq_map.get((_county_lower, _pid))
+            if s_row:
+                tax_status = {k: s_row.get(k) for k in _TAX_STATUS_KEYS}
+    shaped["tax_status"] = tax_status
 
     # Owner portfolio: how many distressed properties this row's owner holds,
     # plus their classified type. Looked up by the normalized gis_owner key,
@@ -2807,8 +2908,9 @@ async def list_properties(
             overlay_map = _load_overlay_map()
             owner_map = _load_owner_map()
             tracker_map = _load_redemption_tracker_map()
+            delq_map = _load_delq_status_map()
             shaped = [
-                _shape_property_row(r, overlay_map, owner_map, tracker_map)
+                _shape_property_row(r, overlay_map, owner_map, tracker_map, delq_map)
                 for r in rows
             ]
             _apply_assessor_owners(shaped)
@@ -2901,8 +3003,9 @@ async def list_properties(
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         tracker_map = _load_redemption_tracker_map()
+        delq_map = _load_delq_status_map()
         _shaped_page = [
-            _shape_property_row(r, overlay_map, owner_map, tracker_map)
+            _shape_property_row(r, overlay_map, owner_map, tracker_map, delq_map)
             for r in rows
         ]
         _apply_assessor_owners(_shaped_page)
@@ -2987,7 +3090,8 @@ async def get_property(
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         tracker_map = _load_redemption_tracker_map()
-        shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map)
+        delq_map = _load_delq_status_map()
+        shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map, delq_map)
         _apply_assessor_owners([shaped])
         shaped["raw"] = rows[0].get("raw_data") or {}
 
@@ -3158,8 +3262,9 @@ async def owner_properties(
         overlay_map = _load_overlay_map()
         owner_map = _load_owner_map()
         tracker_map = _load_redemption_tracker_map()
+        delq_map = _load_delq_status_map()
         shaped = [
-            _shape_property_row(r, overlay_map, owner_map, tracker_map)
+            _shape_property_row(r, overlay_map, owner_map, tracker_map, delq_map)
             for r in matched
         ]
         # Drop the internal de-dup key before returning.
