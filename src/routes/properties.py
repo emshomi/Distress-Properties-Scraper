@@ -2885,6 +2885,20 @@ async def list_properties(
 
         if needs_fetch_all:
 
+            # STABLE PAGE ORDER (2026-07-12): the paging loop below issues
+            # SEPARATE queries per 1000-row page, and Postgres guarantees no
+            # row order at all without ORDER BY — rows shuffle between pages,
+            # so some duplicate and some vanish (observed live: 40 of 4,614
+            # tax_delinquent rows lost/duplicated across 5 pages, deflating
+            # redeemed_count 254->214 while inflating total). Order by the
+            # requested column when it's a real DB column, then ALWAYS by id
+            # as the unique tiebreaker — ties on the primary sort are exactly
+            # how rows slip between page boundaries. Computed sorts re-sort
+            # in Python afterward, so id-only order is sufficient for them.
+            if sort not in computed_sorts:
+                query = query.order(sort, desc=(order == "desc"), nullsfirst=False)
+            query = query.order("id", desc=False)
+
             # Fetch EVERY matching row before shaping/filtering — never a
             # single capped slice. The multi_signal filter and computed sorts
             # operate on the shaped rows, so an incomplete fetch silently
@@ -3036,7 +3050,11 @@ async def list_properties(
         # nullsfirst=False: Postgres floats NULLs to the top of DESC sorts by
         # default, which put date-less legal notices above every dated sale on
         # "latest first". Nulls belong at the end in both directions.
+        # id tiebreaker (2026-07-12): rows tied on the sort column can swap
+        # across page boundaries between requests (same instability fixed in
+        # the fetch-all path) — a unique secondary key pins them.
         query = query.order(sort, desc=(order == "desc"), nullsfirst=False)
+        query = query.order("id", desc=False)
         query = query.range(offset, offset + limit - 1)
 
         result = query.execute()
