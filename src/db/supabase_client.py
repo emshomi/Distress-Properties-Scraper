@@ -89,11 +89,6 @@ def audit_table(table_name: str) -> Any:
     """Access a table in the `audit` schema (scraper_runs, scraper_errors, source_health)."""
     return get_client().schema("audit").table(table_name)
 
-
-def scoring_table(table_name: str) -> Any:
-    """Access a table in the `scoring` schema (models, parcel_features, parcel_scores)."""
-    return get_client().schema("scoring").table(table_name)
-
 def access_table(table_name: str) -> Any:
     """Access a table in the `access` schema (access_requests — the /data gate)."""
     return get_client().schema("access").table(table_name)
@@ -105,9 +100,15 @@ def ai_table(table_name: str) -> Any:
 
 
 def scoring_table(table_name: str) -> Any:
-    """Access a table/materialized view in the `scoring` schema
-    (comp_ratios, distress_multipliers — the deal-math calibration,
-    refreshed weekly by pg_cron after the Monday eCRV load)."""
+    """Access a table/materialized view in the `scoring` schema.
+
+    Covers the ML side (models, parcel_features, parcel_scores) AND the
+    deal-math calibration views (comp_ratios, distress_multipliers —
+    refreshed weekly by pg_cron after the Monday eCRV load).
+
+    NOTE (2026-07-13): this file briefly carried TWO definitions of this
+    function with divergent docstrings (Python silently lets the second
+    shadow the first). Merged into one — never redefine helpers here."""
     return get_client().schema("scoring").table(table_name)
 
 
@@ -155,6 +156,5 @@ __all__ = [
     "access_table",
     "ai_table",
     "outcomes_table",
-    "scoring_table",
     "ping_supabase",
 ]
