@@ -2167,6 +2167,90 @@ async def stats_endpoint() -> dict[str, Any]:
     })
     
 # ============================================================
+# GET /counties — the data-driven coverage registry (2026-07-13)
+# ============================================================
+# Kills the frontend's two hardcoded county arrays (dropdown + coverage
+# list). Membership rule, decided explicitly: a county is COVERED iff it
+# has a non-null slug in core.source_county_map — the mapping table is the
+# single coverage registry (the role it took on 2026-07-11). Row counts
+# come from the view; counties with zero current rows are omitted from the
+# response (a dropdown entry with nothing behind it is a coverage claim we
+# can't back). startribune's ~36 incidental one-notice counties never
+# appear: they're not in the registry.
+#
+# Onboarding a new county after this: scraper + one INSERT into
+# source_county_map (+ the properties.py Python maps until the backlogged
+# consolidation). ZERO frontend edits.
+
+
+@router.get(
+    "/counties",
+    status_code=http_status.HTTP_200_OK,
+    summary="Covered counties with live signal counts (drives the county dropdown).",
+)
+async def covered_counties() -> dict[str, Any]:
+    """Counties from the coverage registry (core.source_county_map) with a
+    live row count each from distress_with_parcel. Public, no tier gating —
+    coverage is marketing-page data. Fails LOUD (503) if the registry is
+    unreachable: an empty dropdown would be an honest-looking lie."""
+    try:
+        map_rows = (
+            core_table("source_county_map")
+            .select("county_slug")
+            .not_.is_("county_slug", "null")
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        logger.error(
+            "county registry load failed", error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="County coverage registry unavailable",
+        )
+
+    slugs = sorted({r["county_slug"] for r in map_rows if r.get("county_slug")})
+
+    counties: list[dict[str, Any]] = []
+    for slug in slugs:
+        try:
+            result = (
+                signals_table("distress_with_parcel")
+                .select("id", count="exact")
+                .eq("county_slug", slug)
+                .limit(1)
+                .execute()
+            )
+            count: Optional[int] = result.count or 0
+        except Exception as e:
+            # Count failed for this county only: keep the county (it IS
+            # registered coverage) with count=None rather than silently
+            # dropping it from the dropdown on a transient error.
+            logger.warning(
+                "county count failed",
+                county=slug,
+                error_type=type(e).__name__,
+            )
+            count = None
+        if count == 0:
+            continue  # registered but currently empty (e.g. a source not yet live)
+        counties.append(
+            {
+                "slug": slug,
+                "name": _SLUG_TO_COUNTY_NAME.get(
+                    slug, slug.replace("_", " ").title()
+                ),
+                "count": count,
+            }
+        )
+
+    counties.sort(key=lambda c: c["name"])
+    return success_envelope({"counties": counties})
+
+
+# ============================================================
 # GET /stats/differentiators — live USP numbers for the /about page
 # ============================================================
 
