@@ -123,6 +123,19 @@ class ParcelUpsert(BaseModel):
     estimated_equity: Decimal | None = None
     estimated_mortgage_balance: Decimal | None = None
 
+    # Assessor valuation + characteristics (2026-07-14): the typed columns
+    # the distress_with_parcel view and the UI actually read (emv_total etc.),
+    # DISTINCT from estimated_market_value above (a parallel legacy column).
+    # Added for the olmsted_parcels loader patch; optional everywhere, so
+    # existing loaders that don't set them are unaffected (exclude_none
+    # dumps also mean upserts never null-clobber backfilled values).
+    emv_total: Decimal | None = Field(default=None, ge=0)
+    emv_land: Decimal | None = Field(default=None, ge=0)
+    emv_building: Decimal | None = Field(default=None, ge=0)
+    num_units: int | None = Field(default=None, ge=0)
+    use_class: str | None = Field(default=None, max_length=200)
+    school_district: str | None = Field(default=None, max_length=50)
+
     # Status fields
     vacancy_status: VacancyStatus | None = None
 
