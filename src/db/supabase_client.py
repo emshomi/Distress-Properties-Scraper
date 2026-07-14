@@ -119,6 +119,7 @@ def outcomes_table(table_name: str) -> Any:
     return get_client().schema("outcomes").table(table_name)
 
 
+
 # ============================================================
 # CONNECTIVITY CHECK
 # ============================================================
