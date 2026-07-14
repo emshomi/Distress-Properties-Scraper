@@ -83,17 +83,19 @@ _FEATURE_SERVICE_URL = (
     "/General_Land_Info_OlmstedCountyMN/MapServer/3"
 )
 
-# MN property-class prefix -> internal property_type. Olmsted publishes the
-# statutory class STRING ("1a RESIDENTIAL", "3a COMMERCIAL PREFERENTIAL").
-# We map only the unambiguous prefixes; everything else stays NULL (better
-# than misclassifying). Class + LandUseDes are preserved in raw_data for
-# later refinement against real data.
-_CLASS_PREFIX_TO_INTERNAL: dict[str, str] = {
-    "1a": "single_family",   # residential homestead
-    "1b": "single_family",   # blind/disabled homestead
-    "4bb": "single_family",  # residential non-homestead single unit
-    "4a": "multifamily",     # apartment (4+ units)
-}
+# Class DESCRIPTION -> internal property_type. FIXED 2026-07-14: Olmsted's
+# statutory class strings are COMPOUND ("1a/4bb(1) RESIDENTIAL SINGLE UNIT"),
+# so the original first-token prefix map ("1a", "4bb", ...) matched only
+# plain-prefix classes — in practice the 697 '4a APARTMENT...' rows — and
+# missed all 54,060 single-unit rows (live audit). The county states the
+# answer in words, so match the description text. Deliberately conservative:
+# 'RESIDENTIAL 1-3 UNITS' stays None (could be a triplex — a wrong label is
+# worse than a missing one). Class + LandUseDes remain in raw_data for later
+# refinement. Same rule as MIGRATION_olmsted_typed_backfill_2026-07-14.sql.
+_CLASS_DESC_TO_INTERNAL: list[tuple[str, str]] = [
+    ("RESIDENTIAL SINGLE UNIT", "single_family"),
+    ("APARTMENT", "multifamily"),
+]
 
 _DB_BATCH_SIZE: int = 500
 
@@ -168,8 +170,11 @@ def _map_property_type(class_str: Any) -> str | None:
     s = _safe_str(class_str)
     if not s:
         return None
-    prefix = s.split()[0].lower()
-    return _CLASS_PREFIX_TO_INTERNAL.get(prefix)
+    up = s.upper()
+    for needle, internal in _CLASS_DESC_TO_INTERNAL:
+        if needle in up:
+            return internal
+    return None
 
 
 def _polygon_centroid(geometry: dict[str, Any] | None) -> tuple[float | None, float | None]:
@@ -377,6 +382,27 @@ class OlmstedParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
         property_type = _map_property_type(attributes.get("Class"))
         mkt_val = _safe_decimal(attributes.get("EMVTotal"))
+
+        # Typed assessor columns (2026-07-14 patch — same mappings as
+        # MIGRATION_olmsted_typed_backfill): these feed the emv_* columns
+        # the view/UI actually read (estimated_market_value above is a
+        # parallel legacy column, kept for its existing consumers).
+        emv_total = mkt_val
+        if emv_total is not None and emv_total == 0:
+            # 0 = unassessed/exempt, not "worth nothing" — a $0 EMV would
+            # poison equity-spread math. Component zeros below stay: bare
+            # land truly has EMVBldg 0.
+            emv_total = None
+        emv_land = _safe_decimal(attributes.get("EMVLand"))
+        emv_building = _safe_decimal(attributes.get("EMVBldg"))
+        lot_sqft = _safe_int(attributes.get("DeededSqFt"))
+        if not lot_sqft:  # 0 or None — most platted city lots publish 0 here
+            acres = _safe_float(attributes.get("DeedAcres"))
+            lot_sqft = int(acres * 43560) if acres and acres > 0 else None
+        num_units = _safe_int(attributes.get("LivngUnits"))
+        use_class = _safe_str(attributes.get("Class"))
+        school_district = _safe_str(attributes.get("SchoolDist"))
+
         cleaned_raw = _clean_raw_data(attributes)
 
         return {
@@ -390,6 +416,13 @@ class OlmstedParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "year_built": None,
             "property_type": property_type,
             "estimated_market_value": mkt_val,
+            "emv_total": emv_total,
+            "emv_land": emv_land,
+            "emv_building": emv_building,
+            "lot_sqft": lot_sqft,
+            "num_units": num_units,
+            "use_class": use_class,
+            "school_district": school_district,
             "raw_data": cleaned_raw,
         }
 
@@ -422,6 +455,13 @@ class OlmstedParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     year_built=sig.get("year_built"),
                     property_type=sig.get("property_type"),  # type: ignore[arg-type]
                     estimated_market_value=sig.get("estimated_market_value"),
+                    emv_total=sig.get("emv_total"),
+                    emv_land=sig.get("emv_land"),
+                    emv_building=sig.get("emv_building"),
+                    lot_sqft=sig.get("lot_sqft"),
+                    num_units=sig.get("num_units"),
+                    use_class=sig.get("use_class"),
+                    school_district=sig.get("school_district"),
                     raw_data=sig.get("raw_data"),
                     data_sources=[self.source_name],
                     last_observed_at=datetime.now(timezone.utc),
