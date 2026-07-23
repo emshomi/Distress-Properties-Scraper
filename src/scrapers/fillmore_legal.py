@@ -61,9 +61,13 @@ from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
 _API_URL = "https://fillmorecountyjournal.com/wp-json/wp/v2/posts"
 _CATEGORY_ID = 12          # "Legal Notice" (verified live 2026-07-23)
 _NEWSPAPER = "Fillmore County Journal"
-_WINDOW_DAYS = 45          # covers the full 6-week publication run
+_WINDOW_DAYS = 180         # wide: the Journal batch-posts web legals (the
+                           # 2026-07-23 first run found 0 posts in 45 days
+                           # while a live foreclosure sat at day 80); a
+                           # notice stays relevant through its ~6-month
+                           # redemption, and dedup makes the width free
 _PAGE_SIZE = 100           # WP REST max
-_MAX_PAGES = 3             # weekly paper; 45 days is well under 300 legals
+_MAX_PAGES = 6             # 180 days of a weekly paper's legals fits in 600
 _REQUEST_TIMEOUT = 30.0
 
 _TITLE = "Scheduled sheriff's sale (Fillmore County Journal notice)"
