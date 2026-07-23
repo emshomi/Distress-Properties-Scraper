@@ -379,10 +379,18 @@ class FillmoreParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
         # Acreage: DEEDEDACRE is the legal deeded figure; Acres is the
         # GIS-computed polygon area. Prefer deeded, fall back to computed.
+        # SANITY CAP (2026-07-23, run #1 lesson): one source row carried a
+        # garbage acreage that overflowed int4 (2.6e12 sqft) and killed its
+        # whole 500-row batch. Fillmore County is ~553k acres total; any
+        # parcel claiming more than 100,000 acres is source garbage ->
+        # honest None (raw value stays in raw_data).
         acres = _safe_float(attributes.get("DEEDEDACRE"))
         if not acres or acres <= 0:
             acres = _safe_float(attributes.get("Acres"))
-        lot_sqft = int(acres * 43560) if acres and acres > 0 else None
+        if acres and 0 < acres <= 100000:
+            lot_sqft = int(acres * 43560)
+        else:
+            lot_sqft = None
 
         use_class = _safe_str(attributes.get("CLASSDESCR"))
         school_district = _safe_str(attributes.get("SCHOOLDIST"))
@@ -477,6 +485,16 @@ class FillmoreParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 records_failed += f
                 batch = []
             if len(owner_batch) >= _DB_BATCH_SIZE:
+                # RACE FIX (2026-07-23, run #1 lesson): owner batches fill
+                # slower than parcel batches when some parcels lack an
+                # OWNERNAME, so an owner flush can reference parcels still
+                # sitting in the unflushed parcel batch -> FK violation
+                # kills the whole owner batch. Flush parcels FIRST, always.
+                if batch:
+                    n, f = self._upsert_batch(batch)
+                    records_new += n
+                    records_failed += f
+                    batch = []
                 self._upsert_owner_batch(owner_batch)
                 owner_batch = []
 
