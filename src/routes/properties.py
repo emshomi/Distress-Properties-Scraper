@@ -56,6 +56,10 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         # Rochester Post Bulletin foreclosure notices (Column API) — the
         # Olmsted pilot's first signal source (2026-07-09).
         {"source": "postbulletin_legal"},
+        # Fillmore County Journal foreclosure notices (WordPress REST) —
+        # the Chatfield-corridor expansion's first signal source
+        # (2026-07-23).
+        {"source": "fillmore_legal"},
     ],
     "tax_forfeit": [
         {"source": "hennepin_tax_roll", "event_type": "tax_forfeit"},
@@ -99,6 +103,7 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     "ramsey_tax_roll": "Ramsey",
     "ramsey_tfl": "Ramsey",
     "postbulletin_legal": "Olmsted",
+    "fillmore_legal": "Fillmore",
     "olmsted_delq_list": "Olmsted",
     "mn_dor_red_book": "Statewide",
 }
@@ -844,6 +849,9 @@ _EXTRACTORS: dict[str, Any] = {
     "ramsey_tax_roll": _extract_hennepin_tax,
     "ramsey_tfl": _extract_ramsey_tfl,
     "postbulletin_legal": _extract_postbulletin_legal,
+    # fillmore_legal writes the SAME raw_data schema by design
+    # (2026-07-23) — the extractor is shared, like ramsey_tax_roll.
+    "fillmore_legal": _extract_postbulletin_legal,
     "olmsted_delq_list": _extract_olmsted_delq,
 }
 
