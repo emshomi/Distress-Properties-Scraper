@@ -104,7 +104,7 @@ _COUNTY_NORMALIZERS: dict[str, Callable[[str], str]] = {
     "otter_tail": _normalize_generic,
     "cass": _normalize_generic,
     "chisago": _normalize_generic,
-    "fillmore": _normalize_generic,  # Beacon/Schneider county; verify format against real IDs in Phase 1
+    "fillmore": _normalize_generic,  # Beacon/Schneider county; 9-digit PINs verified live 2026-07-23
 }
 
 
