@@ -329,7 +329,7 @@ class FillmoreProbateScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             for r in matches:
                 signals.append(DistressEventInsert(
                     parcel_id=r["parcel_id"],
-                    event_type="probate_estate",
+                    event_type="probate_filing",
                     event_subtype="probate_notice",
                     event_date=event_date,
                     event_value=None,
