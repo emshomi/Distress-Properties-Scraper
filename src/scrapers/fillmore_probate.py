@@ -162,7 +162,7 @@ class FillmoreProbateScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
     """Fillmore probate notices -> probate_estate events on matched parcels."""
 
     source_name: ClassVar[str] = "fillmore_probate"
-    signal_type: ClassVar[str] = "probate_estate"
+    signal_type: ClassVar[str] = "probate_filing"
     county_code: ClassVar[str] = "fillmore"
 
     # ---- Fetch: same WP endpoint as fillmore_legal ----
