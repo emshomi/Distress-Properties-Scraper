@@ -58,7 +58,7 @@ _NEWSPAPER = "Fillmore County Journal"
 _WINDOW_DAYS = 365         # estates administer over a year; volume is tiny
                            # (19 posts/90d) and dedup makes the width free
 _PAGE_SIZE = 100
-_MAX_PAGES = 3
+_MAX_PAGES = 5
 _REQUEST_TIMEOUT = 30.0
 
 _TITLE = "Parcel owned by an estate in probate"
