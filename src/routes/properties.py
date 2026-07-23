@@ -112,6 +112,7 @@ _SLUG_TO_COUNTY_NAME: dict[str, str] = {
     "cass": "Cass",
     "chisago": "Chisago",
     "dakota": "Dakota",
+    "fillmore": "Fillmore",
     "hennepin": "Hennepin",
     "olmsted": "Olmsted",
     "otter_tail": "Otter Tail",
