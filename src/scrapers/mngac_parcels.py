@@ -508,6 +508,9 @@ def _build_owner_row(
             is_absentee = True
         elif up.startswith("Y") or "HOMESTEAD" in up:
             is_absentee = False
+    is_out_of_state: bool | None = (
+        (mailing_state != "MN") if mailing_state else None
+    )
     return {
         "parcel_id": parcel_id,
         "owner_name": owner_name,
