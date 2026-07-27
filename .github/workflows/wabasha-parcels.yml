@@ -1,0 +1,76 @@
+name: Wabasha Parcels Loader
+# Manual + QUARTERLY (deliberately not monthly). Wabasha is the first
+# county onboarded through the MnGeo statewide MNGAC open-parcels
+# aggregate rather than a county-operated GIS server, and that aggregate
+# recompiles far less often than a county updates its own layer: at
+# inspection (2026-07-27) all 87 counties shared a single rundate of
+# 2026-04-28, with Wabasha's acqdate at 2026-04-09. A monthly job would
+# re-upsert 17,323 identical rows eleven times a year for nothing.
+# The loader logs acqdate/rundate on every run, so if the compile cadence
+# turns out to be faster than quarterly the evidence will be in the logs.
+on:
+  workflow_dispatch:
+  schedule:
+    # 4th of Jan/Apr/Jul/Oct, 13:30 UTC = 7:30am Central (standard) /
+    # 8:30am (DST). Offset from the Ramsey monthly (1st, 13:30 UTC),
+    # Olmsted monthly (2nd, 13:30 UTC), Fillmore monthly (3rd, 13:30 UTC)
+    # and the daily sheriff jobs (12:00-12:20 UTC).
+    - cron: '30 13 4 1,4,7,10 *'
+jobs:
+  scrape:
+    name: Run Wabasha parcels (spine + owners)
+    runs-on: ubuntu-latest
+    # ~18 keyset pages of 1000 + per-page DB writes. Slightly more
+    # headroom than Fillmore: this layer is a STATEWIDE table filtered to
+    # co_code, so each page carries a WHERE the server must evaluate
+    # across all MN parcels.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Wabasha parcels loader
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable ONLY this job ---
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_FILLMORE_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_OLMSTED_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_RAMSEY_TFL_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+          SCRAPER_WABASHA_PARCELS_ENABLED: 'true'
+        run: |
+          python -m scripts.run_wabasha_parcels github_actions
