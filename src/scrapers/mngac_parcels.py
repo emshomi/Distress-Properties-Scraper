@@ -506,7 +506,10 @@ def _build_owner_row(
         up = homestead.upper()
         if up.startswith("N"):          # "No" / "Non-homestead"
             is_absentee = True
-        elif up.startswith("Y") or "HOMESTEAD" in up:
+        # "Yes" / "Fractional" / "Partial" / "FULL HOMESTEAD" — all mean
+        # the owner occupies the parcel (fractional = partial homestead,
+        # i.e. split ownership or mixed use, still owner-occupied).
+        elif up.startswith(("Y", "F", "P")) or "HOMESTEAD" in up:
             is_absentee = False
     is_out_of_state: bool | None = (
         (mailing_state != "MN") if mailing_state else None
