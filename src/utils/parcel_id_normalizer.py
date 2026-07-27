@@ -8,6 +8,7 @@ Canonical form for each county:
   - Hennepin: 13 digits, no separators (e.g., "0102924130001")
   - Ramsey:   12 digits, no separators (e.g., "012345678901")
   - Others:   strip non-alphanumeric, lowercase
+              (e.g., Wabasha "R08-00241-00" -> "r080024100")
 
 Use safe_normalize_parcel_id() for use cases where you want to catch
 malformed IDs without exceptions; use normalize_parcel_id() when an
@@ -105,6 +106,8 @@ _COUNTY_NORMALIZERS: dict[str, Callable[[str], str]] = {
     "cass": _normalize_generic,
     "chisago": _normalize_generic,
     "fillmore": _normalize_generic,  # Beacon/Schneider county; 9-digit PINs verified live 2026-07-23
+    "wabasha": _normalize_generic,   # MNGAC open-parcels county; hyphenated alphanumeric PINs
+                                     # ("R08-00241-00" -> "r080024100") verified live 2026-07-27
 }
 
 
