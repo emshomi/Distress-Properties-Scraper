@@ -144,6 +144,7 @@ class Settings(BaseSettings):
     scraper_fillmore_parcels_enabled: bool = Field(default=True)
     scraper_fillmore_legal_enabled: bool = Field(default=True)
     scraper_fillmore_probate_enabled: bool = Field(default=True)
+    scraper_wabasha_parcels_enabled: bool = Field(default=True)
     scraper_postbulletin_legal_enabled: bool = Field(default=True)
     scraper_anoka_sheriff_enabled: bool = Field(default=True)
     scraper_washington_sheriff_enabled: bool = Field(default=True)
