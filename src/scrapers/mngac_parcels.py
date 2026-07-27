@@ -486,14 +486,28 @@ def _build_owner_row(
         mailing_state = alt_state
         mailing_zip = mailing_zip or alt_zip
 
+    # ABSENTEE (2026-07-27, run #1 lesson): the mailing-vs-site string
+    # comparison the other counties use flagged 91% of Wabasha owners as
+    # absentee (10,049 of 11,047 addressed parcels) — real rates run
+    # 20-35%. Our site address is REASSEMBLED from MNGAC components
+    # ("73422 N 319th Ave") while own_add_l1 is the county's free-text
+    # mailing line ("73422 319th Ave"), so owner-occupied parcels fail
+    # equality on formatting alone.
+    #
+    # This layer publishes the ASSESSOR'S OWN owner-occupancy
+    # determination in `homestead` — authoritative where a string compare
+    # is a guess. Wabasha uses "Yes"/"No"; other MNGAC counties may use
+    # the "FULL HOMESTEAD"/"NON HOMESTEAD" form (cf. dakota_parcels), so
+    # both are handled. Honest None when the flag is absent — never fall
+    # back to the string compare that produced the bad number.
+    homestead = _clean_str(attrs.get("homestead"))
     is_absentee: bool | None = None
-    if mailing_address and site_address:
-        is_absentee = (
-            mailing_address.strip().upper() != site_address.strip().upper()
-        )
-    is_out_of_state: bool | None = (
-        (mailing_state != "MN") if mailing_state else None
-    )
+    if homestead:
+        up = homestead.upper()
+        if up.startswith("N"):          # "No" / "Non-homestead"
+            is_absentee = True
+        elif up.startswith("Y") or "HOMESTEAD" in up:
+            is_absentee = False
     return {
         "parcel_id": parcel_id,
         "owner_name": owner_name,
