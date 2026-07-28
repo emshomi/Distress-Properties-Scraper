@@ -212,14 +212,7 @@ _UNIT_WORD_RE = re.compile(r"\s+(UNIT|APT|STE|SUITE)\s+\S+$")
 _MULTI_WS_RE = re.compile(r"\s+")
 
 
-def _classify_owner(name: str) -> str:
-    up = name.upper()
-    for otype, pat in _OWNER_TYPE_PATTERNS:
-        if pat.search(up):
-            return otype
-    if "TRUST" in up and _LENDER_TRUST.search(up):
-        return "bank_lender"
-    return "individual"
+_classify_owner = classify_owner
 
 
 def _norm_street(value: str | None) -> str | None:
