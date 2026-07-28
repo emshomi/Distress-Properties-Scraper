@@ -160,16 +160,19 @@ def _title_case_city(city: str | None) -> str | None:
 
 
 def _normalize_fillmore_pin(raw_pin: str) -> str | None:
-    """Normalize a Fillmore PIN. The shared normalizer's 'fillmore' rule
-    (generic: strip non-alphanumeric, lowercase) passes the verified
-    9-digit numeric PINs through unchanged; the sanitize fallback keeps
-    any non-conforming id usable rather than dropping the parcel (PIN is
-    a 10-char field, so oddballs are possible)."""
-    pid, err = safe_normalize_parcel_id("fillmore", raw_pin)
-    if pid is not None:
-        return pid
-    sanitized = "".join(raw_pin.split())
-    return sanitized or None
+    """Normalize a Fillmore PIN, or None if it isn't one.
+
+    CHANGED 2026-07-28: this previously fell back to sanitizing any
+    non-conforming id "rather than dropping the parcel". That assumption was
+    wrong. The FillmoreAll layer's PIN field holds a STREET NAME on
+    right-of-way and road-centerline features — 'sunset', 'woodview',
+    'OakDr', 'CR11', '102ndst' — and the fallback loaded 355 of them as
+    parcels. Only 10 carried any EMV; 46 were exactly 9 characters and so
+    were indistinguishable from real PINs by length. They are road geometry,
+    not property, so the honest outcome is to drop them.
+    """
+    pid, _err = safe_normalize_parcel_id("fillmore", raw_pin)
+    return pid
 
 
 def _map_property_type(class_descr: Any) -> str | None:
