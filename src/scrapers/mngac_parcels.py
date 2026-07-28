@@ -1096,4 +1096,27 @@ class WabashaParcelsScraper(MNGACParcelsScraper):
     max_pages: ClassVar[int] = 40   # 17,323 rows -> ~18 pages; headroom
 
 
-__all__ = ["MNGACParcelsScraper", "WabashaParcelsScraper"]
+class AnokaParcelsScraper(MNGACParcelsScraper):
+    """Anoka County parcels via the MNGAC statewide open layer.
+
+    139,930 parcels verified live 2026-07-28. acqdate 2026-04-27 — one day
+    before the compile, the freshest tier in the whole aggregate (tied with
+    Hennepin and Houston), so the aggregate is a legitimate primary source
+    here rather than an expansion compromise.
+
+    THE NINTH COUNTY, and the reason the generic loader was worth building:
+    before this, core.parcels held 192 Anoka rows, every one a synthetic
+    ANOKA-FC-* placeholder created when a foreclosure signal could not
+    resolve to a real parcel. A top-five metro foreclosure county had no
+    spine at all — no EMV, no equity math, no eCRV outcome confirmation.
+    """
+
+    source_name: ClassVar[str] = "anoka_parcels"
+    county_code: ClassVar[str] = "anoka"
+    co_code: ClassVar[str] = "27003"
+
+    max_pages: ClassVar[int] = 200   # 139,930 rows -> 140 pages; headroom
+    progress_log_every: ClassVar[int] = 20000
+
+
+__all__ = ["MNGACParcelsScraper", "WabashaParcelsScraper", "AnokaParcelsScraper"]
