@@ -69,6 +69,31 @@ def _normalize_ramsey(raw: str) -> str:
     return cleaned
 
 
+def _normalize_fillmore(raw: str) -> str:
+    """
+    Fillmore: 9-digit numeric PIN.
+
+    ADDED 2026-07-28: the FillmoreAll layer's PIN field holds a STREET NAME
+    on right-of-way and road-centerline features — 'sunset', 'woodview',
+    'OakDr', 'CR11', '102ndst'. The generic rule accepts any alphanumeric
+    string of 6+ chars, so 355 of these were loaded as parcels (only 10 of
+    which carried any EMV). Length alone can't catch them: 46 were exactly
+    9 characters and so looked like valid PINs. The format is the test.
+
+    Examples:
+        "123456789"    -> "123456789"
+        "12-345-6789"  -> "123456789"
+        "sunset"       -> ValueError (road centerline, not a parcel)
+    """
+    cleaned = re.sub(r"\D", "", raw)
+    if len(cleaned) != 9:
+        raise ValueError(
+            f"Fillmore PIN must be 9 digits after normalization; got "
+            f"{len(cleaned)} from {raw!r}"
+        )
+    return cleaned
+
+
 def _normalize_wabasha(raw: str) -> str:
     """
     Wabasha: hyphenated alphanumeric PIN with a leading 'R' district prefix.
