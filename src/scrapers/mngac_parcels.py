@@ -398,14 +398,7 @@ _CITY_STATE_ZIP = re.compile(
 )
 
 
-def _classify_owner(name: str) -> str:
-    up = name.upper()
-    for otype, pat in _OWNER_TYPE_PATTERNS:
-        if pat.search(up):
-            return otype
-    if "TRUST" in up and _LENDER_TRUST.search(up):
-        return "bank_lender"
-    return "individual"
+_classify_owner = classify_owner
 
 
 def _parse_city_state_zip(
