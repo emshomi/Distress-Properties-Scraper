@@ -69,6 +69,25 @@ def _normalize_ramsey(raw: str) -> str:
     return cleaned
 
 
+def _normalize_wabasha(raw: str) -> str:
+    """
+    Wabasha: hyphenated alphanumeric PIN with a leading 'R' district prefix.
+
+    The generic rule kept the 'R' and produced 'r080024100', which does NOT
+    join to Minnesota's eCRV sales data — eCRV publishes the same identifier
+    as '22.00969.00', i.e. digits only. Verified live 2026-07-28: 0% match on
+    the generic key, 100% on digits-only across all 10 Wabasha eCRV records.
+
+    Examples:
+        "R08-00241-00" -> "080024100"
+        "08.00241.00"  -> "080024100"   (eCRV form of the same parcel)
+    """
+    cleaned = re.sub(r"\D", "", raw)
+    if not cleaned:
+        raise ValueError(f"Wabasha PIN is empty after normalization: {raw!r}")
+    return cleaned
+
+
 def _normalize_generic(raw: str) -> str:
     """
     Fallback for counties we haven't customized.
