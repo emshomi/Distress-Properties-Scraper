@@ -209,24 +209,9 @@ def _clean_raw_data(attributes: dict[str, Any]) -> dict[str, Any]:
 # signals.owner_distress_summary: government / bank_lender /
 # llc_business / individual.
 
-_OWNER_TYPE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("government", re.compile(
-        r"(SECRETARY OF|VETERANS AFFAIRS|\bHUD\b|HOUSING & URBAN|"
-        r"HOUSING AND URBAN|COUNTY OF|STATE OF MINNESOTA|CITY OF)")),
-    ("bank_lender", re.compile(
-        r"(BANK|MORTGAGE|\bMTGE\b|\bMTG\b|LENDING|FINANCIAL|"
-        r"CREDIT UNION|NATIONSTAR|FREDDIE|FANNIE|MIDFIRST|BANKUNITED|"
-        r"FEDERAL HOME LOAN|FEDERAL NAT|SERVBANK|CITIMORTGAGE)")),
-    ("bank_lender", re.compile(
-        r"(\bLOAN\b|NATIONAL ASSOC|\bNA\b|\bN A\b|\bN\.A\.|TRUSTEE)")),
-    ("llc_business", re.compile(
-        r"(\bLLC\b|L\.?L\.?C|\bINC\b|\bLTD\b|HOLDINGS|VENTURES|"
-        r"PROPERTIES|RENOVATION|REALTY|GROUP|COMPANY|\bCO\b)")),
-]
-_LENDER_TRUST = re.compile(
-    r"(MORTGAGE|\bMTG\b|\bLOAN\b|PARTIC|POINT|FUNDING|CAPITAL|MASTER|"
-    r"TITLE TRUST|TRUST [0-9])")
-_CSZ_RE = re.compile(r"^(?P<city>.*?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s*$")
+# Owner classification moved to src/utils/owner_classifier.py (2026-07-28).
+# This block was duplicated identically across five loaders; the shared
+# version also fixes ~1,255 government parcels misfiled as individual.
 
 
 def _classify_owner(name: str) -> str:
