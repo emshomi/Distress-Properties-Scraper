@@ -149,7 +149,7 @@ _COUNTY_NORMALIZERS: dict[str, Callable[[str], str]] = {
     "otter_tail": _normalize_generic,
     "cass": _normalize_generic,
     "chisago": _normalize_generic,
-    "fillmore": _normalize_generic,  # Beacon/Schneider county; 9-digit PINs verified live 2026-07-23
+    "fillmore": _normalize_fillmore,  # 9-digit numeric; layer PIN field holds street names on ROW features
     "wabasha": _normalize_wabasha,   # MNGAC open-parcels county; digits-only to join eCRV
                                      # ("R08-00241-00" -> "r080024100") verified live 2026-07-27
 }
