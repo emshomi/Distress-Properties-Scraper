@@ -239,15 +239,7 @@ def _clean_raw_data(attributes: dict[str, Any]) -> dict[str, Any]:
 # version also fixes ~1,255 government parcels misfiled as individual.
 
 
-def _classify_owner(name: str) -> str:
-    up = name.upper()
-    for otype, pat in _OWNER_TYPE_PATTERNS:
-        if pat.search(up):
-            return otype
-    if "TRUST" in up and _LENDER_TRUST.search(up):
-        return "bank_lender"
-    return "individual"
-
+_classify_owner = classify_owner
 
 def _compose_owner_mailing(attrs: dict[str, Any]) -> str | None:
     """Owner mailing street. Olmsted publishes BOTH composite lines
