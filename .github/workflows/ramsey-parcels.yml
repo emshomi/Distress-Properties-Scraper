@@ -1,0 +1,72 @@
+name: Ramsey Parcels Loader
+# Manual + monthly. ADDED 2026-07-28: run_ramsey_parcels.py and
+# src/scrapers/ramsey_parcels.py both existed, and 163,896 Ramsey parcels
+# are loaded, but there was no workflow — the spine had been run some other
+# way and could not be re-run from the browser. That surfaced when the
+# owner-classifier fix reclassified every other county's owners and Ramsey
+# kept 366 government parcels misfiled as individual, with no way to
+# refresh them.
+on:
+  workflow_dispatch:
+  schedule:
+    # 1st of the month, 13:30 UTC = 7:30am Central (standard) / 8:30am (DST).
+    # The 1st is Ramsey's existing monthly slot, ahead of Olmsted (2nd),
+    # Fillmore (3rd) and Wabasha (4th, quarterly).
+    - cron: '30 13 1 * *'
+jobs:
+  scrape:
+    name: Run Ramsey parcels (spine + owners)
+    runs-on: ubuntu-latest
+    # ~164K parcels. Hennepin's 448K run takes well under an hour; this is
+    # roughly a third of that, with headroom.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Ramsey parcels loader
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable ONLY this job ---
+          SCRAPER_ANOKA_PARCELS_ENABLED: 'false'
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_FILLMORE_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_OLMSTED_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'true'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_RAMSEY_TFL_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+          SCRAPER_WABASHA_PARCELS_ENABLED: 'false'
+        run: |
+          python -m scripts.run_ramsey_parcels github_actions
