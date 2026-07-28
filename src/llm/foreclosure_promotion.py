@@ -31,12 +31,35 @@ import re
 from typing import Any, Optional
 
 
+# The extraction LLM takes the county from free notice text, so it arrives
+# worded however that particular notice worded it — "Washington" in one,
+# "Washington County" in the next. Every downstream use (slug, synthetic
+# PID, display text) must see the bare name.
+_COUNTY_SUFFIX_RE = re.compile(r"\s*\bcount(?:y|ies)\b\s*$", re.IGNORECASE)
+
+
+def _county_bare(county: Optional[str]) -> Optional[str]:
+    """Strip a trailing 'County' from an extracted county name.
+
+    ADDED 2026-07-28: without this, 'Washington County' slugged to
+    'washington_county' and created a duplicate core.counties key alongside
+    the real 'washington' — verified live: ramsey_county, st_louis_county,
+    washington_county and polk_county each held one orphaned parcel. It also
+    produced 'Scheduled Washington County County sheriff sale' in the
+    public-facing description.
+    """
+    if not county:
+        return None
+    cleaned = _COUNTY_SUFFIX_RE.sub("", str(county)).strip()
+    return cleaned or None
+
+
 def _county_upper(county: Optional[str]) -> str:
-    return (county or "UNKNOWN").strip().upper()
+    return (_county_bare(county) or "UNKNOWN").strip().upper()
 
 
 def _county_lower(county: Optional[str]) -> str:
-    return (county or "unknown").strip().lower()
+    return (_county_bare(county) or "unknown").strip().lower()
 
 
 # County spelling variants that must collapse to the seeded core.counties slug.
