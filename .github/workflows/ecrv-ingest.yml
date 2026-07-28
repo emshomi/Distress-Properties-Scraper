@@ -1,0 +1,54 @@
+name: eCRV Ingest
+# MANUAL ONLY — no schedule. The Minnesota Department of Revenue emails an
+# alert when a new Weekly Sales Extract is ready; there is no fetchable URL
+# (the eCRV SOAP API needs county/city credentials Govire does not have).
+#
+# Process:
+#   1. Download the zip from the state
+#   2. Upload it to the private Supabase Storage bucket 'ecrv-extracts'
+#   3. Run this workflow with the object name
+#   4. Verify in SQL
+#
+# Before this existed, the loader was an uncommitted local script — 322,728
+# rows of history with no code in version control, and two extracts sitting
+# unloaded. The local-scrapers README already documents what that costs.
+#
+# Idempotent on (crv_number_id, parcel_id_raw): re-running the same file
+# updates rather than duplicates. Weekly extracts overlap by design.
+on:
+  workflow_dispatch:
+    inputs:
+      object_name:
+        description: 'Zip filename in the ecrv-extracts bucket'
+        required: true
+        default: '2026-07-27-02-10-41_eCRVExtract.zip'
+jobs:
+  ingest:
+    name: Ingest eCRV weekly extract
+    runs-on: ubuntu-latest
+    # ~2,700 certificates -> ~3,000 parcel rows, parsed in seconds; the
+    # time is the download plus batched upserts.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run eCRV ingest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          SCHEDULER_TIMEZONE: America/Chicago
+        run: |
+          python -m scripts.run_ecrv_ingest "${{ inputs.object_name }}"
