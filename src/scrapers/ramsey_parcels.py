@@ -66,6 +66,7 @@ from src.utils.errors import (
     ScraperDisabledError,
 )
 from src.utils.logger import logger
+from src.utils.owner_classifier import classify_owner
 from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
 
 
