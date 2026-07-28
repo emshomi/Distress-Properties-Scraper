@@ -214,6 +214,15 @@ def _clean_raw_data(attributes: dict[str, Any]) -> dict[str, Any]:
 # version also fixes ~1,255 government parcels misfiled as individual.
 
 
+# Ramsey publishes owner city/state/zip as ONE combined field
+# (OwnerCityStateZIP, e.g. "SAINT PAUL MN 55106"), so it needs a parser the
+# other four loaders don't. RESTORED 2026-07-28 — it lived inside the
+# classifier block that moved to src/utils/owner_classifier.py and was
+# removed with it, which broke the run with NameError: _CSZ_RE.
+_CSZ_RE = re.compile(
+    r"^(?P<city>.+?)\s+(?P<state>[A-Za-z]{2})\.?\s+(?P<zip>\d{5})(?:-\d{4})?\s*$"
+)
+
 _classify_owner = classify_owner
 
 
