@@ -1,0 +1,76 @@
+name: Anoka Parcels Loader
+# Manual + QUARTERLY. Same reasoning as Wabasha: this is the MnGeo
+# statewide MNGAC aggregate, which recompiles far less often than a county
+# updates its own layer (all 87 counties shared a single rundate of
+# 2026-04-28 at inspection). A monthly job would re-upsert 139,930
+# identical rows eleven times a year for nothing. Anoka's acqdate is
+# 2026-04-27 — one day before the compile, the freshest tier available —
+# so the aggregate is a legitimate primary source here.
+# The loader logs acqdate/rundate every run, so a cadence change shows up
+# in the logs.
+on:
+  workflow_dispatch:
+  schedule:
+    # 5th of Jan/Apr/Jul/Oct, 13:30 UTC = 7:30am Central (standard) /
+    # 8:30am (DST). Offset from Ramsey (1st), Olmsted (2nd), Fillmore
+    # (3rd), Wabasha (4th, quarterly) and the daily sheriff jobs
+    # (12:00-12:20 UTC).
+    - cron: '30 13 5 1,4,7,10 *'
+jobs:
+  scrape:
+    name: Run Anoka parcels (spine + owners)
+    runs-on: ubuntu-latest
+    # ~140 keyset pages of 1000 + per-page DB writes. Wabasha ran 18 pages
+    # in ~60s; Anoka is 8x that against the same statewide layer, so ~8-10
+    # minutes expected. Generous headroom.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Anoka parcels loader
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable ONLY this job ---
+          SCRAPER_ANOKA_PARCELS_ENABLED: 'true'
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_FILLMORE_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_OLMSTED_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_RAMSEY_TFL_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+          SCRAPER_WABASHA_PARCELS_ENABLED: 'false'
+        run: |
+          python -m scripts.run_anoka_parcels github_actions
