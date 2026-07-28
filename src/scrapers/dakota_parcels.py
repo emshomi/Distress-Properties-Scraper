@@ -193,7 +193,7 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     out_fields: ClassVar[str] = (  # CHANGED (added; was inherited "*")
         "PIN,SITEADDRESS,FULLNAME_PUBLIC,JOINT_OWNER_PUBLIC,"
         "OWN_ADD_L1,OWN_ADD_L2,OWN_ADD_L3,TOTALVAL,HOMESTEAD,"
-        "MUNICIPALITY,YEAR_BUILT"
+        "MUNICIPALITY,YEAR_BUILT,TAXPIN,OLDPIN"
     )
     # Geometry OFF: the address join needs no coordinates, and polygon geometry
     # was the main cause of the too-heavy payload. lat/lng will be None.
