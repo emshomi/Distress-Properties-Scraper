@@ -77,6 +77,7 @@ def _county_slug(county: Optional[str]) -> Optional[str]:
     values exactly: 'Scott' -> 'scott', 'St. Louis' -> 'st_louis',
     'Saint Louis' -> 'st_louis', 'Otter Tail' -> 'otter_tail'. Returns None if
     no county given."""
+    county = _county_bare(county)
     if not county:
         return None
     s = str(county).strip().lower()
