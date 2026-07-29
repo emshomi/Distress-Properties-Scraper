@@ -1,0 +1,49 @@
+name: Redemption Tracker Builder
+# Rebuilds outcomes.redemption_tracker from distress signals.
+#
+# ADDED 2026-07-28 because nothing in the repo populated that table. The
+# original loader was run from somewhere else and never committed — the
+# third such case found in one day. It defaulted every row to a 6-month
+# redemption period, and 193 of 529 Hennepin rows therefore contradicted
+# the county's OWN published expiry date, by up to 375 days. One of those
+# rows belonged to an owner who redeemed on a date our tracker said had
+# already passed.
+#
+# Runs AFTER the sheriff scrapers so new sales get a correct window the
+# same day. Idempotent — upserts on (source_table, source_id) and never
+# downgrades a county-published date to a computed default.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Set to 1 to preview counts without writing'
+        required: false
+        default: '0'
+  schedule:
+    # Daily at 12:40 UTC = 7:40am Central (standard) / 6:40am (DST).
+    # The sheriff scrapers run 12:00-12:20 UTC; this follows them so a sale
+    # scraped this morning has a redemption window by the time anyone looks.
+    - cron: '40 12 * * *'
+jobs:
+  build:
+    name: Rebuild redemption tracker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build redemption tracker
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python outcome_capture/redemption_builder.py
