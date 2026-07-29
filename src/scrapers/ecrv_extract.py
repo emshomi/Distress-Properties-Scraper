@@ -187,10 +187,27 @@ def parse_ecrv_xml(xml_bytes: bytes, source_file: str) -> list[dict[str, Any]]:
     """
     try:
         root = ET.fromstring(xml_bytes)
-    except ET.ParseError as e:
-        logger.warning("eCRV XML parse failed", file=source_file,
-                       error=str(e)[:200])
-        return []
+    except ET.ParseError:
+        # ENCODING FALLBACK (2026-07-28): the 2026-07-13 extract declared
+        # encoding="UTF-8" but wrote Windows-1252 bytes, so 198 of its 2,932
+        # certificates (6.8%) failed strict parsing and were silently
+        # dropped. The offenders are exactly the characters legal
+        # descriptions are full of: ° (414), ¼ (310), curly quotes (211),
+        # ½ (77) — quarter-quarter section calls and bearings.
+        #
+        # Every other weekly file parses clean as UTF-8, so this is a
+        # per-export defect at the state's end, not a format change. Decode
+        # as cp1252 and re-encode; verified to recover 198 of 198 with
+        # complete data (CRV id, county, parcels and price on every one).
+        try:
+            repaired = xml_bytes.decode("cp1252", errors="replace").encode("utf-8")
+            root = ET.fromstring(repaired)
+            logger.info("eCRV XML repaired via cp1252 fallback",
+                        file=source_file)
+        except (ET.ParseError, UnicodeDecodeError) as e:
+            logger.warning("eCRV XML parse failed", file=source_file,
+                           error=str(e)[:200])
+            return []
 
     crv_raw = _txt(root, "headerForm/crvNumberId")
     if not crv_raw:
