@@ -253,11 +253,30 @@ UPSERT_SQL = """
 INSERT INTO outcomes.redemption_tracker
     (county_code, parcel_id, source_table, source_id,
      anchor_date, anchor_type, redemption_period_months,
-     period_source, redemption_expiry_date, check_stage, outcome)
+     period_source, redemption_expiry_date, check_stage, outcome,
+     next_check_date)
 SELECT COALESCE(p.county_code, 'unknown'),
        %(parcel_id)s, %(source_table)s, %(source_id)s,
        %(anchor_date)s, %(anchor_type)s, %(redemption_period_months)s,
-       %(period_source)s, %(redemption_expiry_date)s, 0, 'pending'
+       %(period_source)s, %(redemption_expiry_date)s, 0, 'pending',
+       -- next_check_date MUST be set on insert. outcome_checker selects on
+       -- `next_check_date <= today`, so a NULL here makes the row invisible
+       -- to it forever: the property sits 'pending' and its outcome never
+       -- reaches distressed_exit_sales. Found live 2026-07-28 — 266 rows
+       -- inserted without it were stranded.
+       -- Mirrors outcome_checker.LADDER_OFFSETS = [30, 60, 90, 180]: the
+       -- first rung past expiry that is still in the future.
+       CASE
+         WHEN %(redemption_expiry_date)s::date + 30  > CURRENT_DATE
+           THEN %(redemption_expiry_date)s::date + 30
+         WHEN %(redemption_expiry_date)s::date + 60  > CURRENT_DATE
+           THEN %(redemption_expiry_date)s::date + 60
+         WHEN %(redemption_expiry_date)s::date + 90  > CURRENT_DATE
+           THEN %(redemption_expiry_date)s::date + 90
+         WHEN %(redemption_expiry_date)s::date + 180 > CURRENT_DATE
+           THEN %(redemption_expiry_date)s::date + 180
+         ELSE CURRENT_DATE
+       END
 FROM (SELECT 1) x
 LEFT JOIN core.parcels p ON p.parcel_id = %(parcel_id)s
 ON CONFLICT (source_table, source_id) DO UPDATE
