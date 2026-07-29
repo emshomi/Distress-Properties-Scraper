@@ -1455,8 +1455,18 @@ def _load_deal_calibration() -> Optional[dict[str, Any]]:
         ratio_rows = _fetch_all_rows_in_schema(
             scoring_table, "comp_ratios", "scope, county_code, city_norm, n, ratio"
         )
+        # REBUILT 2026-07-29. distress_multipliers no longer keys on the
+        # tracker `outcome` — it now groups by eCRV `channel`, which is
+        # observed from the deed rather than inferred, and is built on
+        # outcomes.distressed_exit_sales (first arms-length sale within 18
+        # months, one per parcel, deed-confirmed price). Usable sample went
+        # from 53 to 451. County-level rows carry county_slug; the
+        # statewide rollup has county_slug NULL.
+        #   old 'redeemed_by_owner' (owner sold in window) -> 'direct_standard'
+        #   old 'foreclosed_sold'   (REO resale)           -> 'reo_resale'
         mult_rows = _fetch_all_rows_in_schema(
-            scoring_table, "distress_multipliers", "outcome, n, p25, median, p75"
+            scoring_table, "distress_multipliers",
+            "channel, county_slug, n, p25, median, p75, avg_days_to_exit"
         )
     except Exception as e:
         logger.warning(
