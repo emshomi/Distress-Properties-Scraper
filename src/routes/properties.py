@@ -1486,7 +1486,17 @@ def _load_deal_calibration() -> Optional[dict[str, Any]]:
             county[r["county_code"]] = r
         elif r["scope"] == "metro":
             metro = r
-    mult = {m["outcome"]: m for m in mult_rows}
+    # Statewide rollup only (county_slug NULL) keyed to the old names, so
+    # every downstream caller keeps working unchanged.
+    _CHANNEL_ALIAS = {
+        "direct_standard": "redeemed_by_owner",
+        "reo_resale": "foreclosed_sold",
+    }
+    mult = {
+        _CHANNEL_ALIAS[m["channel"]]: m
+        for m in mult_rows
+        if m.get("county_slug") is None and m["channel"] in _CHANNEL_ALIAS
+    }
     if "redeemed_by_owner" not in mult:
         return None
     data = {"city": city, "county": county, "metro": metro, "mult": mult}
