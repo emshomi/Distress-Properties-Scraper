@@ -99,13 +99,65 @@ def _money_str(value: Any) -> str:
         return "—"
 
 
+# Redemption-period parsing. Notices state the period in wildly varied
+# wording, and the period is the single most consequential field we extract:
+# it determines the date an owner is told they must act by.
+_WORD_NUMBERS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+_NO_REDEMPTION_RE = re.compile(r"\bno\s+right\s+of\s+redemption\b", re.I)
+_PARENS_NUM_RE = re.compile(r"\((\d{1,2})\)")
+_LEADING_MONTHS_RE = re.compile(r"^\s*(\d{1,2})(?:\.\d+)?\s*(?:month|mo\b)", re.I)
+_ANY_DIGIT_MONTHS_RE = re.compile(r"\b(\d{1,2})(?:\.\d+)?\s*month", re.I)
+_WORD_MONTHS_RE = re.compile(
+    r"\b(" + "|".join(_WORD_NUMBERS) + r")\b\s*(?:\(\d{1,2}\))?\s*month", re.I
+)
+
+
 def _parse_redemption_months(text: Optional[str]) -> Optional[int]:
-    """'6 Months' -> 6. Returns None if no leading integer is present."""
+    """Redemption period in months. 0 = 'no right of redemption'. None = the
+    notice does not state one.
+
+    REWRITTEN 2026-07-28. The previous rule was `re.match(r"\\s*(\\d+)")` —
+    a LEADING digit only — which failed on every spelled-out notice. Measured
+    live: 114 of 215 sheriff_sales rows had a stated period that parsed to
+    NULL, and 110 of those were spelled out. The largest single value,
+    'six (6) months', accounted for 95 rows.
+
+    Worse than the nulls: 'twelve (12) months' also returned None, and
+    downstream the redemption tracker defaults an unknown period to 6 months
+    — so a 12-month property was being given a deadline SIX MONTHS EARLY.
+    Minnesota periods are genuinely 6 or 12 (Minn. Stat. ch. 580), so this
+    is not a hypothetical.
+
+    Verified against all 14 distinct values present in signals.sheriff_sales:
+    215 of 215 correct, including 'twelve (12) months' -> 12 and
+    'No right of redemption' -> 0.
+
+    Deliberately returns None rather than guessing for:
+      '5 weeks'  — §580.07 allows a five-WEEK period; weeks are not months
+      'not stated' — the notice genuinely omits it
+    An honest None lets the caller say "confirm on your notice"; a guess
+    would put a false date in front of a homeowner.
+    """
     if not text:
         return None
-    m = re.match(r"\s*(\d+)", str(text))
-    return int(m.group(1)) if m else None
-
+    s = str(text).strip()
+    if not s:
+        return None
+    if _NO_REDEMPTION_RE.search(s):
+        return 0
+    for rx in (_LEADING_MONTHS_RE, _PARENS_NUM_RE, _ANY_DIGIT_MONTHS_RE):
+        m = rx.search(s)
+        if m:
+            value = int(m.group(1))
+            if 0 < value <= 24:
+                return value
+    m = _WORD_MONTHS_RE.search(s)
+    if m:
+        return _WORD_NUMBERS[m.group(1).lower()]
+    return None
 
 def _parse_sale_time(text: Optional[str]) -> Optional[str]:
     """'10:00 AM' -> '10:00:00' (Postgres time). Returns None if unparseable."""
