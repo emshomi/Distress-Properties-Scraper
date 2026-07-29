@@ -37,7 +37,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-      -# outcome_capture/ scripts talk to Postgres directly via psycopg2 and
+      # outcome_capture/ scripts talk to Postgres directly via psycopg2 and
       # do not use the FastAPI service's dependency set. requirements.txt
       # has no Postgres driver — the service uses PostgREST. Mirrors how
       # outcome-checker.yml installs.
