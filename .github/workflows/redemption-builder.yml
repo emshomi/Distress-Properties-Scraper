@@ -37,10 +37,12 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+      -# outcome_capture/ scripts talk to Postgres directly via psycopg2 and
+      # do not use the FastAPI service's dependency set. requirements.txt
+      # has no Postgres driver — the service uses PostgREST. Mirrors how
+      # outcome-checker.yml installs.
       - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install psycopg2-binary
       - name: Build redemption tracker
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
