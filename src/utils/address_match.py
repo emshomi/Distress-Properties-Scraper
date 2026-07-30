@@ -1,121 +1,141 @@
-@router.get(
-    "/connect/lookup",
-    status_code=http_status.HTTP_200_OK,
-    summary="Find a property — masked, no distress detail",
-)
-async def connect_lookup(
-    address: str = Query(..., min_length=3, max_length=200),
-    city: Optional[str] = Query(default=None, max_length=60),
-    county: Optional[str] = Query(default=None, max_length=40),
-) -> dict[str, Any]:
-    """Step one. Returns whether we hold a record and a MASKED address only.
+"""
+Address normalization for the Connect owner lookup.
 
-    Deliberately returns NO redemption date, NO owner name and NO distress
-    information — see the privacy rule in the module docstring. A stranger
-    fuzzing addresses learns nothing they did not already know.
+An owner types their address the way they would write it on a letter. The
+county wrote it the way a database stores it. Those are rarely the same
+string, and every mismatch shows a homeowner "we do not have a record for
+that address" for a property we hold perfectly well.
 
-    MATCHING (rebuilt 2026-07-30):
-      * The typed address is normalized the same way the stored one is —
-        'Avenue North' and 'Ave. N.' both become 'AVE N'. Without this, an
-        owner who writes their address the way they would on a letter is told
-        we have no record of a property we hold perfectly well.
-      * The house number is matched with a LEADING anchor, not a substring.
-        Unanchored, a search for 5331 also returns 15331 Oak and anything on
-        Highway 5331 — across 1.1M parcels that is noise from the whole metro,
-        and the owner only sees masked addresses so cannot tell which is
-        theirs.
-      * A bare house number is refused outright rather than answered with ten
-        unrelated properties.
+Measured against the real assessor value 'AVE N':
+
+    what they type                    matches without this module?
+    5331 Angeline                     yes
+    5331 Angeline Avenue North        NO  — assessor abbreviates
+    5331 Angeline Ave. N.             NO  — punctuation
+    5331 angeline ave n, crystal      NO  — city is not in the address field
+    5331 N Angeline Ave               NO  — directional placed first
+
+The suffix and directional maps are the same ones
+src/scrapers/dakota_foreclosure_enrichment.py already uses, and for the same
+reason: Dakota's own two layers disagreed on street-type spelling, so the
+enrichment had to normalize BOTH sides through one map. Applying it here is
+the same problem seen from the owner's side.
+
+DIRECTION OF MAPPING: always long -> short. We never expand abbreviations,
+because expansion is ambiguous ('N' could be North or a street literally
+named N) while contraction is not.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+
+# Spelled-out street types -> the abbreviation county records use.
+_SUFFIX_MAP: dict[str, str] = {
+    "AVENUE": "AVE",
+    "STREET": "ST",
+    "DRIVE": "DR",
+    "ROAD": "RD",
+    "LANE": "LN",
+    "COURT": "CT",
+    "CIRCLE": "CIR",
+    "BOULEVARD": "BLVD",
+    "PLACE": "PL",
+    "PARKWAY": "PKWY",
+    "HIGHWAY": "HWY",
+    "TERRACE": "TER",
+    "TRAIL": "TRL",
+    "CROSSING": "XING",
+    "HEIGHTS": "HTS",
+    "POINT": "PT",
+    "SQUARE": "SQ",
+    "WAY": "WAY",
+}
+
+# Compound forms first — 'NORTHEAST' must not be read as 'NORTH' + 'EAST'.
+_DIRECTIONAL_MAP: dict[str, str] = {
+    "NORTHEAST": "NE",
+    "NORTHWEST": "NW",
+    "SOUTHEAST": "SE",
+    "SOUTHWEST": "SW",
+    "NORTH": "N",
+    "SOUTH": "S",
+    "EAST": "E",
+    "WEST": "W",
+}
+
+_UNIT_WORDS = {"APT", "UNIT", "STE", "SUITE", "#"}
+
+
+def normalize_address(raw: Optional[str]) -> str:
+    """Upper-case, strip punctuation and unit designators, collapse
+    spelled-out street types and directionals to their abbreviations.
+
+    Applied identically to what the owner typed and to what the county
+    stored, so it can never create a one-sided mismatch.
     """
-    if not is_searchable(address):
-        return success_envelope({
-            "query": address,
-            "match_count": 0,
-            "matches": [],
-            "needs_more_input": True,
-            "next_step": (
-                "Please include the street name as well as the number — "
-                "for example, 5331 Angeline."
-            ),
-        })
+    if not raw:
+        return ""
+    s = str(raw).upper()
 
-    normalized = normalize_address(address)
-    number, street = split_house_number(normalized)
+    # Everything from a unit marker onward is noise for matching purposes.
+    hash_at = s.find("#")
+    if hash_at != -1:
+        s = s[:hash_at]
 
-    try:
-        q = core_table("parcels").select(
-            "parcel_id, address, city, county_code, year_built, property_type"
-        )
-        if county:
-            q = q.eq("county_code", county.strip().lower())
-        if city:
-            q = q.ilike("city", city.strip())
-        # Anchor on the house number; the street name is filtered in Python
-        # after normalization, because the stored value has not been
-        # normalized and no SQL LIKE can do the suffix mapping.
-        q = q.ilike("address", f"{number}%") if number else q.ilike(
-            "address", f"%{normalized[:40]}%"
-        )
-        res = q.limit(60).execute()
-        rows = res.data or []
-    except Exception as e:
-        logger.warning("connect lookup failed", error_type=type(e).__name__)
-        rows = []
+    # Drop a trailing ", CRYSTAL MN 55429" — the county keeps city and zip in
+    # separate columns, so anything after a comma cannot help and will only
+    # prevent a match.
+    if "," in s:
+        s = s.split(",")[0]
 
-    # Keep rows whose normalized address starts with what they typed. This is
-    # what lets '5331 Angeline' find '5331 ANGELINE AVE N' while still
-    # rejecting '5331 Angelica Dr'.
-    candidates = []
-    for r in rows:
-        stored = normalize_address(r.get("address"))
-        if not stored:
-            continue
-        if stored.startswith(normalized) or normalized.startswith(stored):
-            candidates.append(r)
+    s = re.sub(r"[.\-_]", " ", s)          # 5331 Angeline Ave. N. -> AVE N
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
 
-    # Collapse duplicates. A foreclosed property often appears TWICE: once as
-    # the real assessor parcel and once as a synthetic '<COUNTY>-FC-*'
-    # placeholder minted by the foreclosure path when it could not resolve a
-    # parcel. Verified live: '5331 Angeline' returned both '0911821120148' and
-    # 'HENNEPIN-FC-2606002'.
-    #
-    # Two identical-looking rows is confusing for anyone, and actively harmful
-    # here — if the owner picks the synthetic one, /connect/status finds no
-    # assessed value, because synthetic parcels carry none. So when a real
-    # parcel exists for an address, the placeholder is dropped.
-    best: dict[str, dict[str, Any]] = {}
-    for r in candidates:
-        key = normalize_address(r.get("address"))
-        is_synthetic = "-FC-" in (r["parcel_id"] or "")
-        existing = best.get(key)
-        if existing is None or (existing["_synthetic"] and not is_synthetic):
-            best[key] = {
-                "parcel_id": r["parcel_id"],
-                "masked_address": _mask_address(r.get("address")),
-                "city": r.get("city"),
-                "county_code": r.get("county_code"),
-                # Included so the owner can RECOGNISE their own home from a
-                # masked address. '5XXX ANGELINE AVE N' alone is hard to
-                # confirm on a street with similar numbers. These add nothing
-                # a stranger could not read on the county's own public site.
-                "year_built": r.get("year_built"),
-                "property_type": r.get("property_type"),
-                "_synthetic": is_synthetic,
-            }
-    matches = [
-        {k: v for k, v in m.items() if not k.startswith("_")}
-        for m in list(best.values())[:10]
-    ]
+    out: list[str] = []
+    for tok in s.split():
+        if tok in _UNIT_WORDS:
+            break                          # unit designator: stop here
+        out.append(_DIRECTIONAL_MAP.get(tok, _SUFFIX_MAP.get(tok, tok)))
+    return " ".join(out)
 
-    logger.info("connect lookup", county=county, has_city=bool(city),
-                matches=len(matches))
-    return success_envelope({
-        "query": address,
-        "match_count": len(matches),
-        "matches": matches,
-        "needs_more_input": False,
-        "next_step": (
-            "If one of these is your property, confirm you are the owner to "
-            "see your redemption deadline and what is at stake."
-        ),
-    })
+
+def split_house_number(normalized: str) -> tuple[Optional[str], str]:
+    """('5331 ANGELINE AVE N') -> ('5331', 'ANGELINE AVE N').
+
+    The house number is matched with a LEADING anchor rather than a
+    substring, so a search for 5331 does not also return 15331 Oak St or a
+    property on Highway 5331. Across 1.1M parcels an unanchored number match
+    returns noise from the whole metro, and the owner — who only sees masked
+    addresses — cannot tell which if any is theirs.
+    """
+    if not normalized:
+        return None, ""
+    parts = normalized.split(" ", 1)
+    if parts[0].isdigit():
+        return parts[0], (parts[1] if len(parts) > 1 else "")
+    return None, normalized
+
+
+def is_searchable(raw: Optional[str]) -> bool:
+    """True when there is enough to search on: a number AND a street word.
+
+    A bare '5331' is not a search, it is a prefix, and answering it with ten
+    masked addresses from ten different cities tells an owner nothing except
+    that we appear not to have their home.
+    """
+    norm = normalize_address(raw)
+    if len(norm) < 4:
+        return False
+    number, rest = split_house_number(norm)
+    return bool(number and len(rest) >= 2)
+
+
+__all__ = [
+    "normalize_address",
+    "split_house_number",
+    "is_searchable",
+]
