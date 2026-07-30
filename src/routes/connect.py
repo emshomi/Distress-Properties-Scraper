@@ -728,21 +728,47 @@ async def connect_raise_hand(
     # trusts, estates and spouses not on title are common, and estates are
     # among the best opportunities. A miss goes to manual review, never to a
     # closed door.
-    verified = "manual_review"
-    try:
-        ow = (
-            core_table("owners")
-            .select("owner_name")
-            .eq("parcel_id", parcel_id)
-            .limit(1)
-            .execute()
-        )
-        if (ow.data or []):
-            verified = "unverified"   # owner of record exists; name match
-                                      # happens on review, not here
-    except Exception as e:
-        logger.warning("raise-hand: owner lookup failed",
-                       error_type=type(e).__name__)
+    # Ownership check against the assessor roll.
+    #
+    # NEVER a rejection gate. Trusts, estates, spouses not on title and
+    # recent transfers are all common, and estates are among the best
+    # opportunities on the platform. A mismatch goes to manual review, never
+    # to a closed door.
+    #
+    # The earlier version set 'unverified' when an owner record EXISTED and
+    # 'manual_review' when none did — inverted from what those words mean,
+    # and meaningless either way because no name was ever collected.
+    verified = "unverified"
+    if owner_name:
+        try:
+            ow = (
+                core_table("owners")
+                .select("owner_name")
+                .eq("parcel_id", parcel_id)
+                .limit(1)
+                .execute()
+            )
+            rows = ow.data or []
+            if rows and rows[0].get("owner_name"):
+                # Surname match on uppercase tokens. Deliberately loose: the
+                # assessor writes 'JOHN GOETTE', an owner may type 'John R.
+                # Goette' or 'Goette, John'. Requiring an exact string would
+                # fail almost everyone.
+                of_record = set(
+                    t for t in str(rows[0]["owner_name"]).upper().split()
+                    if len(t) > 2
+                )
+                claimed = set(
+                    t.strip(",.") for t in owner_name.upper().split()
+                    if len(t.strip(",.")) > 2
+                )
+                verified = "verified" if (of_record & claimed) else "manual_review"
+            else:
+                verified = "manual_review"
+        except Exception as e:
+            logger.warning("raise-hand: owner lookup failed",
+                           error_type=type(e).__name__)
+            verified = "manual_review"
 
     row: dict[str, Any] = {
         "parcel_id": parcel_id,
