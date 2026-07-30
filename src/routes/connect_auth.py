@@ -1,7 +1,8 @@
 """
 Magic-link authentication for Govire Connect owners.
 
-Deliberately separate from app_auth, and deliberately passwordless.
+Passwordless, and deliberately separate from every other identity system in
+the codebase.
 
 === WHY NOT app_auth.users ===
 That table is investor-shaped: password_hash NOT NULL, tier NOT NULL,
@@ -21,39 +22,59 @@ one-time token, nothing else required.
 
 === WHY NOT SUPABASE AUTH ===
 auth.users has ZERO rows — Govire has never used it. marketplace.listings
-originally FK'd to it, which is why that table could never hold a row. Every
-RLS policy on the marketplace schema keyed on auth.uid(), which returns NULL
-for us, so those policies matched nothing while appearing to protect owner
-data. They were dropped 2026-07-29; access is enforced here instead, the
+originally FK'd to it, which is why that table could never hold a row (fixed
+2026-07-29). Every RLS policy on the marketplace schema keyed on auth.uid(),
+which returns NULL for us, so those policies matched nothing while appearing
+to protect owner data. They were dropped; authorization happens here, the
 same way properties.py enforces tier in Python.
+
+=== WHY DIRECT POSTGRES AND NOT POSTGREST ===
+Rewritten 2026-07-29. The marketplace schema is RLS-enabled with NO policies
+and no grants to anon/authenticated — service-role only by design. PostgREST
+therefore buys nothing here and adds four independent failure modes: schema
+exposure, per-table exposure, the PostgREST schema cache, and Content-Profile
+/ Accept-Profile headers.
+
+All four were hit in one evening. The final state was a correctly created
+table, correctly exposed schema with a green tick, correct grants — and a
+flat HTTP 406 on even a plain SELECT, while the identical INSERT ran first
+try in the SQL editor. Rather than keep debugging a layer that adds no value
+for this schema, Connect talks to Postgres directly over DATABASE_URL, the
+same way outcome_capture/ already does.
 
 === TOKEN DESIGN ===
   * 32 bytes from secrets.token_urlsafe — not uuid4, not random.random.
-  * Stored as sha256. The plaintext exists only in the email or SMS, so a
-    database read cannot impersonate an owner.
-  * 30-minute expiry. Long enough for someone to find the email on a phone
-    in a difficult moment; short enough to matter.
-  * Single use: consumed on verification.
-  * Session token issued on success, 30 days, same hashing rules. Owners
-    should not have to re-authenticate to check on offers.
+  * Stored as sha256. The plaintext exists only in the email, so a database
+    read cannot impersonate an owner.
+  * 30-minute expiry on the login link. Long enough to find the email on a
+    phone in a difficult moment; short enough to matter.
+  * Single use: cleared on verification, so a forwarded or leaked link
+    cannot be replayed.
+  * 30-day session afterwards. Owners should not have to re-authenticate
+    every time they check whether offers have come in.
 
 === ENUMERATION ===
-request_link() returns the same response whether or not the address is
-known. Someone probing addresses to discover who is in foreclosure learns
-nothing.
+request_link() returns the same response to the caller whether or not the
+address is known. Someone probing addresses to discover who is in
+foreclosure learns nothing. A genuine internal failure IS reported, via
+internal_error — returning success on a failed insert made a real outage
+indistinguishable from normal operation and cost an evening.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import httpx
+import psycopg2
+import psycopg2.extras
 
 from src.config import settings
-from src.db.supabase_client import get_client
 from src.utils.logger import logger
 
 
@@ -64,15 +85,27 @@ _SESSION_TTL_DAYS = 30
 _RESEND_URL = "https://api.resend.com/emails"
 
 
-def marketplace_table(table_name: str) -> Any:
-    """Table handle in the marketplace schema.
+@contextmanager
+def pg() -> Iterator[Any]:
+    """A Postgres connection with a dict cursor.
 
-    Not in supabase_client alongside core_table/outcomes_table because the
-    marketplace is Connect-only and its access rules differ: RLS is enabled
-    with NO policies, so the service role is the sole reader and writer, and
-    every authorization decision happens in Python.
+    Opens per call rather than pooling: Connect's write volume is a handful
+    of requests a day, and a short-lived connection cannot go stale between
+    them. Revisit if that stops being true.
     """
-    return get_client().schema("marketplace").table(table_name)
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL is not set")
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _hash(token: str) -> str:
@@ -91,8 +124,11 @@ def _normalize_email(email: Optional[str]) -> Optional[str]:
 
 
 def _normalize_phone(phone: Optional[str]) -> Optional[str]:
-    """Digits only, then require 10 or 11 (US). Owners type phone numbers
-    every imaginable way and a rejected number is a lost person."""
+    """Digits only, then require 10 (US), tolerating a leading 1.
+
+    Owners type phone numbers every imaginable way and a rejected number is
+    a lost person.
+    """
     if not phone:
         return None
     digits = "".join(c for c in str(phone) if c.isdigit())
@@ -102,19 +138,19 @@ def _normalize_phone(phone: Optional[str]) -> Optional[str]:
 
 
 async def _send_magic_link(to_email: str, token: str) -> bool:
-    """Email the link via Resend. Mirrors scripts/health_alert.py, but async
-    and NON-FATAL: a send failure returns an error to the caller rather than
-    killing the process."""
+    """Email the link via Resend. Mirrors scripts/health_alert.py but async,
+    and NON-FATAL: a send failure is reported, never raised."""
     api_key = getattr(settings, "resend_api_key", None)
     from_addr = getattr(settings, "alert_email_from", None)
     if api_key is None or not from_addr:
-        logger.warning("connect: RESEND_API_KEY or ALERT_EMAIL_FROM unset; "
-                       "cannot send magic link")
+        logger.error("connect: RESEND_API_KEY or ALERT_EMAIL_FROM unset; "
+                     "cannot send magic link")
         return False
     if hasattr(api_key, "get_secret_value"):
         api_key = api_key.get_secret_value()
 
-    base = str(getattr(settings, "frontend_origin", None) or "https://govire.com").rstrip("/")
+    base = str(getattr(settings, "frontend_origin", None)
+               or "https://govire.com").rstrip("/")
     link = f"{base}/connect/verify?token={token}"
 
     body = (
@@ -122,7 +158,7 @@ async def _send_magic_link(to_email: str, token: str) -> bool:
         "deadline and any offers waiting for you:\n\n"
         f"{link}\n\n"
         "The link works once and expires in 30 minutes. If you did not "
-        "request it, you can ignore this email — nothing has been shared "
+        "request it you can ignore this email — nothing has been shared "
         "with anyone.\n\n"
         "Govire does not buy properties and takes no part of any sale."
     )
@@ -143,12 +179,14 @@ async def _send_magic_link(to_email: str, token: str) -> bool:
                 },
             )
     except httpx.HTTPError as e:
-        logger.warning("connect: Resend unreachable", error_type=type(e).__name__)
+        logger.error("connect: Resend unreachable",
+                     error_type=type(e).__name__, error=str(e)[:400])
         return False
 
     if 200 <= resp.status_code < 300:
         return True
-    logger.warning("connect: Resend rejected send", status=resp.status_code)
+    logger.error("connect: Resend rejected send",
+                 status=resp.status_code, body=resp.text[:400])
     return False
 
 
@@ -156,15 +194,7 @@ async def request_link(
     email: Optional[str] = None,
     phone: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Create or find an owner, mint a one-time token, and email it.
-
-    ALWAYS returns the same shape to the CALLER whether or not the contact is
-    known — revealing that an address exists would let someone probe for who
-    is in foreclosure. But a genuine internal failure is reported honestly
-    via internal_error, because returning success on a failed insert made a
-    real outage indistinguishable from normal operation on 2026-07-29 and
-    cost an hour of guessing at a cause the logs already knew.
-    """
+    """Create or find an owner, mint a one-time token, and email the link."""
     norm_email = _normalize_email(email)
     norm_phone = _normalize_phone(phone)
     if not norm_email and not norm_phone:
@@ -174,38 +204,48 @@ async def request_link(
     expires = _now() + timedelta(minutes=_LINK_TTL_MINUTES)
 
     try:
-        q = marketplace_table("owners").select("id, email, phone")
-        if norm_email:
-            q = q.ilike("email", norm_email)
-        else:
-            q = q.eq("phone", norm_phone)
-        existing = (q.limit(1).execute().data or [None])[0]
+        with pg() as cur:
+            if norm_email:
+                cur.execute(
+                    "SELECT id FROM marketplace.owners "
+                    "WHERE lower(email) = %s LIMIT 1",
+                    (norm_email,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id FROM marketplace.owners "
+                    "WHERE phone = %s LIMIT 1",
+                    (norm_phone,),
+                )
+            existing = cur.fetchone()
 
-        if existing:
-            owner_id = existing["id"]
-            marketplace_table("owners").update({
-                "login_token_hash": _hash(token),
-                "login_token_expires_at": expires.isoformat(),
-                "last_seen_at": _now().isoformat(),
-            }).eq("id", owner_id).execute()
-        else:
-            row = {
-                "email": norm_email,
-                "phone": norm_phone,
-                "login_token_hash": _hash(token),
-                "login_token_expires_at": expires.isoformat(),
-                "last_seen_at": _now().isoformat(),
-            }
-            created = marketplace_table("owners").insert(row).execute()
-            owner_id = (created.data or [{}])[0].get("id")
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE marketplace.owners
+                    SET login_token_hash = %s,
+                        login_token_expires_at = %s,
+                        last_seen_at = now()
+                    WHERE id = %s
+                    """,
+                    (_hash(token), expires, existing["id"]),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO marketplace.owners
+                        (email, phone, login_token_hash,
+                         login_token_expires_at, last_seen_at)
+                    VALUES (%s, %s, %s, %s, now())
+                    RETURNING id
+                    """,
+                    (norm_email, norm_phone, _hash(token), expires),
+                )
+                cur.fetchone()
     except Exception as e:
-        # LOG THE FULL ERROR. The response to the caller stays generic, but
-        # the operator has to be able to see what broke.
-        logger.error(
-            "connect: owner upsert FAILED",
-            error_type=type(e).__name__,
-            error=str(e)[:800],
-        )
+        # Log the real reason; tell the caller nothing specific.
+        logger.error("connect: owner upsert FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
         return {
             "sent": False,
             "channel": "email" if norm_email else "sms",
@@ -215,102 +255,135 @@ async def request_link(
     if norm_email:
         ok = await _send_magic_link(norm_email, token)
         logger.info("connect: magic link requested", delivered=ok)
+        if not ok:
+            # The owner row and token exist, but the link never reached them.
+            # Saying "sent" here would leave someone waiting for an email
+            # that is not coming.
+            return {"sent": False, "channel": "email", "internal_error": True}
     else:
-        # SMS not wired yet. The token exists and the owner row is created,
-        # so adding a sender later needs no schema change.
+        # SMS is not wired. The row and token exist, so adding a sender later
+        # needs no schema change — but phone-only signup does not work yet.
         logger.info("connect: magic link requested for phone; SMS not wired")
 
     return {"sent": True, "channel": "email" if norm_email else "sms"}
 
 
 def verify_link(token: str) -> Optional[dict[str, Any]]:
-    """Consume a magic-link token. Returns {owner_id, session_token} or None.
-
-    Single use: the login token is cleared on success, so a link in an email
-    that is later forwarded or leaked cannot be replayed.
-    """
+    """Consume a magic-link token. Returns {owner_id, session_token} or None."""
     if not token or len(token) < 20:
         return None
     try:
-        res = (
-            marketplace_table("owners")
-            .select("id, login_token_expires_at")
-            .eq("login_token_hash", _hash(token))
-            .limit(1)
-            .execute()
-        )
-        row = (res.data or [None])[0]
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT id, login_token_expires_at
+                FROM marketplace.owners
+                WHERE login_token_hash = %s
+                LIMIT 1
+                """,
+                (_hash(token),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            expires = row.get("login_token_expires_at")
+            if not expires or expires < _now():
+                logger.info("connect: magic link expired or already used")
+                return None
+
+            session = secrets.token_urlsafe(_TOKEN_BYTES)
+            cur.execute(
+                """
+                UPDATE marketplace.owners
+                SET login_token_hash = NULL,        -- single use
+                    login_token_expires_at = NULL,
+                    session_token_hash = %s,
+                    session_expires_at = %s,
+                    email_verified = true,
+                    last_seen_at = now()
+                WHERE id = %s
+                """,
+                (_hash(session),
+                 _now() + timedelta(days=_SESSION_TTL_DAYS),
+                 row["id"]),
+            )
+            return {"owner_id": str(row["id"]), "session_token": session}
     except Exception as e:
-        logger.warning("connect: token lookup failed",
-                       error_type=type(e).__name__)
+        logger.error("connect: verify FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
         return None
-
-    if not row:
-        return None
-
-    expires_raw = row.get("login_token_expires_at")
-    if not expires_raw:
-        return None
-    try:
-        expires = datetime.fromisoformat(str(expires_raw).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if expires < _now():
-        logger.info("connect: magic link expired")
-        return None
-
-    session = secrets.token_urlsafe(_TOKEN_BYTES)
-    try:
-        marketplace_table("owners").update({
-            "login_token_hash": None,          # single use
-            "login_token_expires_at": None,
-            "session_token_hash": _hash(session),
-            "session_expires_at": (_now() + timedelta(days=_SESSION_TTL_DAYS)).isoformat(),
-            "email_verified": True,
-            "last_seen_at": _now().isoformat(),
-        }).eq("id", row["id"]).execute()
-    except Exception as e:
-        logger.warning("connect: session issue failed",
-                       error_type=type(e).__name__)
-        return None
-
-    return {"owner_id": row["id"], "session_token": session}
 
 
 def owner_from_session(session_token: Optional[str]) -> Optional[str]:
     """Resolve a session token to an owner id, or None.
 
-    This is the authorization check for every owner-side write. It replaces
-    what RLS would have done via auth.uid() — see the module docstring.
+    This is the authorization check for every owner-side write — it replaces
+    what RLS would have done via auth.uid(). See the module docstring.
     """
     if not session_token or len(session_token) < 20:
         return None
     try:
-        res = (
-            marketplace_table("owners")
-            .select("id, session_expires_at")
-            .eq("session_token_hash", _hash(session_token))
-            .limit(1)
-            .execute()
-        )
-        row = (res.data or [None])[0]
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM marketplace.owners
+                WHERE session_token_hash = %s
+                  AND session_expires_at > now()
+                LIMIT 1
+                """,
+                (_hash(session_token),),
+            )
+            row = cur.fetchone()
+            return str(row["id"]) if row else None
     except Exception as e:
-        logger.warning("connect: session lookup failed",
-                       error_type=type(e).__name__)
+        logger.error("connect: session lookup FAILED",
+                     error_type=type(e).__name__, error=str(e)[:400])
         return None
-    if not row or not row.get("session_expires_at"):
-        return None
+
+
+def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
+    """Insert a marketplace.listings row. Returns the new id, or None.
+
+    Column allow-list is explicit: asking_price, description and photos are
+    NOT accepted. Pricing is exactly what a distressed owner does not know
+    and exactly what gets them taken advantage of — the offers set the
+    price. And nobody photographs a house they are ashamed of.
+    """
+    allowed = (
+        "parcel_id", "status", "occupancy", "condition", "primary_need",
+        "leaseback_interest", "buyback_interest", "earliest_close_date",
+        "preferred_close_date", "contact_preference", "contact_restrictions",
+        "ownership_verified",
+    )
+    cols = ["user_id"]
+    vals: list[Any] = [owner_id]
+    for key in allowed:
+        if fields.get(key) is not None:
+            cols.append(key)
+            vals.append(fields[key])
+
+    placeholders = ", ".join(["%s"] * len(vals))
+    col_sql = ", ".join(cols)
     try:
-        expires = datetime.fromisoformat(
-            str(row["session_expires_at"]).replace("Z", "+00:00"))
-    except ValueError:
+        with pg() as cur:
+            cur.execute(
+                f"INSERT INTO marketplace.listings ({col_sql}) "
+                f"VALUES ({placeholders}) RETURNING id",
+                vals,
+            )
+            row = cur.fetchone()
+            return str(row["id"]) if row else None
+    except Exception as e:
+        logger.error("connect: listing insert FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
         return None
-    return row["id"] if expires >= _now() else None
 
 
 __all__ = [
-    "marketplace_table",
+    "pg",
     "request_link",
     "verify_link",
     "owner_from_session",
+    "create_listing",
 ]
