@@ -176,18 +176,48 @@ def _options(days_remaining: Optional[int]) -> list[dict[str, Any]]:
             "govire_earns": None,
         },
         {
+            {
             "key": "counseling",
             "title": "Talk to a free HUD-approved housing counsellor",
             "detail": (
-                "Free, confidential, and independent. They can review your "
-                "whole situation, including options not listed here."
+                "Free, confidential and independent. A HUD-certified "
+                "counsellor will review your whole situation and tell you "
+                "what your options are — including ones not listed here, and "
+                "including telling you not to sell if that is the right "
+                "answer. We earn nothing from this and we are not involved."
             ),
-            # TODO: populate per-county agency contacts. Open decision #4 in
-            # docs/GOVIRE_CONNECT_IMPLEMENTATION_PLAN.md — needs real calls
-            # to HUD-approved agencies by county. Until then the front end
-            # links to the HUD directory rather than inventing a referral.
-            "agencies": [],
+            # DELIBERATELY LINKS THE OFFICIAL DIRECTORIES rather than
+            # embedding a list of agencies (2026-07-29).
+            #
+            # Minnesota has ~59 HUD-approved counselling agencies. Hardcoding
+            # their names, addresses and phone numbers would go stale, and a
+            # homeowner in crisis calling a disconnected number is a real
+            # harm — the same failure mode as directing people to the NEDA
+            # helpline after it was permanently disconnected.
+            #
+            # The Minnesota Homeownership Center maintains the authoritative
+            # searchable directory and keeps it current. Sending people there
+            # is both more reliable and more honest than duplicating it.
+            "directories": [
+                {
+                    "name": "Minnesota Homeownership Center — find an advisor",
+                    "url": "https://www.hocmn.org/find-an-advisor/",
+                    "note": (
+                        "Search free foreclosure-prevention counsellors by "
+                        "city or ZIP. This is the state's own referral tool."
+                    ),
+                },
+                {
+                    "name": "HUD — approved housing counselling agencies",
+                    "url": (
+                        "https://www.hud.gov/topics/"
+                        "avoiding_foreclosure/foreclosureprocess"
+                    ),
+                    "note": "The federal list and HUD's own foreclosure guide.",
+                },
+            ],
             "govire_earns": None,
+        },
         },
         {
             "key": "sell",
