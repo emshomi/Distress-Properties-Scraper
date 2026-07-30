@@ -18,6 +18,14 @@ resend==2.4.0
 # ---- Database client ----
 supabase==2.10.0
 postgrest==0.18.0
+# Direct Postgres. Added 2026-07-29: the marketplace schema is RLS-closed
+# with no grants (service-role only, every authorization decision in
+# Python), so PostgREST buys nothing there and adds four failure modes —
+# schema exposure, table exposure, schema cache, profile headers. All four
+# cost time on 2026-07-29 while direct SQL on the same table worked first
+# try. Connect writes go straight to Postgres via DATABASE_URL, the same
+# way outcome_capture already does.
+psycopg2-binary==2.9.10
 # ---- LLM (Anthropic Claude — NL search, summaries, extraction) ----
 anthropic==0.40.0
 # ---- HTTP client (used by all scrapers + geocoder) ----
