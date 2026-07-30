@@ -122,11 +122,26 @@ class Settings(BaseSettings):
         description="Per-account HUD USPS vacancy CSV download URL",
     )
 
-    # ----- CORS -----
+   # ----- CORS -----
 
     frontend_origin: HttpUrl | None = Field(
         default=None,
         description="Production frontend origin for CORS allow-list",
+    )
+
+    # ----- Transactional email (Resend) -----
+    # Added 2026-07-29 for Connect magic-link auth. scripts/health_alert.py
+    # already sends via Resend but reads os.environ directly, so these were
+    # never in config. Without them the magic link silently no-ops.
+
+    resend_api_key: SecretStr | None = Field(
+        default=None,
+        description="Resend API key for transactional email (magic links)",
+    )
+
+    alert_email_from: str | None = Field(
+        default=None,
+        description="Verified Resend sender, e.g. noreply@govire.com",
     )
 
     # ----- Scraper toggles -----
