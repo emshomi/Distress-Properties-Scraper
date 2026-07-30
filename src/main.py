@@ -180,6 +180,10 @@ app.include_router(properties.router)
 app.include_router(access.router)
 app.include_router(admin.router)
 app.include_router(ai.router)
+# Govire Connect — the public redemption calculator. Deliberately NOT behind
+# resolve_tier or redact_property: different consent basis, and gating it
+# would kill the organic search that is the whole point.
+app.include_router(connect.router)
 
 
 # ============================================================
