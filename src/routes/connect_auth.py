@@ -151,7 +151,12 @@ async def _send_magic_link(to_email: str, token: str) -> bool:
 
     base = str(getattr(settings, "frontend_origin", None)
                or "https://govire.com").rstrip("/")
-    link = f"{base}/connect/verify?token={token}"
+    # `next` carries the owner back to where they were. Without it the verify
+    # page defaults to /connect and someone who had just filled in the offers
+    # form landed on the calculator instead — their answers intact in
+    # sessionStorage but invisible, with no obvious way back.
+    nxt = f"&next={quote(next_path, safe='/')}" if next_path else ""
+    link = f"{base}/connect/verify?token={token}{nxt}"
 
     body = (
         "Here is your secure link to see your property's redemption "
