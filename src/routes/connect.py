@@ -72,6 +72,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, Body, Header, HTTPException, Query, status as http_status
 
 from src.db.supabase_client import core_table, outcomes_table, scoring_table
+from src.utils.address_match import (
+    is_searchable,
+    normalize_address,
+    split_house_number,
+)
 from src.routes.connect_auth import (
     create_listing,
     owner_from_session,
