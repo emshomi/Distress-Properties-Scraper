@@ -364,7 +364,11 @@ def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
     cols = ["user_id"]
     vals: list[Any] = [owner_id]
     for key in allowed:
-        if fields.get(key) is not None:
+        # `is not None`, NOT truthiness. leaseback_interest=False means "no,
+        # I do not want a leaseback" — real information an investor needs.
+        # A truthiness test would silently discard it along with every other
+        # deliberate 'no'.
+        if key in fields and fields[key] is not None:
             cols.append(key)
             vals.append(fields[key])
 
