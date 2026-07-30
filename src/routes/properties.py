@@ -2359,9 +2359,23 @@ async def redemption_stats() -> dict[str, Any]:
         return success_envelope(_REDEMPTION_STATS_CACHE["data"])
 
     try:
+        # redemption_current, NOT redemption_tracker.
+        #
+        # The raw tracker holds ONE ROW PER SHERIFF-SALE EVENT, so a property
+        # whose sale was postponed appears two or three times — all still
+        # 'pending', nothing marking the earlier ones superseded. 132 parcels
+        # are affected. Reading the raw table put "IN REDEMPTION NOW 837" on
+        # the public homepage when the true figure is 716 distinct properties.
+        #
+        # redemption_current is DISTINCT ON (parcel_id) ORDER BY anchor_date
+        # DESC — one authoritative row per property. See runbook Part 7.
+        #
+        # NOTE: _load_redemption_tracker_map() above deliberately still reads
+        # the RAW tracker — it needs every event to build its 'exact' index,
+        # and it already picks the latest anchor per parcel itself.
         rows = _fetch_all_rows_in_schema(
             outcomes_table,
-            "redemption_tracker",
+            "redemption_current",
             "redemption_expiry_date, outcome",
         )
     except Exception as e:
