@@ -182,7 +182,6 @@ def _options(days_remaining: Optional[int]) -> list[dict[str, Any]]:
             "govire_earns": None,
         },
         {
-            {
             "key": "counseling",
             "title": "Talk to a free HUD-approved housing counsellor",
             "detail": (
