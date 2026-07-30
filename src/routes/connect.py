@@ -426,7 +426,12 @@ async def connect_status(
 
     days = window.get("days_remaining") if window else None
     expiry = window.get("redemption_expiry_date") if window else None
-    emv = float(parcel["emv_total"]) if parcel and parcel.get("emv_total") else None
+    emv = None
+    if parcel:
+        for col in ("emv_total", "estimated_market_value"):
+            if parcel.get(col):
+                emv = float(parcel[col])
+                break
 
     deadline: Optional[dict[str, Any]] = None
     if window and expiry:
