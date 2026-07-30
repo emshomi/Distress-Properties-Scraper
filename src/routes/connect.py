@@ -82,6 +82,9 @@ from src.utils.errors import success_envelope
 from src.utils.logger import logger
 
 
+router = APIRouter(tags=["connect"])
+
+
 # Channels we NEVER show an owner as a price. See runbook Part 8.
 #   transfer_non_market — median 0.109. Quitclaims and nominal transfers.
 #     Paper transactions, not sales. Would read as "homes sell for 11% of
