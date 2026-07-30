@@ -223,7 +223,6 @@ def _options(days_remaining: Optional[int]) -> list[dict[str, Any]]:
             ],
             "govire_earns": None,
         },
-        },
         {
             "key": "sell",
             "title": "Sell before the deadline",
