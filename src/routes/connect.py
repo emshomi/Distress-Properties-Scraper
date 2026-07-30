@@ -609,6 +609,17 @@ async def connect_request_link(
     foreclosure."""
     result = await request_link(email=email, phone=phone)
     if not result.get("sent"):
+        if result.get("internal_error"):
+            # A database or send failure — NOT the caller's fault. Reporting
+            # this as "invalid email" sent us hunting a phantom escaping bug
+            # on 2026-07-29 while the real error sat in the logs.
+            raise HTTPException(
+                status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"message": (
+                    "We could not send that link just now. Please try again "
+                    "in a moment."
+                )},
+            )
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail={"message": "Enter a valid email address or phone number."},
