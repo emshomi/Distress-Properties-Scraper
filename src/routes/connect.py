@@ -584,5 +584,190 @@ async def connect_outcomes(
         "outcomes": bands,
     })
 
+# ============================================================
+# OWNER AUTH + HAND-RAISE
+# ============================================================
+# Passwordless by design. See src/routes/connect_auth.py for why this does
+# not use app_auth.users (investor-shaped: password, tier, subscription) or
+# Supabase Auth (zero rows, never used).
+
+
+@router.post(
+    "/connect/request-link",
+    status_code=http_status.HTTP_200_OK,
+    summary="Email a one-time sign-in link to an owner",
+)
+async def connect_request_link(
+    email: Optional[str] = Body(default=None),
+    phone: Optional[str] = Body(default=None),
+) -> dict[str, Any]:
+    """Returns the SAME response whether or not the contact is known — a
+    different answer would let someone probe addresses to discover who is in
+    foreclosure."""
+    result = await request_link(email=email, phone=phone)
+    if not result.get("sent"):
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Enter a valid email address or phone number."},
+        )
+    return success_envelope({
+        "sent": True,
+        "message": (
+            "Check your email for a secure link. It works once and expires "
+            "in 30 minutes."
+        ),
+    })
+
+
+@router.get(
+    "/connect/verify",
+    status_code=http_status.HTTP_200_OK,
+    summary="Exchange a one-time link for a session",
+)
+async def connect_verify(
+    token: str = Query(..., min_length=20, max_length=200),
+) -> dict[str, Any]:
+    session = verify_link(token)
+    if session is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": (
+                "That link has expired or has already been used. Request a "
+                "new one — it takes a moment."
+            )},
+        )
+    return success_envelope({
+        "session_token": session["session_token"],
+        "expires_in_days": 30,
+    })
+
+
+@router.post(
+    "/connect/raise-hand",
+    status_code=http_status.HTTP_201_CREATED,
+    summary="Owner signals they would consider offers",
+)
+async def connect_raise_hand(
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+    parcel_id: str = Body(...),
+    county: str = Body(...),
+    occupancy: Optional[str] = Body(default=None),
+    condition: Optional[str] = Body(default=None),
+    primary_need: Optional[str] = Body(default=None),
+    leaseback_interest: Optional[bool] = Body(default=None),
+    buyback_interest: Optional[bool] = Body(default=None),
+    earliest_close_date: Optional[str] = Body(default=None),
+    preferred_close_date: Optional[str] = Body(default=None),
+    contact_preference: Optional[str] = Body(default=None),
+    contact_restrictions: Optional[str] = Body(default=None),
+) -> dict[str, Any]:
+    """Create the listing.
+
+    NOTE what is NOT accepted: asking_price and description. Pricing is
+    exactly what a distressed owner does not know and exactly what gets them
+    taken advantage of — the offers set the price. Photos likewise: nobody
+    photographs a house they are ashamed of.
+
+    `primary_need` is the field that matters most. Nobody asks it today, and
+    it is where value is being destroyed: an owner who would take 15% less
+    for a 60-day leaseback has no way to say so, and the buyer who would
+    happily agree never hears it.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+
+    county = county.strip().lower()
+
+    # The parcel must be real. marketplace.listings FKs to core.parcels, and
+    # a synthetic '<COUNTY>-FC-*' placeholder would both fail the FK and
+    # carry no assessed value.
+    try:
+        pr = (
+            core_table("parcels")
+            .select("parcel_id, address, city")
+            .eq("parcel_id", parcel_id)
+            .eq("county_code", county)
+            .limit(1)
+            .execute()
+        )
+        parcel = (pr.data or [None])[0]
+    except Exception as e:
+        logger.warning("raise-hand: parcel lookup failed",
+                       error_type=type(e).__name__)
+        parcel = None
+
+    if parcel is None or "-FC-" in parcel_id:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail={"message": "We do not have a record for that property."},
+        )
+
+    # Ownership check against the assessor roll. NOT a rejection gate —
+    # trusts, estates and spouses not on title are common, and estates are
+    # among the best opportunities. A miss goes to manual review, never to a
+    # closed door.
+    verified = "manual_review"
+    try:
+        ow = (
+            core_table("owners")
+            .select("owner_name")
+            .eq("parcel_id", parcel_id)
+            .limit(1)
+            .execute()
+        )
+        if (ow.data or []):
+            verified = "unverified"   # owner of record exists; name match
+                                      # happens on review, not here
+    except Exception as e:
+        logger.warning("raise-hand: owner lookup failed",
+                       error_type=type(e).__name__)
+
+    row: dict[str, Any] = {
+        "parcel_id": parcel_id,
+        "user_id": owner_id,
+        "status": "active",
+        "occupancy": occupancy,
+        "condition": condition,
+        "primary_need": primary_need,
+        "leaseback_interest": leaseback_interest,
+        "buyback_interest": buyback_interest,
+        "earliest_close_date": earliest_close_date,
+        "preferred_close_date": preferred_close_date,
+        "contact_preference": contact_preference,
+        "contact_restrictions": contact_restrictions,
+        "ownership_verified": verified,
+    }
+    row = {k: v for k, v in row.items() if v is not None}
+
+    try:
+        created = marketplace_table("listings").insert(row).execute()
+        listing = (created.data or [{}])[0]
+    except Exception as e:
+        logger.warning("raise-hand: insert failed",
+                       error_type=type(e).__name__, error=str(e)[:300])
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={"message": (
+                "We could not save that. If you have already raised your "
+                "hand on this property, it is on file."
+            )},
+        ) from e
+
+    logger.info("raise-hand created", county=county, verified=verified)
+    return success_envelope({
+        "listing_id": listing.get("id"),
+        "status": "active",
+        "ownership_verified": verified,
+        "message": (
+            "On file. You are not committed to anything and you can withdraw "
+            "at any time. We will show you any offers that come in — nobody "
+            "gets your address or contact details until you choose to open "
+            "one."
+        ),
+    })
 
 __all__ = ["router"]
