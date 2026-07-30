@@ -201,6 +201,7 @@ async def _send_magic_link(
 async def request_link(
     email: Optional[str] = None,
     phone: Optional[str] = None,
+    next_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create or find an owner, mint a one-time token, and email the link."""
     norm_email = _normalize_email(email)
