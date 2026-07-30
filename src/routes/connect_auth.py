@@ -158,9 +158,12 @@ async def request_link(
 ) -> dict[str, Any]:
     """Create or find an owner, mint a one-time token, and email it.
 
-    ALWAYS returns the same shape whether or not the contact is known.
-    Revealing that an address exists would let someone probe for who is in
-    foreclosure.
+    ALWAYS returns the same shape to the CALLER whether or not the contact is
+    known — revealing that an address exists would let someone probe for who
+    is in foreclosure. But a genuine internal failure is reported honestly
+    via internal_error, because returning success on a failed insert made a
+    real outage indistinguishable from normal operation on 2026-07-29 and
+    cost an hour of guessing at a cause the logs already knew.
     """
     norm_email = _normalize_email(email)
     norm_phone = _normalize_phone(phone)
@@ -195,12 +198,9 @@ async def request_link(
             }
             created = marketplace_table("owners").insert(row).execute()
             owner_id = (created.data or [{}])[0].get("id")
-   except Exception as e:
-        # LOG THE FULL ERROR. The response stays generic — an attacker must
-        # not learn whether a given address exists — but the operator has to
-        # be able to see what broke. Returning success on a failed insert
-        # made a real outage indistinguishable from normal operation on
-        # 2026-07-29 and cost an hour of guessing.
+    except Exception as e:
+        # LOG THE FULL ERROR. The response to the caller stays generic, but
+        # the operator has to be able to see what broke.
         logger.error(
             "connect: owner upsert FAILED",
             error_type=type(e).__name__,
