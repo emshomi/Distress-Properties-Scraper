@@ -242,11 +242,32 @@ def _outcome_bands(county_code: Optional[str]) -> dict[str, Any]:
             and (r.get("n") or 0) >= _MIN_SAMPLE
         ]
 
-    scope = county_code
-    picked = usable([r for r in rows if r.get("county_slug") == county_code])
-    if len(picked) < 2:          # need at least owner-sale vs REO to compare
-        scope = "minnesota"
-        picked = usable([r for r in rows if r.get("county_slug") is None])
+   # Scope selection is ALL-OR-NOTHING on the two channels that carry the
+    # comparison. The owner's decision is "sell it myself" vs "let it go to
+    # foreclosure", so direct_standard and reo_resale must BOTH clear the
+    # sample floor or we fall back to statewide for every band.
+    #
+    # Filtering band-by-band was the earlier behaviour and it was worse than
+    # a thin sample: Hennepin's reo_resale (n=9) dropped out and the page
+    # showed "sold by the owner 1.023x" with nothing to compare it against.
+    # A number with no counterfactual is not evidence, it is an assertion.
+    _REQUIRED = ("direct_standard", "reo_resale")
+
+    def scope_ok(scope_rows: list[dict[str, Any]]) -> bool:
+        have = {r["channel"] for r in usable(scope_rows)}
+        return all(ch in have for ch in _REQUIRED)
+
+    county_rows = [r for r in rows if r.get("county_slug") == county_code]
+    state_rows = [r for r in rows if r.get("county_slug") is None]
+
+    if county_code and scope_ok(county_rows):
+        scope, picked = county_code, usable(county_rows)
+    elif scope_ok(state_rows):
+        scope, picked = "minnesota", usable(state_rows)
+    else:
+        # Neither scope can support the comparison. Say nothing rather than
+        # publish half of it.
+        scope, picked = None, []
 
     bands = sorted(
         (
