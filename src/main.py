@@ -164,7 +164,18 @@ app.add_middleware(
     allow_origins=_cors_allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Admin-Key", "X-Access-Key", "Accept", "Authorization"],
+    # X-Connect-Session is what makes POST /connect/raise-hand a preflighted
+    # request. Omitting it here fails the OPTIONS check, so the browser blocks
+    # the POST before sending it — no status code, no server-side log, and a
+    # bare "CORS error" in devtools.
+    allow_headers=[
+        "Content-Type",
+        "X-Admin-Key",
+        "X-Access-Key",
+        "X-Connect-Session",
+        "Accept",
+        "Authorization",
+    ],
     max_age=3600,
 )
 
