@@ -380,9 +380,14 @@ def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
             row = cur.fetchone()
             return str(row["id"]) if row else None
     except Exception as e:
+        # TEMPORARY: returns the error string so it reaches the HTTP response.
+        # The Railway log stream silently drops loguru lines — entries arrive
+        # as blank strings — so it cannot be relied on for diagnosis. Revert
+        # to `return None` once the cause is known; an internal error message
+        # must never reach a homeowner.
         logger.error("connect: listing insert FAILED",
                      error_type=type(e).__name__, error=str(e)[:800])
-        return None
+        return f"ERROR::{type(e).__name__}: {e}"
 
 
 __all__ = [
