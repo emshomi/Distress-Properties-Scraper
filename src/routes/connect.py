@@ -389,10 +389,19 @@ async def connect_status(
 
     # --- the property
     try:
+        # Read BOTH value columns. core.parcels has two: emv_total (written by
+        # the MNGAC loaders — anoka, wabasha) and estimated_market_value
+        # (written by the older county-direct loaders — hennepin, dakota,
+        # ramsey, washington, olmsted, fillmore). Verified live 2026-07-29:
+        # Hennepin had emv_total on 29,522 rows but
+        # estimated_market_value on 443,610. Reading only emv_total made
+        # at_stake null for ~95% of Hennepin owners — the single most
+        # behaviour-changing fact on the page.
         pr = (
             core_table("parcels")
             .select("parcel_id, address, city, zip, emv_total, emv_land, "
-                    "emv_building, year_built, property_type")
+                    "emv_building, estimated_market_value, year_built, "
+                    "property_type")
             .eq("parcel_id", parcel_id)
             .eq("county_code", county)
             .limit(1)
