@@ -606,7 +606,10 @@ async def connect_request_link(
     """Returns the SAME response whether or not the contact is known — a
     different answer would let someone probe addresses to discover who is in
     foreclosure."""
-    result = await request_link(email=email, phone=phone)
+    # Only same-site paths — never an absolute URL. An open redirect in an
+    # emailed link is a phishing primitive.
+    safe_next = next_path if (next_path or "").startswith("/") else None
+    result = await request_link(email=email, phone=phone, next_path=safe_next)
     if not result.get("sent"):
         if result.get("internal_error"):
             # A database or send failure — NOT the caller's fault. Reporting
