@@ -601,6 +601,7 @@ async def connect_outcomes(
 async def connect_request_link(
     email: Optional[str] = Body(default=None),
     phone: Optional[str] = Body(default=None),
+    next_path: Optional[str] = Body(default=None),
 ) -> dict[str, Any]:
     """Returns the SAME response whether or not the contact is known — a
     different answer would let someone probe addresses to discover who is in
