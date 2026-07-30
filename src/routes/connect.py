@@ -474,11 +474,17 @@ async def connect_status(
 
     at_stake: Optional[dict[str, Any]] = None
     if emv:
+        # The land/building split is included only where the county populates
+        # it, and omitted entirely otherwise rather than returned as null —
+        # a null reads as missing data when in fact it is detail we do not
+        # need. Coverage is uneven and deliberately not backfilled: Olmsted
+        # and Fillmore are at 100%, Hennepin at ~7% (its LAND_MV1/BLDG_MV1
+        # sit unmapped in raw_data), Dakota/Ramsey/Washington use different
+        # field names again. An owner deciding whether to reinstate, sell or
+        # call a counsellor needs the TOTAL; how the assessor divides it
+        # between dirt and structure changes nothing.
         at_stake = {
             "assessed_value": emv,
-            "assessed_land": float(parcel["emv_land"]) if parcel.get("emv_land") else None,
-            "assessed_building": (float(parcel["emv_building"])
-                                  if parcel.get("emv_building") else None),
             "note": (
                 "Assessed value is the county's figure for tax purposes, not "
                 "a listing price. What you would actually get depends on "
