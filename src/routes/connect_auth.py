@@ -267,7 +267,7 @@ async def request_link(
         }
 
     if norm_email:
-        ok = await _send_magic_link(norm_email, token)
+        ok = await _send_magic_link(norm_email, token, next_path)
         logger.info("connect: magic link requested", delivered=ok)
         if not ok:
             # The owner row and token exist, but the link never reached them.
