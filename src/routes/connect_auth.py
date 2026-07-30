@@ -195,8 +195,7 @@ async def request_link(
             }
             created = marketplace_table("owners").insert(row).execute()
             owner_id = (created.data or [{}])[0].get("id")
-    except Exception as e:
-        except Exception as e:
+   except Exception as e:
         # LOG THE FULL ERROR. The response stays generic — an attacker must
         # not learn whether a given address exists — but the operator has to
         # be able to see what broke. Returning success on a failed insert
