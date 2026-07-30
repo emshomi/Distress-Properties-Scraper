@@ -757,23 +757,19 @@ async def connect_raise_hand(
     }
     row = {k: v for k, v in row.items() if v is not None}
 
-    try:
-        created = marketplace_table("listings").insert(row).execute()
-        listing = (created.data or [{}])[0]
-    except Exception as e:
-        logger.warning("raise-hand: insert failed",
-                       error_type=type(e).__name__, error=str(e)[:300])
+    listing_id = create_listing(owner_id, row)
+    if listing_id is None:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail={"message": (
                 "We could not save that. If you have already raised your "
                 "hand on this property, it is on file."
             )},
-        ) from e
+        )
 
     logger.info("raise-hand created", county=county, verified=verified)
     return success_envelope({
-        "listing_id": listing.get("id"),
+        "listing_id": listing_id,
         "status": "active",
         "ownership_verified": verified,
         "message": (
