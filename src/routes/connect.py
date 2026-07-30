@@ -69,14 +69,17 @@ import re
 from datetime import date
 from typing import Any, Optional
 
-from fastapi import APIRouter, Query, status as http_status
+from fastapi import APIRouter, Body, Header, HTTPException, Query, status as http_status
 
 from src.db.supabase_client import core_table, outcomes_table, scoring_table
+from src.routes.connect_auth import (
+    marketplace_table,
+    owner_from_session,
+    request_link,
+    verify_link,
+)
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
-
-
-router = APIRouter(tags=["connect"])
 
 
 # Channels we NEVER show an owner as a price. See runbook Part 8.
