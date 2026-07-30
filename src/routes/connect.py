@@ -665,6 +665,10 @@ async def connect_raise_hand(
     x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
     parcel_id: str = Body(...),
     county: str = Body(...),
+    # Needed to verify ownership at all. Without a name there is nothing to
+    # compare against the assessor's owner of record, and the
+    # ownership_verified column is decorative.
+    owner_name: Optional[str] = Body(default=None),
     occupancy: Optional[str] = Body(default=None),
     condition: Optional[str] = Body(default=None),
     primary_need: Optional[str] = Body(default=None),
