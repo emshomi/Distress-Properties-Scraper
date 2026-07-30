@@ -196,11 +196,22 @@ async def request_link(
             created = marketplace_table("owners").insert(row).execute()
             owner_id = (created.data or [{}])[0].get("id")
     except Exception as e:
-        logger.warning("connect: owner upsert failed",
-                       error_type=type(e).__name__)
-        # Same response as success — never leak that something went wrong
-        # for a specific address.
-        return {"sent": True, "channel": "email" if norm_email else "sms"}
+        except Exception as e:
+        # LOG THE FULL ERROR. The response stays generic — an attacker must
+        # not learn whether a given address exists — but the operator has to
+        # be able to see what broke. Returning success on a failed insert
+        # made a real outage indistinguishable from normal operation on
+        # 2026-07-29 and cost an hour of guessing.
+        logger.error(
+            "connect: owner upsert FAILED",
+            error_type=type(e).__name__,
+            error=str(e)[:800],
+        )
+        return {
+            "sent": False,
+            "channel": "email" if norm_email else "sms",
+            "internal_error": True,
+        }
 
     if norm_email:
         ok = await _send_magic_link(norm_email, token)
