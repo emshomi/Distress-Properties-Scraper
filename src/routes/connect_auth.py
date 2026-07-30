@@ -138,7 +138,9 @@ def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     return digits if len(digits) == 10 else None
 
 
-async def _send_magic_link(to_email: str, token: str) -> bool:
+async def _send_magic_link(
+    to_email: str, token: str, next_path: Optional[str] = None
+) -> bool:
     """Email the link via Resend. Mirrors scripts/health_alert.py but async,
     and NON-FATAL: a send failure is reported, never raised."""
     api_key = getattr(settings, "resend_api_key", None)
