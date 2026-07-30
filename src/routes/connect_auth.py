@@ -67,6 +67,7 @@ import hashlib
 import os
 import secrets
 from contextlib import contextmanager
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
