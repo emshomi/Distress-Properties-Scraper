@@ -98,7 +98,12 @@ _CHANNEL_LABELS = {
 
 # Minimum sample before a band is quoted at all. A ratio without an n is a
 # guess; a ratio on n=3 is noise wearing a decimal point.
-_MIN_SAMPLE = 5
+#
+# RAISED 5 -> 15 on 2026-07-29. At 5, Hennepin's reo_resale band showed at
+# n=9 — too thin for a figure an owner will make a decision on. At 15 that
+# band falls back to the statewide rollup (n=22), which is honest: the
+# statewide REO ratio is a better estimate than nine local sales.
+_MIN_SAMPLE = 15
 
 
 def _norm_addr(s: Optional[str]) -> str:
