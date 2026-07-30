@@ -294,15 +294,34 @@ async def connect_lookup(
         logger.warning("connect lookup failed", error_type=type(e).__name__)
         rows = []
 
+   # Collapse duplicates. A foreclosed property often appears TWICE: once as
+    # the real assessor parcel and once as a synthetic '<COUNTY>-FC-*'
+    # placeholder minted by the foreclosure path when it could not resolve a
+    # parcel. Verified live: '5331 Angeline' returned both
+    # '0911821120148' and 'HENNEPIN-FC-2606002'.
+    #
+    # Two identical-looking rows is confusing for anyone, and actively
+    # harmful here — if the owner picks the synthetic one, /connect/status
+    # finds no assessed value, because synthetic parcels carry none. So when
+    # a real parcel exists for an address, the placeholder is dropped.
+    best: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if not r.get("address"):
+            continue
+        key = _norm_addr(r["address"])
+        is_synthetic = "-FC-" in (r["parcel_id"] or "")
+        existing = best.get(key)
+        if existing is None or (existing["_synthetic"] and not is_synthetic):
+            best[key] = {
+                "parcel_id": r["parcel_id"],
+                "masked_address": _mask_address(r.get("address")),
+                "city": r.get("city"),
+                "county_code": r.get("county_code"),
+                "_synthetic": is_synthetic,
+            }
     matches = [
-        {
-            "parcel_id": r["parcel_id"],
-            "masked_address": _mask_address(r.get("address")),
-            "city": r.get("city"),
-            "county_code": r.get("county_code"),
-        }
-        for r in rows
-        if r.get("address")
+        {k: v for k, v in m.items() if not k.startswith("_")}
+        for m in best.values()
     ]
 
     logger.info("connect lookup", county=county, matches=len(matches))
