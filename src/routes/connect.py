@@ -73,7 +73,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, status as htt
 
 from src.db.supabase_client import core_table, outcomes_table, scoring_table
 from src.routes.connect_auth import (
-    marketplace_table,
+    create_listing,
     owner_from_session,
     request_link,
     verify_link,
