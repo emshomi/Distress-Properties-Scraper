@@ -243,7 +243,12 @@ async def request_link(
                 )
                 cur.fetchone()
     except Exception as e:
-        # Log the real reason; tell the caller nothing specific.
+        # print(), not logger. The structured logger emitted BLANK LINES to
+        # Railway on 2026-07-29, which is why five hypotheses were guessed
+        # instead of one error being read. A diagnostic that cannot be read
+        # is worse than none: it creates the impression of visibility.
+        print(f"[connect] OWNER UPSERT FAILED: {type(e).__name__}: {e}",
+              flush=True)
         logger.error("connect: owner upsert FAILED",
                      error_type=type(e).__name__, error=str(e)[:800])
         return {
