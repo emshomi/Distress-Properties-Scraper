@@ -80,6 +80,7 @@ from src.utils.address_match import (
 from src.routes.connect_auth import (
     create_listing,
     get_active_listing,
+    get_owner_dashboard,
     owner_from_session,
     request_link,
     verify_link,
@@ -716,6 +717,61 @@ async def connect_verify(
     return success_envelope({
         "session_token": session["session_token"],
         "expires_in_days": 30,
+    })
+
+
+@router.get(
+    "/connect/me",
+    status_code=http_status.HTTP_200_OK,
+    summary="The caller's own properties, deadlines and offers",
+)
+async def connect_me(
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+) -> dict[str, Any]:
+    """The owner's status page.
+
+    Until this existed the hand-raise was a dead letterbox: an owner
+    submitted, saw a confirmation, and had no way back in. No page showing
+    where things stood, no way to learn an offer had arrived. Someone months
+    from losing their home will not keep checking a website on faith, and a
+    service they cannot reach is not helping them.
+
+    Session-scoped, so this returns the caller's own properties and nothing
+    else. A 401 here is the normal expired-session case, not an error — the
+    frontend answers it by asking for an email and sending a fresh link.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link to see your property."},
+        )
+
+    try:
+        data = get_owner_dashboard(owner_id)
+    except Exception:
+        # get_owner_dashboard raises rather than returning an empty list, so a
+        # failure never reaches an owner as "you have no properties" — which
+        # they would reasonably read as their listing having been deleted.
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not load your property just now. Nothing has "
+                "changed — please try again in a moment."
+            )},
+        )
+
+    # Dates and timestamps are not JSON-serialisable as-is.
+    listings: list[dict[str, Any]] = []
+    for row in data["listings"]:
+        out: dict[str, Any] = {}
+        for key, value in row.items():
+            out[key] = str(value) if hasattr(value, "isoformat") else value
+        listings.append(out)
+
+    return success_envelope({
+        "count": data["count"],
+        "listings": listings,
     })
 
 
