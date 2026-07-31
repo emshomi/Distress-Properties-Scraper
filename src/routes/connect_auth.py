@@ -585,6 +585,57 @@ def get_owner_dashboard(owner_id: str) -> dict[str, Any]:
     return {"listings": rows, "count": len(rows)}
 
 
+def withdraw_listing(owner_id: str, listing_id: str) -> Optional[dict[str, Any]]:
+    """Stop showing a listing to buyers. Returns the updated row, or None.
+
+    The offers form has always told owners they can withdraw at any time, and
+    until now nothing anywhere could do it — a promise the product did not
+    keep. For someone who has been contacted by people wanting to buy their
+    house cheaply, being unable to take their own information back is exactly
+    the trap they were afraid of.
+
+    Scoped to owner_id AND listing_id, so a guessed or copied id cannot
+    withdraw someone else's property.
+
+    Only acts on rows that are currently 'active'. Withdrawing something
+    already withdrawn returns None rather than pretending to do work, and the
+    endpoint reads that as "nothing to do" rather than an error.
+
+    'withdrawn' rather than deletion: the record of what was submitted and
+    when it stopped being shown is worth keeping, and the partial unique index
+    listings_one_active_per_owner_parcel only covers status = 'active', so a
+    withdrawn row does not block the same owner raising their hand on that
+    property again later.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                UPDATE marketplace.listings
+                SET status = 'withdrawn',
+                    status_changed_at = now(),
+                    updated_at = now()
+                WHERE id = %s
+                  AND user_id = %s
+                  AND status = 'active'
+                RETURNING id, parcel_id, status, status_changed_at
+                """,
+                (listing_id, owner_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        # print(), not just logger — the structured logger emitted BLANK LINES
+        # to Railway on 2026-07-29, so it cannot be the only diagnostic path.
+        print(f"[connect] WITHDRAW FAILED: {type(e).__name__}: {e}", flush=True)
+        logger.error("connect: withdraw FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        # Raise rather than returning None. None means "nothing to withdraw",
+        # and an owner told their listing was withdrawn when it is still live
+        # would be a worse failure than an error message.
+        raise
+
+
 __all__ = [
     "pg",
     "request_link",
@@ -593,4 +644,5 @@ __all__ = [
     "create_listing",
     "get_active_listing",
     "get_owner_dashboard",
+    "withdraw_listing",
 ]
