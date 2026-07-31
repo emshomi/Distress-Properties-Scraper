@@ -387,6 +387,13 @@ def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
         "parcel_id", "status", "occupancy", "condition", "primary_need",
         "leaseback_interest", "buyback_interest", "earliest_close_date",
         "preferred_close_date", "contact_preference", "contact_restrictions",
+        # Whether a buyer may see the house, and on what terms. Investors
+        # who cannot view a property either discount heavily or walk, so an
+        # owner willing to allow access is worth materially more to them —
+        # and had no way to say so. Kept separate from occupancy: a vacant
+        # house can take a lockbox, a tenant-occupied one cannot guarantee
+        # entry, and an owner living there may need notice.
+        "viewing_access",
         "ownership_verified",
     )
     cols = ["user_id"]
@@ -453,6 +460,7 @@ def get_active_listing(owner_id: str, parcel_id: str) -> Optional[dict[str, Any]
                        leaseback_interest, buyback_interest,
                        earliest_close_date, preferred_close_date,
                        contact_preference, contact_restrictions,
+                       viewing_access,
                        ownership_verified, status, created_at, updated_at
                 FROM marketplace.listings
                 WHERE user_id = %s AND parcel_id = %s AND status = 'active'
