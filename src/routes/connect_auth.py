@@ -394,6 +394,15 @@ def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
         # house can take a lockbox, a tenant-occupied one cannot guarantee
         # entry, and an owner living there may need notice.
         "viewing_access",
+        # The assessed value AS IT STOOD when the owner raised their hand,
+        # plus which of core.parcels' two value columns it came from and when
+        # it was read. Captured rather than joined at read time: a listing is
+        # a record of what was represented, so a later reassessment or loader
+        # fix must not silently restate it, and an outstate listing must not
+        # spontaneously acquire a valuation the day its county is onboarded.
+        "assessed_value_at_listing",
+        "assessed_value_source",
+        "assessed_value_captured_at",
         "ownership_verified",
     )
     cols = ["user_id"]
@@ -461,6 +470,8 @@ def get_active_listing(owner_id: str, parcel_id: str) -> Optional[dict[str, Any]
                        earliest_close_date, preferred_close_date,
                        contact_preference, contact_restrictions,
                        viewing_access,
+                       assessed_value_at_listing, assessed_value_source,
+                       assessed_value_captured_at,
                        ownership_verified, status, created_at, updated_at
                 FROM marketplace.listings
                 WHERE user_id = %s AND parcel_id = %s AND status = 'active'
