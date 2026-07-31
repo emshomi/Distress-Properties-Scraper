@@ -66,7 +66,7 @@ Endpoints:
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, status as http_status
@@ -811,13 +811,18 @@ async def connect_raise_hand(
 
     county = county.strip().lower()
 
-    # The parcel must be real. marketplace.listings FKs to core.parcels, and
-    # a synthetic '<COUNTY>-FC-*' placeholder would both fail the FK and
-    # carry no assessed value.
+    # The parcel must exist in core.parcels — marketplace.listings FKs to it.
+    # Both value columns are read here: core.parcels carries
+    # estimated_market_value for the county-direct loaders (hennepin, dakota,
+    # ramsey, washington, olmsted, fillmore) and emv_total for the MNGAC ones
+    # (anoka, wabasha). Hennepin has 29,522 rows in one and 443,610 in the
+    # other, so reading only one of them is how at_stake came back null for
+    # ~95% of Hennepin owners.
     try:
         pr = (
             core_table("parcels")
-            .select("parcel_id, address, city")
+            .select("parcel_id, address, city, "
+                    "estimated_market_value, emv_total")
             .eq("parcel_id", parcel_id)
             .eq("county_code", county)
             .limit(1)
@@ -829,11 +834,84 @@ async def connect_raise_hand(
                        error_type=type(e).__name__)
         parcel = None
 
-    if parcel is None or "-FC-" in parcel_id:
+    if parcel is None:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail={"message": "We do not have a record for that property."},
         )
+
+    # A '<COUNTY>-FC-*' parcel is a placeholder created by a foreclosure
+    # notice rather than by a parcel loader. Rejecting all of them was wrong
+    # and stranded real owners.
+    #
+    # In a COVERED county the synthetic duplicates a real assessor parcel, and
+    # listing against the placeholder loses the assessed value — that is the
+    # harm the original guard existed to prevent, and it still applies.
+    #
+    # OUTSTATE the synthetic is the ONLY record. 136 of 141 such parcels
+    # across 33 counties carry a live redemption window, 134 of them with a
+    # county-STATED expiry date — a better provenance than Dakota or Anoka,
+    # both of which publish no period at all. Refusing those owners told
+    # someone we had just shown a real deadline to that we had no record of
+    # them, after they had answered seven questions and signed in.
+    #
+    # So the test is not "is this synthetic" but "does a real parcel exist for
+    # this address in this county". Filtering happens in Python rather than in
+    # the query: a NOT-LIKE through the client is easy to get subtly wrong,
+    # and this is a handful of rows.
+    if "-FC-" in parcel_id:
+        real_sibling = None
+        if parcel.get("address"):
+            try:
+                sr = (
+                    core_table("parcels")
+                    .select("parcel_id")
+                    .eq("county_code", county)
+                    .eq("address", parcel["address"])
+                    .limit(20)
+                    .execute()
+                )
+                real_sibling = next(
+                    (r for r in (sr.data or [])
+                     if "-FC-" not in str(r.get("parcel_id", ""))),
+                    None,
+                )
+            except Exception as e:
+                # Fail OPEN, deliberately. If this check cannot run we accept
+                # the hand-raise: a duplicate listing is recoverable, turning
+                # away a distressed owner is not.
+                logger.warning("raise-hand: sibling parcel check failed",
+                               error_type=type(e).__name__)
+                real_sibling = None
+
+        if real_sibling is not None:
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail={"message": (
+                    "There are two records for that address. Please go back "
+                    "and choose the other one so your property's assessed "
+                    "value is attached to your listing."
+                )},
+            )
+
+    # Capture the assessed value AS IT STOOD when the owner raised their hand,
+    # rather than joining to core.parcels at read time.
+    #
+    # A listing is a record of what was represented, and it has to stay
+    # stable. A reassessment or a loader fix months from now must not silently
+    # restate what this owner was shown — and an outstate listing must not
+    # spontaneously acquire a valuation the day its county is onboarded.
+    #
+    # The source column is what makes a null self-explaining: 'none_published'
+    # means we looked and the county publishes nothing, which is a different
+    # fact from a column nobody has filled in yet.
+    assessed_value = parcel.get("estimated_market_value")
+    assessed_source = "estimated_market_value"
+    if assessed_value is None:
+        assessed_value = parcel.get("emv_total")
+        assessed_source = "emv_total"
+    if assessed_value is None:
+        assessed_source = "none_published"
 
     # Ownership check against the assessor roll. NOT a rejection gate —
     # trusts, estates and spouses not on title are common, and estates are
@@ -895,6 +973,9 @@ async def connect_raise_hand(
         "contact_preference": contact_preference,
         "contact_restrictions": contact_restrictions,
         "viewing_access": viewing_access,
+        "assessed_value_at_listing": assessed_value,
+        "assessed_value_source": assessed_source,
+        "assessed_value_captured_at": datetime.now(timezone.utc).isoformat(),
         "ownership_verified": verified,
     }
     row = {k: v for k, v in row.items() if v is not None}
