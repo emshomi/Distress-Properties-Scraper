@@ -79,6 +79,7 @@ from src.utils.address_match import (
 )
 from src.routes.connect_auth import (
     create_listing,
+    get_active_listing,
     owner_from_session,
     request_link,
     verify_link,
@@ -716,6 +717,47 @@ async def connect_verify(
         "session_token": session["session_token"],
         "expires_in_days": 30,
     })
+
+
+@router.get(
+    "/connect/my-listing",
+    status_code=http_status.HTTP_200_OK,
+    summary="The caller's own active listing on a parcel, if any",
+)
+async def connect_my_listing(
+    parcel_id: str,
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+) -> dict[str, Any]:
+    """Feeds the pre-filled offers form.
+
+    An owner who comes back weeks later should see what buyers are currently
+    being told about their home and change only what they want to change.
+    Before this existed there was no edit path at all: resubmitting the form
+    was the only way to correct anything, and it produced a second active
+    listing contradicting the first.
+
+    Scoped to the session's owner AND the parcel, so a guessed parcel_id
+    returns nothing — this can only ever read back the caller's own answers.
+    A signed-in owner who has never raised their hand gets found=false, not
+    an error; that is the normal first-visit case, not a failure.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+
+    listing = get_active_listing(owner_id, parcel_id)
+    if listing is None:
+        return success_envelope({"found": False, "listing": None})
+
+    # Dates and timestamps are not JSON-serialisable as-is.
+    out: dict[str, Any] = {}
+    for key, value in listing.items():
+        out[key] = str(value) if hasattr(value, "isoformat") else value
+
+    return success_envelope({"found": True, "listing": out})
 
 
 @router.post(
