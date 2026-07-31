@@ -84,6 +84,7 @@ from src.routes.connect_auth import (
     owner_from_session,
     request_link,
     verify_link,
+    withdraw_listing,
 )
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
@@ -814,6 +815,69 @@ async def connect_my_listing(
         out[key] = str(value) if hasattr(value, "isoformat") else value
 
     return success_envelope({"found": True, "listing": out})
+
+
+@router.post(
+    "/connect/withdraw",
+    status_code=http_status.HTTP_200_OK,
+    summary="Stop showing one of the caller's listings to buyers",
+)
+async def connect_withdraw(
+    listing_id: str = Body(..., embed=True),
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+) -> dict[str, Any]:
+    """Withdraw a listing.
+
+    The offers form has told owners since day one that they can withdraw at
+    any time, and nothing anywhere could actually do it. For someone who has
+    been contacted by several people wanting to buy their house cheaply, being
+    unable to take their own information back is precisely the trap they were
+    afraid of walking into.
+
+    Reversible: the row keeps its answers and the owner can raise their hand
+    on the same property again. The partial unique index only covers active
+    rows, so a withdrawn listing does not block them.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+
+    try:
+        row = withdraw_listing(owner_id, listing_id)
+    except Exception:
+        # withdraw_listing raises only when the UPDATE itself failed. Telling
+        # an owner their listing was withdrawn while it is still live in front
+        # of buyers would be the worst lie this product could tell.
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not withdraw that just now. It is still showing to "
+                "buyers — please try again in a moment."
+            )},
+        )
+
+    if row is None:
+        # Not active, or not theirs. Both are 'nothing to do' rather than
+        # errors: a double-click, or a stale page. Deliberately NOT a 404,
+        # which would let someone probe listing ids to learn which exist.
+        return success_envelope({
+            "withdrawn": False,
+            "message": "That listing is not currently showing to buyers.",
+        })
+
+    logger.info("connect: listing withdrawn", parcel_id=row.get("parcel_id"))
+    return success_envelope({
+        "withdrawn": True,
+        "listing_id": str(row["id"]),
+        "status": row["status"],
+        "message": (
+            "Withdrawn. Buyers are no longer seeing this property. Your "
+            "answers are kept, so you can put it back any time."
+        ),
+    })
 
 
 @router.post(
