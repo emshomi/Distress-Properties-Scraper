@@ -357,7 +357,26 @@ def owner_from_session(session_token: Optional[str]) -> Optional[str]:
 
 
 def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
-    """Insert a marketplace.listings row. Returns the new id, or None.
+    """Create OR UPDATE the owner's active listing on a parcel. Returns the
+    id, or None on failure.
+
+    UPSERT, not a plain insert. There is no separate edit screen: an owner
+    whose circumstances change — the tenant moves out, they decide a
+    leaseback would work after all — has the offers form and nothing else.
+    Before this, resubmitting produced a SECOND active listing that
+    contradicted the first, and an investor had no way to tell which was
+    current. Two such rows existed on parcel 0911821120148 on 2026-07-30.
+
+    The partial unique index `listings_one_active_per_owner_parcel`
+    (parcel_id, user_id) WHERE status = 'active' is what makes the conflict
+    target work. The WHERE clause below must match that predicate exactly or
+    Postgres cannot infer the index and raises. Partial by design: a
+    withdrawn listing from six months ago must not block an owner from
+    raising their hand again.
+
+    Only the columns actually supplied are updated. An omitted field keeps
+    its previous value rather than being nulled — otherwise a half-completed
+    resubmission would silently erase answers the owner gave earlier.
 
     Column allow-list is explicit: asking_price, description and photos are
     NOT accepted. Pricing is exactly what a distressed owner does not know
@@ -381,26 +400,74 @@ def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
             cols.append(key)
             vals.append(fields[key])
 
+    # The conflict target columns are never self-assigned in the SET clause.
+    updatable = [c for c in cols if c not in ("user_id", "parcel_id")]
+    set_sql = ", ".join(f"{c} = EXCLUDED.{c}" for c in updatable)
+    set_sql = f"{set_sql}, updated_at = now()" if set_sql else "updated_at = now()"
+
     placeholders = ", ".join(["%s"] * len(vals))
     col_sql = ", ".join(cols)
     try:
         with pg() as cur:
             cur.execute(
                 f"INSERT INTO marketplace.listings ({col_sql}) "
-                f"VALUES ({placeholders}) RETURNING id",
+                f"VALUES ({placeholders}) "
+                f"ON CONFLICT (parcel_id, user_id) WHERE status = 'active' "
+                f"DO UPDATE SET {set_sql} "
+                f"RETURNING id",
                 vals,
             )
             row = cur.fetchone()
             return str(row["id"]) if row else None
     except Exception as e:
-        # TEMPORARY: returns the error string so it reaches the HTTP response.
-        # The Railway log stream silently drops loguru lines — entries arrive
-        # as blank strings — so it cannot be relied on for diagnosis. Revert
-        # to `return None` once the cause is known; an internal error message
-        # must never reach a homeowner.
-        logger.error("connect: listing insert FAILED",
+        # print(), not just logger. The structured logger emitted BLANK LINES
+        # to Railway on 2026-07-29, so it cannot be the only diagnostic path.
+        print(f"[connect] LISTING UPSERT FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: listing upsert FAILED",
                      error_type=type(e).__name__, error=str(e)[:800])
-        return f"ERROR::{type(e).__name__}: {e}"
+        # Returns None, never the exception text. An earlier version returned
+        # f"ERROR::{...}" so the reason would reach the browser while Railway
+        # logs were unreadable — but the caller only tests `is None`, so that
+        # string passed as a valid listing_id and the owner was told "You are
+        # on file" when nothing had been saved.
+        return None
+
+
+def get_active_listing(owner_id: str, parcel_id: str) -> Optional[dict[str, Any]]:
+    """The owner's current active listing on a parcel, or None.
+
+    Feeds the pre-filled offers form. An owner returning weeks later should
+    see what buyers are currently being told about their home and change
+    what they want to change — not face a blank form whose submission
+    silently overwrites answers they no longer remember giving.
+
+    Deliberately scoped to (owner_id, parcel_id): an owner can only ever
+    read back their own listing, so a guessed parcel_id reveals nothing.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT id, parcel_id, occupancy, condition, primary_need,
+                       leaseback_interest, buyback_interest,
+                       earliest_close_date, preferred_close_date,
+                       contact_preference, contact_restrictions,
+                       ownership_verified, status, created_at, updated_at
+                FROM marketplace.listings
+                WHERE user_id = %s AND parcel_id = %s AND status = 'active'
+                LIMIT 1
+                """,
+                (owner_id, parcel_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        print(f"[connect] ACTIVE LISTING READ FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: active listing read FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        return None
 
 
 __all__ = [
@@ -409,4 +476,5 @@ __all__ = [
     "verify_link",
     "owner_from_session",
     "create_listing",
+    "get_active_listing",
 ]
