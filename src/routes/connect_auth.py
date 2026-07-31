@@ -403,6 +403,17 @@ def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
         "assessed_value_at_listing",
         "assessed_value_source",
         "assessed_value_captured_at",
+        # The evidence behind the ownership verdict: what the owner typed,
+        # what it was compared against, the basis of the comparison, and when.
+        # A single mutating flag collapsed five different situations into
+        # 'manual_review' — most importantly it could not distinguish "this
+        # name did not match" from "this county publishes no owner data at
+        # all", which is true of Dakota and Washington (286,074 parcels, zero
+        # rows in core.owners) and of every outstate synthetic.
+        "owner_name_submitted",
+        "owner_name_on_record",
+        "ownership_check_basis",
+        "ownership_checked_at",
         "ownership_verified",
     )
     cols = ["user_id"]
@@ -472,6 +483,8 @@ def get_active_listing(owner_id: str, parcel_id: str) -> Optional[dict[str, Any]
                        viewing_access,
                        assessed_value_at_listing, assessed_value_source,
                        assessed_value_captured_at,
+                       owner_name_submitted, owner_name_on_record,
+                       ownership_check_basis, ownership_checked_at,
                        ownership_verified, status, created_at, updated_at
                 FROM marketplace.listings
                 WHERE user_id = %s AND parcel_id = %s AND status = 'active'
@@ -530,6 +543,8 @@ def get_owner_dashboard(owner_id: str) -> dict[str, Any]:
                        l.assessed_value_at_listing,
                        l.assessed_value_source,
                        l.assessed_value_captured_at,
+                       l.ownership_check_basis,
+                       l.ownership_checked_at,
                        l.created_at,
                        l.updated_at,
                        p.address,
