@@ -969,51 +969,105 @@ async def connect_raise_hand(
     if assessed_value is None:
         assessed_source = "none_published"
 
-    # Ownership check against the assessor roll. NOT a rejection gate —
-    # trusts, estates and spouses not on title are common, and estates are
-    # among the best opportunities. A miss goes to manual review, never to a
-    # closed door.
     # Ownership check against the assessor roll.
     #
-    # NEVER a rejection gate. Trusts, estates, spouses not on title and
-    # recent transfers are all common, and estates are among the best
-    # opportunities on the platform. A mismatch goes to manual review, never
-    # to a closed door.
+    # NEVER a rejection gate. Trusts, estates, spouses not on title and recent
+    # transfers are all common, and estates are among the best opportunities
+    # on the platform. A mismatch goes to manual review, never to a closed
+    # door.
     #
-    # The earlier version set 'unverified' when an owner record EXISTED and
-    # 'manual_review' when none did — inverted from what those words mean,
-    # and meaningless either way because no name was ever collected.
-    verified = "unverified"
-    if owner_name:
+    # What is RECORDED here matters as much as the verdict. A single mutating
+    # flag collapsed five different situations into 'manual_review', so nobody
+    # working that queue could tell "this name did not match" from "this
+    # county publishes no owner data at all". The latter is not a red flag —
+    # it is 286,074 parcels in Dakota and Washington, both of which have ZERO
+    # rows in core.owners, plus every outstate parcel. Roughly a third of all
+    # coverage would sit in a review queue for no reason.
+    #
+    # So we store the evidence: what the owner typed, what it was compared
+    # against, the basis of the comparison, and when. The verdict becomes
+    # derivable rather than being a lone flag that overwrites itself.
+    verified: Optional[str] = None
+    check_basis: Optional[str] = None
+    name_on_record: Optional[str] = None
+
+    if not owner_name:
+        # No name supplied. This happens on EDIT — an owner correcting their
+        # occupancy has no reason to retype their name.
+        #
+        # ownership_verified is left OUT of the payload entirely below, so
+        # create_listing preserves whatever verdict was already there. An
+        # earlier version sent 'unverified' here, silently destroying a
+        # verification the owner had already earned and, in the other
+        # direction, offering a way to launder a mismatch by resubmitting
+        # blank.
+        check_basis = "no_name_given"
+    else:
         try:
             ow = (
                 core_table("owners")
-                .select("owner_name")
+                .select("owner_name, is_current, ownership_end_date")
                 .eq("parcel_id", parcel_id)
-                .limit(1)
+                .limit(25)
                 .execute()
             )
-            rows = ow.data or []
-            if rows and rows[0].get("owner_name"):
+            rows = [r for r in (ow.data or []) if r.get("owner_name")]
+
+            if not rows:
+                # Nothing to compare against. core.owners has no county_code
+                # and is joined by parcel_id alone, so this is simply "this
+                # parcel has no owner projection" — true for all of Dakota and
+                # Washington and for every -FC- synthetic.
+                check_basis = "no_owner_data_for_county"
+                verified = "manual_review"
+            else:
                 # Surname match on uppercase tokens. Deliberately loose: the
                 # assessor writes 'JOHN GOETTE', an owner may type 'John R.
                 # Goette' or 'Goette, John'. Requiring an exact string would
                 # fail almost everyone.
-                of_record = set(
-                    t for t in str(rows[0]["owner_name"]).upper().split()
-                    if len(t) > 2
-                )
                 claimed = set(
                     t.strip(",.") for t in owner_name.upper().split()
                     if len(t.strip(",.")) > 2
                 )
-                verified = "verified" if (of_record & claimed) else "manual_review"
-            else:
-                verified = "manual_review"
+
+                def _tokens(name: str) -> set[str]:
+                    return set(t for t in str(name).upper().split() if len(t) > 2)
+
+                current_hit = next(
+                    (r for r in rows
+                     if r.get("is_current") and (_tokens(r["owner_name"]) & claimed)),
+                    None,
+                )
+                former_hit = next(
+                    (r for r in rows
+                     if not r.get("is_current") and (_tokens(r["owner_name"]) & claimed)),
+                    None,
+                )
+
+                if current_hit is not None:
+                    check_basis = "matched_current_owner"
+                    verified = "verified"
+                    name_on_record = str(current_hit["owner_name"])
+                elif former_hit is not None:
+                    # A FORMER owner is a real signal, not a failure. Estates
+                    # and recent transfers land here, and the runbook is
+                    # explicit that estates are among the best opportunities.
+                    # Reviewed by a human, not rejected.
+                    check_basis = "matched_former_owner"
+                    verified = "manual_review"
+                    name_on_record = str(former_hit["owner_name"])
+                else:
+                    check_basis = "no_match"
+                    verified = "manual_review"
+                    name_on_record = str(rows[0]["owner_name"])
         except Exception as e:
+            # The check could not RUN. That is not evidence about this person,
+            # so no basis is recorded and the existing verdict is preserved by
+            # omitting ownership_verified below.
             logger.warning("raise-hand: owner lookup failed",
                            error_type=type(e).__name__)
-            verified = "manual_review"
+            check_basis = None
+            verified = None
 
     row: dict[str, Any] = {
         "parcel_id": parcel_id,
@@ -1033,7 +1087,22 @@ async def connect_raise_hand(
         "assessed_value_source": assessed_source,
         "assessed_value_captured_at": datetime.now(timezone.utc).isoformat(),
         "ownership_verified": verified,
+        # The evidence behind the verdict. owner_name_submitted is what the
+        # owner typed — until now it was used once and thrown away, so a
+        # listing sitting in manual_review gave a reviewer nothing to review
+        # with.
+        "owner_name_submitted": owner_name or None,
+        "owner_name_on_record": name_on_record,
+        "ownership_check_basis": check_basis,
+        "ownership_checked_at": (
+            datetime.now(timezone.utc).isoformat() if check_basis else None
+        ),
     }
+    # `is not None` drops any key we deliberately left unset. That is the
+    # mechanism that PRESERVES an existing verdict: create_listing only
+    # updates columns present in the payload, so omitting ownership_verified
+    # on a no-name edit leaves the earlier result intact rather than silently
+    # downgrading a verification the owner already earned.
     row = {k: v for k, v in row.items() if v is not None}
 
     listing_id = create_listing(owner_id, row)
@@ -1046,7 +1115,8 @@ async def connect_raise_hand(
             )},
         )
 
-    logger.info("raise-hand created", county=county, verified=verified)
+    logger.info("raise-hand created", county=county,
+                verified=verified or "unchanged", basis=check_basis)
     return success_envelope({
         "listing_id": listing_id,
         "status": "active",
