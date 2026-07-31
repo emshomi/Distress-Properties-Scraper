@@ -782,6 +782,13 @@ async def connect_raise_hand(
     preferred_close_date: Optional[str] = Body(default=None),
     contact_preference: Optional[str] = Body(default=None),
     contact_restrictions: Optional[str] = Body(default=None),
+    # Whether a buyer may see the house, and on what terms. An investor who
+    # cannot view a property discounts heavily or walks, so an owner willing
+    # to allow access is worth materially more — and had no way to say so.
+    # 'photos_only' exists deliberately: a straight yes/no forces an owner
+    # ashamed of the condition into "no", which reads to a buyer as something
+    # being hidden rather than as "not yet".
+    viewing_access: Optional[str] = Body(default=None),
 ) -> dict[str, Any]:
     """Create the listing.
 
@@ -887,6 +894,7 @@ async def connect_raise_hand(
         "preferred_close_date": preferred_close_date,
         "contact_preference": contact_preference,
         "contact_restrictions": contact_restrictions,
+        "viewing_access": viewing_access,
         "ownership_verified": verified,
     }
     row = {k: v for k, v in row.items() if v is not None}
