@@ -489,6 +489,87 @@ def get_active_listing(owner_id: str, parcel_id: str) -> Optional[dict[str, Any]
         return None
 
 
+def get_owner_dashboard(owner_id: str) -> dict[str, Any]:
+    """Everything an owner can see about their own properties.
+
+    This is what makes the hand-raise more than a dead letterbox. Until this
+    existed an owner submitted a listing and had no way back in — no page
+    showing where things stood, no way to know whether an offer had arrived.
+    Someone months from losing their home will not keep checking a website on
+    faith.
+
+    PLURAL by design. One listing each is the common case today, but nothing
+    stops an owner having two distressed properties, and a page built around
+    a single row would silently hide the second.
+
+    Withdrawn and expired listings are returned too, not just active ones. An
+    owner who withdrew needs to see that it happened and that nothing is
+    being shown to buyers on their behalf.
+
+    The offer count is returned even when it is zero: 'no offers yet' is
+    information, and hiding the section entirely reads as a broken page.
+
+    A single round trip. Three sequential queries on a page an anxious person
+    reloads is a page that feels broken.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT l.id,
+                       l.parcel_id,
+                       l.status,
+                       l.occupancy,
+                       l.condition,
+                       l.primary_need,
+                       l.leaseback_interest,
+                       l.buyback_interest,
+                       l.viewing_access,
+                       l.contact_restrictions,
+                       l.ownership_verified,
+                       l.assessed_value_at_listing,
+                       l.assessed_value_source,
+                       l.assessed_value_captured_at,
+                       l.created_at,
+                       l.updated_at,
+                       p.address,
+                       p.city,
+                       p.county_code,
+                       r.redemption_expiry_date,
+                       r.days_remaining,
+                       r.period_source,
+                       r.anchor_date,
+                       r.anchor_type,
+                       r.outcome,
+                       (SELECT COUNT(*) FROM marketplace.offers o
+                         WHERE o.listing_id = l.id) AS offer_count
+                FROM marketplace.listings l
+                LEFT JOIN core.parcels p
+                       ON p.parcel_id = l.parcel_id
+                LEFT JOIN outcomes.redemption_current r
+                       ON r.parcel_id = l.parcel_id
+                      AND r.county_code = p.county_code
+                WHERE l.user_id = %s
+                ORDER BY l.created_at DESC
+                """,
+                (owner_id,),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+    except Exception as e:
+        # print(), not just logger — the structured logger emitted BLANK LINES
+        # to Railway on 2026-07-29, so it cannot be the only diagnostic path.
+        print(f"[connect] OWNER DASHBOARD READ FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: owner dashboard read FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        # Raise rather than returning an empty list. An owner shown "you have
+        # no properties" when the query failed would reasonably conclude their
+        # listing had been deleted.
+        raise
+
+    return {"listings": rows, "count": len(rows)}
+
+
 __all__ = [
     "pg",
     "request_link",
@@ -496,4 +577,5 @@ __all__ = [
     "owner_from_session",
     "create_listing",
     "get_active_listing",
+    "get_owner_dashboard",
 ]
