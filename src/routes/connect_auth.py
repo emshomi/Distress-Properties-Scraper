@@ -728,6 +728,103 @@ def withdraw_listing(owner_id: str, listing_id: str) -> Optional[dict[str, Any]]
         raise
 
 
+async def send_offer_notification(listing_id: str) -> bool:
+    """Tell an owner an offer has arrived. Returns True if sent.
+
+    NON-FATAL and silent on absence, like the other senders. This runs after
+    the offer row is committed, so the offer exists whatever happens here.
+
+    WHAT THIS EMAIL DOES NOT CONTAIN, and why:
+
+    * The offer AMOUNT. Deliberate. `_options` in connect.py tells owners
+      that getting more than one offer is the single biggest thing they can
+      do, and a figure in an inbox on the day the first one lands invites
+      exactly the isolated yes that advice exists to prevent. On the status
+      page the number sits beside the assessed value, the outcome bands and
+      the sell-versus-foreclose gap — the context that protects them. The
+      email's job is to bring them to that context, not replace it.
+
+    * `notes`. Uncontrolled buyer free text. The whole architecture rests on
+      nobody reaching the owner until the owner opens an offer; forwarding a
+      buyer's prose to their inbox routes straight past that. Same reason
+      excludes preapproval_lender.
+
+    * `expires_at`. A response deadline set by the buyer. Saying one exists
+      is service; counting it down in an inbox is delivering the buyer's
+      pressure for them. The date belongs on the page.
+
+    So: an offer arrived, how many are on file, and a link.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT o.email,
+                       l.parcel_id,
+                       (SELECT COUNT(*)
+                          FROM marketplace.offers f
+                         WHERE f.listing_id = l.id) AS offer_count
+                FROM marketplace.listings l
+                JOIN marketplace.owners o ON o.id = l.user_id
+                WHERE l.id = %s
+                LIMIT 1
+                """,
+                (listing_id,),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        logger.error("connect: offer email — lookup FAILED",
+                     error_type=type(e).__name__, error=str(e)[:400])
+        return False
+
+    if not row:
+        # A listing_id with no listing, or a listing whose owner row is gone.
+        # listings_owner_fk is ON DELETE SET NULL, so an orphaned listing is
+        # a real state rather than an impossible one.
+        logger.error("connect: offer email — no listing/owner for id")
+        return False
+
+    to_email = _normalize_email(row["email"])
+    if not to_email:
+        logger.info("connect: offer email skipped, no address on owner")
+        return False
+
+    count = int(row["offer_count"] or 0)
+    base = str(getattr(settings, "frontend_origin", None)
+               or "https://govire.com").rstrip("/")
+
+    # Plural handled explicitly. "1 offers" in the first email an owner in
+    # foreclosure receives from us reads as an automated system that is not
+    # paying attention, which is the opposite of what this product is for.
+    if count > 1:
+        headline = (
+            f"Another offer has come in on your property. "
+            f"You now have {count} offers waiting."
+        )
+    else:
+        headline = "An offer has come in on your property."
+
+    body = (
+        f"{headline}\n\n"
+        "You can see the amount, the proposed closing date and the terms "
+        "here:\n\n"
+        f"{base}/connect/me\n\n"
+        "We have deliberately left the figures out of this email. They are "
+        "worth reading next to your property's assessed value and what "
+        "comparable properties actually sold for, which are on that page.\n\n"
+        "Nothing is decided by an offer arriving. You are not committed to "
+        "anything, the buyer does not have your name or contact details, "
+        "and you can ignore it or withdraw at any time.\n\n"
+        "Govire does not buy properties, is not your agent, and takes no "
+        "part of any sale."
+    )
+
+    return await _resend_send(
+        to_email, "There is an offer waiting on your property", body,
+        context="offer_notification",
+    )
+
+
 __all__ = [
     "pg",
     "request_link",
@@ -738,4 +835,5 @@ __all__ = [
     "get_owner_dashboard",
     "withdraw_listing",
     "send_listing_confirmation",
+    "send_offer_notification",
 ]
