@@ -83,6 +83,7 @@ from src.routes.connect_auth import (
     get_owner_dashboard,
     owner_from_session,
     request_link,
+    send_listing_confirmation,
     verify_link,
     withdraw_listing,
 )
@@ -1181,6 +1182,29 @@ async def connect_raise_hand(
 
     logger.info("raise-hand created", county=county,
                 verified=verified or "unchanged", basis=check_basis)
+
+    # Confirmation email. AFTER the listing is committed and deliberately
+    # unable to affect what the owner is told: the listing_id above is the
+    # thing that matters, and an owner whose property is safely on file must
+    # not see an error because Resend was slow.
+    #
+    # send_listing_confirmation never raises, but this is belt and braces —
+    # it is called from the request path, so an unexpected failure here would
+    # turn a successful save into a 500 and the owner would resubmit, which
+    # the upsert would absorb but which would look to them like it had not
+    # worked the first time.
+    try:
+        await send_listing_confirmation(
+            owner_id,
+            address=parcel.get("address"),
+            city=parcel.get("city"),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[connect] CONFIRMATION EMAIL FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: confirmation email raised",
+                     error_type=type(e).__name__, error=str(e)[:400])
+
     return success_envelope({
         "listing_id": listing_id,
         "status": "active",
