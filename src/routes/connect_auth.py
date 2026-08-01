@@ -138,20 +138,65 @@ def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     return digits if len(digits) == 10 else None
 
 
-async def _send_magic_link(
-    to_email: str, token: str, next_path: Optional[str] = None
-) -> bool:
-    """Email the link via Resend. Mirrors scripts/health_alert.py but async,
-    and NON-FATAL: a send failure is reported, never raised."""
+async def _resend_send(to_email: str, subject: str, text: str,
+                       context: str) -> bool:
+    """POST one email to Resend. Returns True on a 2xx, False on anything else.
+
+    NEVER raises. Every caller runs after the thing the owner actually asked
+    for has already succeeded — a link row is written, a listing is saved —
+    so a mail failure must degrade to a logged False, not an exception that
+    turns a completed action into an error the owner sees.
+
+    Shared rather than copied. The owner classifier lived in five files and
+    had drifted from the requirement in all of them; this is the second
+    caller and there will be a third, so it gets factored now while there is
+    still only one correct version to preserve.
+
+    `context` appears in the logs so a failure can be traced to which kind of
+    email failed — Railway drops loguru lines intermittently and a generic
+    "Resend rejected" line would be unattributable.
+    """
     api_key = getattr(settings, "resend_api_key", None)
     from_addr = getattr(settings, "alert_email_from", None)
     if api_key is None or not from_addr:
         logger.error("connect: RESEND_API_KEY or ALERT_EMAIL_FROM unset; "
-                     "cannot send magic link")
+                     "cannot send email", context=context)
         return False
     if hasattr(api_key, "get_secret_value"):
         api_key = api_key.get_secret_value()
 
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                _RESEND_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": from_addr,
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": text,
+                },
+            )
+    except httpx.HTTPError as e:
+        logger.error("connect: Resend unreachable", context=context,
+                     error_type=type(e).__name__, error=str(e)[:400])
+        return False
+
+    if 200 <= resp.status_code < 300:
+        return True
+    logger.error("connect: Resend rejected send", context=context,
+                 status=resp.status_code, body=resp.text[:400])
+    return False
+
+
+async def _send_magic_link(
+    to_email: str, token: str, next_path: Optional[str] = None
+) -> bool:
+    """Email the link via Resend. NON-FATAL: a send failure is reported,
+    never raised."""
     base = str(getattr(settings, "frontend_origin", None)
                or "https://govire.com").rstrip("/")
     # `next` carries the owner back to where they were. Without it the verify
@@ -171,31 +216,78 @@ async def _send_magic_link(
         "Govire does not buy properties and takes no part of any sale."
     )
 
+    return await _resend_send(to_email, "Your Govire link", body,
+                              context="magic_link")
+
+
+async def send_listing_confirmation(
+    owner_id: str,
+    address: Optional[str] = None,
+    city: Optional[str] = None,
+) -> bool:
+    """Tell an owner their property is on file. Returns True if sent.
+
+    NON-FATAL and silent on absence. By the time this runs create_listing has
+    already returned an id, so the listing exists whatever happens here. An
+    owner with no email address is a SKIP, not an error: `email` is nullable
+    and phone signup writes a row that SMS cannot yet deliver to, so a
+    phone-only owner is reachable by nothing and must not raise.
+
+    Deliberately does NOT say "we will email you when an offer arrives".
+    Nothing sends that yet. /connect/me already makes that promise on screen
+    and it is the next thing to build — repeating it here would double the
+    number of places we owe someone a message we cannot send.
+
+    The subject line names no distress. An email subject is visible on a lock
+    screen to whoever is standing there, and an owner in foreclosure has not
+    necessarily told the people around them.
+    """
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                _RESEND_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "from": from_addr,
-                    "to": [to_email],
-                    "subject": "Your Govire link",
-                    "text": body,
-                },
+        with pg() as cur:
+            cur.execute(
+                "SELECT email FROM marketplace.owners WHERE id = %s LIMIT 1",
+                (owner_id,),
             )
-    except httpx.HTTPError as e:
-        logger.error("connect: Resend unreachable",
+            row = cur.fetchone()
+    except Exception as e:
+        logger.error("connect: confirmation email — owner lookup FAILED",
                      error_type=type(e).__name__, error=str(e)[:400])
         return False
 
-    if 200 <= resp.status_code < 300:
-        return True
-    logger.error("connect: Resend rejected send",
-                 status=resp.status_code, body=resp.text[:400])
-    return False
+    to_email = _normalize_email(row["email"]) if row else None
+    if not to_email:
+        # Not an error worth alarming on: this is the phone-only case.
+        logger.info("connect: confirmation email skipped, no address on owner")
+        return False
+
+    base = str(getattr(settings, "frontend_origin", None)
+               or "https://govire.com").rstrip("/")
+
+    # Worded to be true whether this was a first submission or an edit. The
+    # route upserts and cannot cheaply tell the difference, and guessing
+    # wrong in an email is worse than in a heading — the owner cannot see the
+    # screen that would have corrected it.
+    where = " · ".join(p for p in (address, city) if p)
+    property_line = f"Property: {where}\n\n" if where else ""
+
+    body = (
+        "Your property is on file with Govire.\n\n"
+        f"{property_line}"
+        "What this means: verified buyers can see that a property is "
+        "available and make an offer on it. Nobody has your address, your "
+        "name or your contact details, and nobody gets them unless you "
+        "choose to open an offer.\n\n"
+        "You are not committed to anything. You can change your answers or "
+        "withdraw at any time here:\n\n"
+        f"{base}/connect/me\n\n"
+        "Govire does not buy properties, is not your agent, and takes no "
+        "part of any sale."
+    )
+
+    return await _resend_send(
+        to_email, "Your property is on file with Govire", body,
+        context="listing_confirmation",
+    )
 
 
 async def request_link(
@@ -645,4 +737,5 @@ __all__ = [
     "get_active_listing",
     "get_owner_dashboard",
     "withdraw_listing",
+    "send_listing_confirmation",
 ]
