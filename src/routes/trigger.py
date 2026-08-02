@@ -14,6 +14,27 @@ Two trigger styles:
       parcels, ~18 min) where holding an HTTP connection open the whole time
       is fragile. Poll /status to watch progress.
       Accepts ?max_records=N too.
+
+=== BOTH ENDPOINTS RUN THE SCRAPE ON A WORKER THREAD (2026-08-02) ===
+Every scraper method is `async def`, but the write path inside them is
+synchronous throughout — the sync supabase client, audit_logger and
+source_health_tracker. Nothing yields, so awaiting a scrape on the API's
+event loop pinned uvicorn for the entire run.
+
+Measured live before the fix: POST /trigger/saint_paul_vacant, a 146-second
+scrape. GET /health timed out at 25s on four consecutive polls during the
+run, then answered in 0.36s the instant it finished. Anyone loading
+govire.com in that window got nothing.
+
+/trigger-async was NOT an escape from this. asyncio.create_task schedules on
+the SAME loop, so the "background" task blocked exactly as hard as the
+synchronous one — the docstring promise above was never true. It is true
+now, because the work happens off-loop.
+
+Both paths now go through asyncio.to_thread, and the scrape gets its own
+event loop on that worker thread via asyncio.run. See scheduler/cron.py for
+the same treatment of the scheduled path, and base_scraper.py for why the
+concurrency guard had to become a threading.Lock.
 """
 
 from __future__ import annotations
@@ -94,6 +115,36 @@ def _resolve_scraper(scraper_name: str) -> type[BaseScraper]:
     return scraper_class
 
 
+def _run_scraper_blocking(
+    scraper_class: type[BaseScraper],
+    max_records: int | None,
+    trigger_source: str,
+) -> Any:
+    """Run one scrape to completion on THIS thread, with its own event loop.
+
+    Called only from a worker thread via asyncio.to_thread. asyncio.run
+    creates a fresh loop, runs the coroutine and closes the loop, so the
+    scrape never touches the API's loop and nothing loop-bound survives
+    between runs.
+
+    The scraper instance is constructed HERE rather than passed in, so it and
+    everything it holds belong to the thread that uses them.
+
+    Exceptions propagate to the caller — the endpoints below need to
+    distinguish ScraperDisabledError and ScraperAlreadyRunningError to return
+    403 and 409, and swallowing them here would collapse both into a 500.
+    """
+    scraper = scraper_class()
+    if max_records is not None and hasattr(scraper, "_max_records_override"):
+        scraper._max_records_override = max_records  # type: ignore[attr-defined]
+
+    metadata: dict[str, Any] = {"trigger_source": trigger_source}
+    if max_records is not None:
+        metadata["max_records"] = max_records
+
+    return asyncio.run(scraper.run(trigger="manual", metadata=metadata))
+
+
 @router.post(
     "/trigger/{scraper_name}",
     status_code=http_status.HTTP_200_OK,
@@ -127,15 +178,14 @@ async def trigger_scraper(
     )
 
     try:
-        scraper = scraper_class()
-        if max_records is not None and hasattr(scraper, "_max_records_override"):
-            scraper._max_records_override = max_records  # type: ignore[attr-defined]
-
-        metadata: dict[str, Any] = {"trigger_source": "trigger_endpoint"}
-        if max_records is not None:
-            metadata["max_records"] = max_records
-
-        result = await scraper.run(trigger="manual", metadata=metadata)
+        # await to_thread: the caller still waits for the scrape to finish,
+        # but the EVENT LOOP does not. Other requests are served throughout.
+        result = await asyncio.to_thread(
+            _run_scraper_blocking,
+            scraper_class,
+            max_records,
+            "trigger_endpoint",
+        )
     except ScraperDisabledError as exc:
         raise HTTPException(
             status_code=http_status.HTTP_403_FORBIDDEN,
@@ -203,17 +253,19 @@ async def _run_scraper_background(
     Exceptions are logged (not raised) — there's no client waiting for a
     response. The run's outcome is recorded in audit.scraper_runs and visible
     via /status.
+
+    The asyncio.Task this runs in stays on the API loop, but it does almost
+    nothing: it awaits a worker thread and logs the result. That await is
+    what makes this genuinely background — before it, the task body ran the
+    whole scrape inline on the loop.
     """
     try:
-        scraper = scraper_class()
-        if max_records is not None and hasattr(scraper, "_max_records_override"):
-            scraper._max_records_override = max_records  # type: ignore[attr-defined]
-
-        metadata: dict[str, Any] = {"trigger_source": "trigger_async_endpoint"}
-        if max_records is not None:
-            metadata["max_records"] = max_records
-
-        result = await scraper.run(trigger="manual", metadata=metadata)
+        result = await asyncio.to_thread(
+            _run_scraper_blocking,
+            scraper_class,
+            max_records,
+            "trigger_async_endpoint",
+        )
         logger.info(
             "Background scraper run complete",
             scraper_name=scraper_name,
