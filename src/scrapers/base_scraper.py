@@ -10,7 +10,9 @@ Every scraper inherits from BaseScraper and implements:
 
 The base class provides the run() lifecycle:
   1. Check if scraper is enabled in settings
-  2. Acquire per-class lock (prevents concurrent invocations)
+  2. Acquire per-class lock (prevents concurrent invocations). The lock is a
+     threading.Lock, not an asyncio.Lock — runs are dispatched to worker
+     threads so the synchronous write path cannot block the API event loop.
   3. Open audit.scraper_runs row
   4. Call fetch() → parse() → write()
   5. Close the run with final counts
@@ -20,7 +22,7 @@ The base class provides the run() lifecycle:
 
 from __future__ import annotations
 
-import asyncio
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -85,12 +87,34 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
 
     # Per-class lock prevents concurrent invocations of the same scraper.
     # Subclasses inherit this; each class gets its own lock.
-    _class_lock: ClassVar[asyncio.Lock]
+    #
+    # threading.Lock, NOT asyncio.Lock — CHANGED 2026-08-02.
+    #
+    # An asyncio.Lock only serialises coroutines running on ONE event loop.
+    # Scraper runs are now dispatched to worker threads, each with its own
+    # loop (see scheduler/cron.py and routes/trigger.py), because the write
+    # path is synchronous — the sync supabase client, audit_logger and
+    # source_health_tracker all block inside `async def`. Left on the API's
+    # loop they made uvicorn deaf for the whole run: measured 2026-08-02,
+    # parcel_enrich_mngeo held it for 20 minutes and every request in that
+    # window, /health included, timed out with nothing in the logs.
+    #
+    # Once runs happen on different threads an asyncio.Lock guards NOTHING,
+    # and it fails silently: `.locked()` would keep answering, the guard
+    # would keep appearing to work, and two runs of the same scraper could
+    # write concurrently. That guard is what returns 409 from
+    # POST /trigger/{name} while a scheduled run is in flight, so losing it
+    # means a manual trigger can collide with the cron.
+    #
+    # threading.Lock is loop-agnostic and thread-safe, which is exactly the
+    # property needed once execution crosses threads. It is only ever used
+    # via .locked() and as a context manager, so the change is contained.
+    _class_lock: ClassVar[threading.Lock]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         # Each subclass gets its own lock
-        cls._class_lock = asyncio.Lock()
+        cls._class_lock = threading.Lock()
 
     # ----- ABSTRACT METHODS -----
 
@@ -151,7 +175,12 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
                 context={"scraper_name": self.source_name},
             )
 
-        async with self._class_lock:
+        # `with`, not `async with`: threading.Lock is a plain context manager.
+        # The acquire cannot block here in practice — .locked() above already
+        # rejected a contended lock — but a plain `with` is still correct if
+        # two threads race that check, because the loser simply waits rather
+        # than running a second concurrent scrape.
+        with self._class_lock:
             return await self._run_locked(trigger, metadata, start_time)
 
     async def _run_locked(
