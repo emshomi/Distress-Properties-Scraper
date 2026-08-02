@@ -9,20 +9,52 @@ same GitHub Actions cadence for uniform observability.
 Usage:
     python -m scripts.run_hennepin_sheriff [trigger_name]
 
-The trigger_name defaults to "github_actions" and is recorded for
-observability. The script exits with code 0 on success, 1 on any failure
-during fetch/parse/write so GitHub Actions correctly marks the run as failed.
+Exit code 0 on success or partial success, 1 on failure, so GitHub Actions
+marks a genuinely broken run as failed.
+
+=== WHY THIS CALLS run() INSTEAD OF fetch/parse/write (2026-08-02) ===
+It used to drive the three lifecycle steps itself and call
+source_health_tracker directly. That worked, and health was recorded
+correctly — but ONLY BaseScraper._run_locked writes audit.scraper_runs, so
+every Actions run of this scraper was INVISIBLE in the run log.
+
+The cost was not theoretical. On 2026-08-02 audit.scraper_runs showed one
+Hennepin run for the day: the 11:15 Railway cron, status 'failed'. It did not
+show the Actions run that succeeded at 12:36. Reading the run log as the
+record of what happened produced a chain of wrong conclusions — that the
+sheriff feeds were dead, that the health digest was lying about Hennepin,
+that anoka_sheriff had not run in 66 days (its Actions workflow is green
+daily; 86 consecutive runs). Three separate false alarms, all from a log
+that was missing half its entries.
+
+run() does everything this file used to do by hand — the audit run row, the
+health row, the per-class lock, and the success/partial/failed decision — in
+ONE place. Duplicating that here is the owner-classifier-in-five-files
+mistake: five runners, five copies, drifting apart. run_dakota_parcels and
+the other parcels/legal runners already call run() and record their Actions
+runs correctly, which is how we know nothing about the Actions environment
+prevents it.
+
+=== EXIT CODE ===
+run() CATCHES exceptions and returns a RunResult with status='failed' rather
+than raising. So the exit code must come from result.status. A try/except
+around it would see nothing and exit 0 on a broken scrape, turning the
+workflow green over a failure — the exact blindness this change is undoing.
+
+'partial' exits 0 deliberately. Today's 11:15 run fetched 503 records and hit
+ONE transient Supabase timeout on one parcel; the old rule (`failed > 0` ->
+exit 1) marked the whole run failed and turned the workflow red. A red mark
+for 1 record in 503 is how people learn to ignore red marks. The count is
+printed and the run row records it as 'partial', which is the honest label.
 """
 from __future__ import annotations
 
 import asyncio
 import sys
-import traceback
 
 # Import is at top level so a missing env var / config error fails fast
 # (before we waste time on imports inside main()).
 from src.scrapers.hennepin_sheriff import HennepinSheriffScraper
-from src.services import source_health_tracker
 from src.utils.logger import logger
 
 
@@ -34,64 +66,29 @@ async def main() -> int:
 
     scraper = HennepinSheriffScraper()
 
-    # --- Fetch ---
-    try:
-        print("[hennepin-runner] fetch: contacting api.hennepincounty.gov ...", flush=True)
-        raw_records = await scraper.fetch(trigger)
-        print(f"[hennepin-runner] fetch: OK, got {len(raw_records)} raw rows", flush=True)
-    except Exception as e:
-        print(f"[hennepin-runner] fetch: FAILED — {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        source_health_tracker.record_failure(
-            scraper.source_name, notes=f"fetch failed: {type(e).__name__}: {e}"[:500]
-        )
-        return 1
+    # trigger="manual" so a disabled scraper RAISES ScraperDisabledError
+    # instead of returning status='skipped' silently. A workflow that runs
+    # daily against a scraper someone turned off should say so, not go green.
+    result = await scraper.run(
+        trigger="manual",
+        metadata={"trigger_source": "github_actions", "runner": "hennepin"},
+    )
 
-    # --- Parse ---
-    try:
-        signals = await scraper.parse(raw_records)
-        print(f"[hennepin-runner] parse: OK, produced {len(signals)} signals", flush=True)
-    except Exception as e:
-        print(f"[hennepin-runner] parse: FAILED — {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        source_health_tracker.record_failure(
-            scraper.source_name, notes=f"parse failed: {type(e).__name__}: {e}"[:500]
-        )
-        return 1
-
-    # --- Write ---
-    try:
-        new, updated, failed = await scraper.write(signals)
-        print(
-            f"[hennepin-runner] write: OK — new={new} updated={updated} failed={failed}",
-            flush=True,
-        )
-    except Exception as e:
-        print(f"[hennepin-runner] write: FAILED — {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        source_health_tracker.record_failure(
-            scraper.source_name, notes=f"write failed: {type(e).__name__}: {e}"[:500]
-        )
-        return 1
-
-    if failed > 0:
-        print(
-            f"[hennepin-runner] completed with {failed} failed events — exit 1",
-            flush=True,
-        )
-        source_health_tracker.record_failure(
-            scraper.source_name,
-            notes=f"{failed} of {new + updated + failed} record writes failed",
-        )
-        return 1
-
-    source_health_tracker.record_success(scraper.source_name)
     print(
-        f"[hennepin-runner] done. (health: success recorded, "
-        f"new={new} updated={updated})",
+        f"[hennepin-runner] {result.status} — run_id={result.run_id} "
+        f"fetched={result.records_fetched} new={result.records_new} "
+        f"updated={result.records_updated} failed={result.records_failed} "
+        f"({result.duration_seconds:.1f}s)",
         flush=True,
     )
-    return 0
+    if result.error_message:
+        print(f"[hennepin-runner] note: {result.error_message}", flush=True)
+
+    if result.status in ("success", "partial"):
+        return 0
+
+    print(f"[hennepin-runner] FAILED — exit 1", flush=True)
+    return 1
 
 
 if __name__ == "__main__":
