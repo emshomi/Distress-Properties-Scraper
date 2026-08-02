@@ -756,6 +756,136 @@ def withdraw_listing(owner_id: str, listing_id: str) -> Optional[dict[str, Any]]
         raise
 
 
+def get_offers_for_owner(owner_id: str) -> list[dict[str, Any]]:
+    """Every offer on every listing this owner holds. Newest first.
+
+    Until this existed /connect/me returned an offer COUNT and nothing else.
+    An owner was told "2 offers waiting" and shown no way to read them — worse
+    than silence, because it names something they cannot reach.
+
+    WHAT THE OWNER SEES, and what they do not:
+
+    * Amount, proposed closing date, financing type, preapproval flag,
+      contingencies, expiry and the buyer's notes. All of it. This is the
+      owner's own property and their own decision; withholding the terms from
+      the person being asked to accept them would be indefensible.
+
+    * NOT the buyer's identity. No buyer_user_id, no email, no name. Identity
+      disclosure is progressive and belongs to the deal room, not to the
+      moment an offer lands. The buyer cannot identify the property either —
+      the redaction in routes/marketplace.py is the same wall from the other
+      side.
+
+    `notes` IS included here, unlike in send_offer_notification, and the
+    difference is deliberate. Free buyer text in an inbox routes around the
+    monitored channel; the same text on an authenticated page the owner chose
+    to open is exactly the context they need before answering.
+
+    Scoped through listings.user_id, so this can only ever return offers on
+    the caller's own properties. A guessed offer id reveals nothing because
+    ids are never accepted as input here.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT o.id,
+                       o.listing_id,
+                       o.offer_amount,
+                       o.proposed_close_date,
+                       o.financing_type,
+                       o.is_preapproved,
+                       o.preapproval_lender,
+                       o.contingencies,
+                       o.status,
+                       o.expires_at,
+                       o.notes,
+                       o.created_at,
+                       o.responded_at,
+                       l.parcel_id,
+                       p.address,
+                       p.city
+                FROM marketplace.offers o
+                JOIN marketplace.listings l ON l.id = o.listing_id
+                LEFT JOIN core.parcels p ON p.parcel_id = l.parcel_id
+                WHERE l.user_id = %s
+                ORDER BY o.created_at DESC
+                """,
+                (owner_id,),
+            )
+            return [dict(r) for r in (cur.fetchall() or [])]
+    except Exception as e:
+        # print(), not just logger — the structured logger emitted BLANK LINES
+        # to Railway on 2026-07-29, so it cannot be the only diagnostic path.
+        print(f"[connect] OFFERS READ FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: offers read FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        # Raise rather than returning []. An owner shown "no offers" when the
+        # query failed would reasonably conclude the buyer had withdrawn.
+        raise
+
+
+def respond_to_offer(owner_id: str, offer_id: str,
+                     decision: str) -> Optional[dict[str, Any]]:
+    """Accept or decline one offer. Returns the updated row, or None.
+
+    Scoped to the offer AND the owner's ownership of its listing, so a copied
+    or guessed offer id cannot answer someone else's offer.
+
+    Only acts on rows still 'submitted'. A second click, a stale tab, or a
+    buyer who withdrew in the meantime returns None rather than overwriting a
+    decision — and an accepted offer can never be flipped to declined by a
+    page the owner left open yesterday.
+
+    Deliberately does NOT change the listing's own status, even though
+    listings_status_check permits 'offer_accepted'. Accepting one offer while
+    others are pending is a state change with consequences for those other
+    buyers, and nothing yet tells them. Recording the owner's decision and
+    leaving the listing live is honest; silently killing competing offers with
+    no notification is not. That is a follow-on, not a default.
+
+    Does not touch marketplace.conversations either. Those tables still FK to
+    auth.users (zero rows) and messages.from_user_id is a single uuid that
+    must hold either an owner or an investor — a schema decision, not a
+    routing one.
+    """
+    if decision not in ("accepted", "declined"):
+        # The route validates first; this is the second line of defence. Only
+        # these two are owner-initiated — 'withdrawn' belongs to the buyer and
+        # 'expired' to a scheduled job.
+        return None
+
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                UPDATE marketplace.offers o
+                SET status = %s,
+                    responded_at = now()
+                FROM marketplace.listings l
+                WHERE l.id = o.listing_id
+                  AND o.id = %s
+                  AND l.user_id = %s
+                  AND o.status = 'submitted'
+                RETURNING o.id, o.listing_id, o.status, o.responded_at,
+                          o.offer_amount
+                """,
+                (decision, offer_id, owner_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        print(f"[connect] OFFER RESPONSE FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: offer response FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        # Raise rather than returning None. None means "nothing to respond
+        # to"; an owner told their acceptance was recorded when it was not
+        # would act on a decision the buyer never received.
+        raise
+
+
 async def send_offer_notification(listing_id: str) -> bool:
     """Tell an owner an offer has arrived. Returns True if sent.
 
@@ -862,6 +992,8 @@ __all__ = [
     "get_active_listing",
     "get_owner_dashboard",
     "withdraw_listing",
+    "get_offers_for_owner",
+    "respond_to_offer",
     "send_listing_confirmation",
     "send_offer_notification",
 ]
