@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, status as http_status
@@ -80,9 +81,11 @@ from src.utils.address_match import (
 from src.routes.connect_auth import (
     create_listing,
     get_active_listing,
+    get_offers_for_owner,
     get_owner_dashboard,
     owner_from_session,
     request_link,
+    respond_to_offer,
     send_listing_confirmation,
     verify_link,
     withdraw_listing,
@@ -1216,5 +1219,174 @@ async def connect_raise_hand(
             "one."
         ),
     })
+
+# ============================================================
+# OFFERS — reading them, and answering them
+# ============================================================
+#
+# Until 2026-08-02 the loop dead-ended here. An offer arrived, the owner was
+# emailed, they opened /connect/me — and could do nothing. /connect/me
+# returned an offer COUNT and no way to read the terms; nothing anywhere
+# accepted or declined. That is worse than no offer at all, because the owner
+# has been told something is waiting for them.
+
+
+@router.get(
+    "/connect/offers",
+    status_code=http_status.HTTP_200_OK,
+    summary="Offers on the caller's own properties",
+)
+async def connect_offers(
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+) -> dict[str, Any]:
+    """Every offer on every property this owner holds.
+
+    Session-scoped through listings.user_id — offer ids are never accepted as
+    input, so nothing here can be probed.
+
+    The owner sees the full terms: amount, closing date, financing,
+    preapproval, contingencies, expiry and the buyer's own notes. They do NOT
+    see who the buyer is. Identity disclosure is progressive and belongs to
+    the deal room; the buyer cannot identify the property either, which is the
+    same wall from the other side.
+
+    An empty list is a normal state, not an error — most owners have no offers
+    most of the time, and 'none yet' is information.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link to see your offers."},
+        )
+
+    try:
+        offers = get_offers_for_owner(owner_id)
+    except Exception:
+        # get_offers_for_owner raises rather than returning [], so a failure
+        # never reaches an owner as "no offers" — which they would reasonably
+        # read as the buyer having withdrawn.
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not load your offers just now. Nothing has changed "
+                "— please try again in a moment."
+            )},
+        )
+
+    # Dates, timestamps and Decimal amounts are not JSON-serialisable as-is.
+    out: list[dict[str, Any]] = []
+    for row in offers:
+        item: dict[str, Any] = {}
+        for key, value in row.items():
+            if hasattr(value, "isoformat"):
+                item[key] = str(value)
+            elif isinstance(value, Decimal):
+                item[key] = float(value)
+            else:
+                item[key] = value
+        item["id"] = str(item["id"])
+        item["listing_id"] = str(item["listing_id"])
+        out.append(item)
+
+    return success_envelope({
+        "count": len(out),
+        "offers": out,
+    })
+
+
+@router.post(
+    "/connect/offers/{offer_id}/respond",
+    status_code=http_status.HTTP_200_OK,
+    summary="Accept or decline an offer on the caller's own property",
+)
+async def connect_respond_to_offer(
+    offer_id: str,
+    decision: str = Body(..., embed=True),
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+) -> dict[str, Any]:
+    """Answer one offer.
+
+    POST, not PATCH. CORS in src/main.py allows only GET, POST, HEAD and
+    OPTIONS, so a PATCH is rejected at preflight with no status code and
+    nothing in the server logs — a silent failure in front of someone
+    answering an offer on their house.
+
+    Only 'accepted' and 'declined' are owner decisions. 'withdrawn' belongs to
+    the buyer and 'expired' to a scheduled job; neither is reachable here.
+
+    Accepting does NOT close the listing or touch competing offers. Nothing
+    yet notifies the other buyers, and silently killing their offers with no
+    word to anyone would be a worse default than leaving the listing live.
+    Recording the owner's decision is what this endpoint is for.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+
+    choice = (decision or "").strip().lower()
+    if choice not in ("accepted", "declined"):
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Choose either accept or decline."},
+        )
+
+    try:
+        row = respond_to_offer(owner_id, offer_id, choice)
+    except Exception:
+        # respond_to_offer raises only when the UPDATE itself failed. Telling
+        # an owner their answer was recorded when it was not would leave them
+        # acting on a decision the buyer never received.
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not record that just now. Your answer has NOT been "
+                "sent — please try again in a moment."
+            )},
+        )
+
+    if row is None:
+        # Already answered, withdrawn by the buyer, or not theirs. All are
+        # 'nothing to do' rather than errors: a double-click or a stale tab.
+        # Deliberately NOT a 404, which would let someone probe offer ids to
+        # learn which exist.
+        return success_envelope({
+            "responded": False,
+            "message": (
+                "That offer is no longer waiting for an answer. Refresh to "
+                "see where things stand."
+            ),
+        })
+
+    logger.info("connect: offer answered", decision=choice)
+
+    # NOTE the wording: neither message claims the buyer has been told.
+    # NOTHING notifies the buyer yet — that path does not exist, and it is the
+    # mirror of the dead end this endpoint was written to fix. Saying "the
+    # buyer has been told" would be the same defect as the "verified buyers"
+    # claim removed from send_listing_confirmation this morning: an email or a
+    # screen promising something no code performs. Say what is true.
+    if choice == "accepted":
+        message = (
+            "Your answer is recorded. Nothing is binding until you both sign "
+            "a purchase agreement, and you are free to take advice before you "
+            "do. We will be in touch about next steps."
+        )
+    else:
+        message = (
+            "Declined, and recorded. Your property is still listed, and other "
+            "buyers can still make offers."
+        )
+
+    return success_envelope({
+        "responded": True,
+        "offer_id": str(row["id"]),
+        "status": row["status"],
+        "message": message,
+    })
+
 
 __all__ = ["router"]
