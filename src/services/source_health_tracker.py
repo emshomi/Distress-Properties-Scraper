@@ -4,6 +4,23 @@ Source health tracker.
 Maintains the audit.source_health row for each scraper, tracking
 consecutive_failures and flipping is_healthy to False once the threshold
 is crossed. Used by /status to surface "this scraper is broken" warnings.
+
+=== is_healthy MUST AGREE WITH THE DIGEST (2026-08-02) ===
+Two things read this table and they used to disagree.
+
+scripts/health_alert.py — the daily digest — deliberately IGNORES is_healthy
+and calls a source BROKEN on `consecutive_failures > 0`, i.e. one failure.
+Its header explains why: it would rather flag a borderline source than let a
+silent failure hide.
+
+/status reads is_healthy, which stayed True until THREE consecutive failures.
+So for a daily scraper there was a two-day window where the digest said broken
+and the status page said healthy, about the same source, on the same data. A
+status page that is optimistic about a feed which is actively failing is worse
+than no status page: it actively reassures.
+
+UNHEALTHY_THRESHOLD is now 1, so both consumers mean the same thing by
+"healthy". See the constant for why flapping is the right trade.
 """
 
 from __future__ import annotations
@@ -14,8 +31,26 @@ from src.db.supabase_client import audit_table
 from src.models.audit import SourceHealth, SourceHealthUpdate
 from src.utils.logger import logger
 
-# Number of consecutive failures before a source is marked unhealthy
-UNHEALTHY_THRESHOLD: int = 3
+# Number of consecutive failures before a source is marked unhealthy.
+#
+# 1, not 3 (changed 2026-08-02). One failure marks the source unhealthy, which
+# is what scripts/health_alert.py has always meant by broken.
+#
+# The objection to 1 is flapping: a source that fails once transiently and
+# recovers on its next run flips False then True. hennepin_sheriff did exactly
+# that on 2026-08-02 — 503 records fetched, ONE Supabase write timeout, clean
+# on the next run.
+#
+# Accepted, because the flap is self-correcting and the alternative is not.
+# record_success() resets the counter and the flag, so a transient failure is
+# visible for exactly one run cycle. At a threshold of 3, a genuinely broken
+# DAILY scraper reads healthy for two more days — and the sheriff feeds are
+# where redemption expiry dates come from, so two days of false reassurance is
+# two days of owners potentially seeing a stale deadline.
+#
+# A brief false alarm costs a second glance. A silent window costs the thing
+# this table exists to prevent.
+UNHEALTHY_THRESHOLD: int = 1
 
 
 # ============================================================
@@ -99,8 +134,12 @@ def record_success(source_name: str, notes: str | None = None) -> None:
 
 def record_failure(source_name: str, notes: str | None = None) -> None:
     """
-    Increment consecutive_failures for a scraper. If we cross the threshold,
-    flip is_healthy to False so /status surfaces the warning.
+    Increment consecutive_failures for a scraper and flip is_healthy to False
+    so /status surfaces the warning.
+
+    With UNHEALTHY_THRESHOLD = 1 this now fires on the FIRST failure, matching
+    what the daily digest already reports. The next successful run clears both
+    the counter and the flag.
     """
     existing = get_health(source_name)
     new_consecutive = (existing.consecutive_failures + 1) if existing else 1
