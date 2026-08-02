@@ -983,6 +983,131 @@ async def send_offer_notification(listing_id: str) -> bool:
     )
 
 
+async def send_offer_response_notification(offer_id: str) -> bool:
+    """Tell a BUYER their offer was accepted or declined. Returns True if sent.
+
+    NON-FATAL and silent on absence, like every other sender here. This runs
+    after the owner's decision is committed, so their answer stands whatever
+    happens to the email. A Resend outage must never turn a recorded
+    acceptance into an error on the owner's screen.
+
+    WHY THIS EXISTS (2026-08-02): the owner learned an offer had arrived and
+    the buyer learned NOTHING about the answer. Exactly the dead end that
+    /connect/offers was built to fix, mirrored.
+
+    Silence is not the safe option here, which is the opposite of the usual
+    instinct. A buyer who has offered a quarter of a million pounds on a real
+    house and hears nothing does not wait quietly — they go looking for the
+    owner, which is the disintermediation the entire redaction design exists
+    to prevent. The email is what keeps them inside the channel.
+
+    WHAT IT DOES NOT CONTAIN:
+
+    * The property. No address, no city, no parcel_id, no county. The
+      redaction rule in routes/marketplace.py is not relaxed because the offer
+      was accepted — an accepted buyer who can identify the house can still
+      bypass the monitored channel, and has more reason to. The buyer knows
+      which offer this is from the amount and the date.
+
+    * The owner. No name, no email, no contact route. Identity disclosure is
+      progressive and belongs to the deal room.
+
+    * Any instruction to act. The accept wording commits GOVIRE to making
+      contact — "we will contact you" — rather than inviting the buyer to
+      chase. A buyer told to act with nowhere to act goes around us.
+
+    Takes only an offer_id, deliberately. It cannot be handed an amount, an
+    address or an owner, so no future caller can leak one into the message.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT o.status,
+                       o.offer_amount,
+                       o.proposed_close_date,
+                       u.email AS buyer_email
+                FROM marketplace.offers o
+                LEFT JOIN app_auth.users u ON u.id = o.buyer_user_id
+                WHERE o.id = %s
+                LIMIT 1
+                """,
+                (offer_id,),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        logger.error("connect: offer response email — lookup FAILED",
+                     error_type=type(e).__name__, error=str(e)[:400])
+        return False
+
+    if not row:
+        logger.error("connect: offer response email — no offer for id")
+        return False
+
+    # buyer_user_id is ON DELETE SET NULL, so an offer whose buyer closed
+    # their account is a real state rather than an impossible one.
+    to_email = _normalize_email(row.get("buyer_email"))
+    if not to_email:
+        logger.info("connect: offer response email skipped, no buyer address")
+        return False
+
+    status = (row.get("status") or "").strip().lower()
+    if status not in ("accepted", "declined"):
+        # Only owner decisions are announced. 'withdrawn' is the buyer's own
+        # action and 'expired' will be a scheduled job with its own wording.
+        logger.info("connect: offer response email skipped, status not a "
+                    "decision")
+        return False
+
+    amount = row.get("offer_amount")
+    try:
+        amount_str = f"${round(float(amount)):,}" if amount is not None else None
+    except (TypeError, ValueError):
+        amount_str = None
+
+    close_date = row.get("proposed_close_date")
+    # The buyer identifies their own offer from these two facts, which is why
+    # the property does not need naming.
+    which = " · ".join(
+        p for p in (
+            f"Offer: {amount_str}" if amount_str else None,
+            f"Proposed closing: {close_date}" if close_date else None,
+        ) if p
+    )
+    which_line = f"{which}\n\n" if which else ""
+
+    if status == "accepted":
+        subject = "Your offer was accepted"
+        body = (
+            "The owner has accepted your offer.\n\n"
+            f"{which_line}"
+            "We will contact you to arrange next steps. You do not need to do "
+            "anything right now, and please do not try to contact the owner "
+            "directly — everything goes through Govire until both sides have "
+            "agreed to share details.\n\n"
+            "Nothing is binding until a purchase agreement is signed.\n\n"
+            "Govire does not buy properties, is not your agent, and takes no "
+            "part of any sale."
+        )
+    else:
+        subject = "Your offer was not accepted"
+        body = (
+            "The owner has declined your offer.\n\n"
+            f"{which_line}"
+            "No reason is given and none is owed — owners here are working to "
+            "a deadline and often have more than one offer in front of "
+            "them.\n\n"
+            "Other properties are available, and this one may be listed "
+            "again.\n\n"
+            "Govire does not buy properties, is not your agent, and takes no "
+            "part of any sale."
+        )
+
+    return await _resend_send(
+        to_email, subject, body, context="offer_response",
+    )
+
+
 __all__ = [
     "pg",
     "request_link",
@@ -996,4 +1121,5 @@ __all__ = [
     "respond_to_offer",
     "send_listing_confirmation",
     "send_offer_notification",
+    "send_offer_response_notification",
 ]
