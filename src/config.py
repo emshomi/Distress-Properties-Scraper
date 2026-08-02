@@ -10,10 +10,16 @@ The `settings` singleton at the bottom is imported throughout the codebase.
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# stdlib logging, NOT src.utils.logger. config.py is imported by nearly
+# everything including the logger itself, so importing the project logger here
+# would be circular.
+_log = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -173,6 +179,24 @@ class Settings(BaseSettings):
     scraper_tax_forfeit_enabled: bool = Field(default=True)
     scraper_parcel_enrich_mngeo_enabled: bool = Field(default=True)
 
+    # ADDED 2026-08-02. These scrapers were WRITING DATA with no toggle here.
+    # scraper_enabled() falls back to False for an unknown attribute, so each
+    # was "disabled" the moment anything routed it through BaseScraper.run() —
+    # while the standalone runners, which called fetch/parse/write directly,
+    # never consulted the flag and kept working.
+    #
+    # Found when scripts/run_hennepin_tax_roll.py was converted to run() and
+    # the workflow failed with ScraperDisabledError. hennepin_tax_roll holds
+    # 4,255 events, the largest single source in signals.distress_events, and
+    # had written as recently as the previous day. Nobody had turned it off;
+    # the field simply never existed.
+    #
+    # olmsted_delq_list (502 events) feeds the Olmsted forfeiture clocks and
+    # has the same gap. Both default True because both are demonstrably
+    # intended to run.
+    scraper_hennepin_tax_roll_enabled: bool = Field(default=True)
+    scraper_olmsted_delq_list_enabled: bool = Field(default=True)
+
     # ----- Scraper behavior -----
 
     scraper_request_timeout_seconds: int = Field(
@@ -224,9 +248,31 @@ class Settings(BaseSettings):
 
         Maps the source_name (e.g., 'mpls_311') to the env-toggle field
         (e.g., 'scraper_mpls_311_enabled').
+
+        A MISSING field returns False, and warns loudly (2026-08-02).
+
+        False is the right answer for an unknown scraper — defaulting an
+        unrecognised name to enabled would let a typo silently run something.
+        But returning it SILENTLY is how hennepin_tax_roll came to be disabled
+        without anyone deciding to disable it: the field was never added, the
+        standalone runner bypassed this check entirely, and the discrepancy
+        only surfaced months later when that runner was changed to go through
+        BaseScraper.run() and the workflow died with ScraperDisabledError.
+
+        The warning distinguishes "deliberately off" from "never wired". Both
+        return False; only one of them is a decision.
         """
         attr_name = f"scraper_{source_name}_enabled"
-        return bool(getattr(self, attr_name, False))
+        if not hasattr(self, attr_name):
+            _log.warning(
+                "No config toggle for scraper %r (expected field %r) — "
+                "treating as DISABLED. Add the field to Settings if this "
+                "scraper is meant to run.",
+                source_name,
+                attr_name,
+            )
+            return False
+        return bool(getattr(self, attr_name))
 
 
 # ============================================================
