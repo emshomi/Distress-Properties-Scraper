@@ -3,10 +3,39 @@ APScheduler-based cron coordinator for the scraper service.
 
 Registers each scraper with a specific cron expression and ensures runs
 happen automatically without operator intervention.
+
+=== WHY JOBS RUN ON A WORKER THREAD (2026-08-02) ===
+AsyncIOScheduler awaits coroutine jobs directly ON THE EVENT LOOP. Every
+scraper method is `async def`, but the WRITE path inside them is entirely
+synchronous — the sync supabase client, audit_logger, source_health_tracker
+and (in parcel_enrich) plain `requests`. None of it ever yields, so the loop
+was pinned for the whole run and uvicorn could not accept a single request.
+
+Measured live 2026-08-02. parcel_enrich_mngeo started 08:30 CDT and held the
+loop until 08:50. In that window GET /health timed out at 21s, an offer POST
+hung until the client gave up, and NOTHING appeared in the Railway logs for
+either request, because the server never processed them. The container was
+Active and healthy the entire time. The same shape had happened at 08:30 the
+previous day and nobody noticed — the only reason it surfaced was that we
+happened to be calling the API mid-run.
+
+The daily cost was ~20 minutes of dead API at 08:30 plus ~10 at 06:15, on a
+product whose users are homeowners in foreclosure looking up a deadline.
+
+Fix: dispatch the whole run to a worker thread via asyncio.to_thread, and
+give it its own event loop with asyncio.run. The API loop stays free. The
+async parts of a scrape (base_arcgis_scraper uses httpx.AsyncClient properly)
+work fine on the worker's loop — that class creates and closes its client
+inside fetch(), holding no loop-bound state across runs.
+
+The per-scraper concurrency guard moved from asyncio.Lock to threading.Lock
+in base_scraper.py for exactly this reason: an asyncio.Lock guards nothing
+once runs happen on different threads, and it fails silently.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -64,8 +93,42 @@ _RUNTIME_CLASS_REGISTRY: dict[str, type[BaseScraper]] = {
 }
 
 
+def _run_scraper_blocking(scraper_class: type[BaseScraper]) -> Any:
+    """Run one scrape to completion on THIS thread, with its own event loop.
+
+    Called only from a worker thread via asyncio.to_thread. asyncio.run
+    creates a fresh loop, runs the coroutine, and closes the loop — so the
+    scrape never touches the API's loop, and nothing loop-bound survives
+    between runs.
+
+    Returns the RunResult. Exceptions propagate to the caller, which is the
+    async wrapper below; letting them out here keeps this function honest and
+    the logging in one place.
+    """
+    scraper = scraper_class()
+    return asyncio.run(
+        scraper.run(
+            trigger="scheduler",
+            metadata={"trigger_source": "cron"},
+        )
+    )
+
+
 async def _run_scraper_job(scraper_class_name: str) -> None:
-    """APScheduler job function — looks up class and invokes run()."""
+    """APScheduler job function — dispatches the run to a worker thread.
+
+    Still `async def` because AsyncIOScheduler awaits its jobs, but the body
+    yields at `await asyncio.to_thread(...)`, which is the entire point: the
+    event loop is released for the duration of the scrape instead of being
+    pinned by its synchronous write path.
+
+    asyncio.to_thread uses the default ThreadPoolExecutor, which FastAPI also
+    uses for sync route handlers. Scrapers are staggered an hour apart and
+    APScheduler enforces max_instances=1, so at most one long scrape occupies
+    a pool thread at a time; the default pool is min(32, cpu_count + 4)
+    workers. If scrapers are ever scheduled to overlap, give them a dedicated
+    executor rather than letting them compete with request handling.
+    """
     scraper_class = _RUNTIME_CLASS_REGISTRY.get(scraper_class_name)
     if scraper_class is None:
         logger.error(
@@ -75,14 +138,10 @@ async def _run_scraper_job(scraper_class_name: str) -> None:
         return
 
     try:
-        scraper = scraper_class()
-        result = await scraper.run(
-            trigger="scheduler",
-            metadata={"trigger_source": "cron"},
-        )
+        result = await asyncio.to_thread(_run_scraper_blocking, scraper_class)
         logger.info(
             "Scheduled scraper run complete",
-            scraper=scraper.source_name,
+            scraper=result.scraper_name,
             run_id=result.run_id,
             status=result.status,
             duration_seconds=result.duration_seconds,
