@@ -87,6 +87,7 @@ from src.routes.connect_auth import (
     request_link,
     respond_to_offer,
     send_listing_confirmation,
+    send_offer_response_notification,
     verify_link,
     withdraw_listing,
 )
@@ -1363,22 +1364,46 @@ async def connect_respond_to_offer(
 
     logger.info("connect: offer answered", decision=choice)
 
-    # NOTE the wording: neither message claims the buyer has been told.
-    # NOTHING notifies the buyer yet — that path does not exist, and it is the
-    # mirror of the dead end this endpoint was written to fix. Saying "the
-    # buyer has been told" would be the same defect as the "verified buyers"
-    # claim removed from send_listing_confirmation this morning: an email or a
-    # screen promising something no code performs. Say what is true.
+    # Tell the buyer. AFTER the UPDATE has committed and unable to affect the
+    # response: the owner's decision stands whatever happens to the email, and
+    # an owner must not see an error because Resend was slow.
+    #
+    # send_offer_response_notification never raises; this wrap is belt and
+    # braces for the same reason the raise-hand confirmation has one.
+    #
+    # Silence toward the buyer is NOT the safe default here, which is the
+    # opposite of the usual instinct. A buyer who offered a quarter of a
+    # million on a real house and hears nothing goes looking for the owner —
+    # the disintermediation the whole redaction design exists to prevent. The
+    # email is what keeps them inside the channel, and it explicitly asks them
+    # not to approach the owner directly.
+    notified = False
+    try:
+        notified = await send_offer_response_notification(offer_id)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[connect] OFFER RESPONSE EMAIL FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: offer response email raised",
+                     error_type=type(e).__name__, error=str(e)[:400])
+
+    # The owner's message claims the buyer was told ONLY when they actually
+    # were. `notified` is the sender's own return value, not an assumption.
+    # This is the "verified buyers" lesson from earlier today: never put a
+    # claim on a screen that no code performed.
     if choice == "accepted":
+        told = ("The buyer has been told. " if notified
+                else "We are letting the buyer know. ")
         message = (
-            "Your answer is recorded. Nothing is binding until you both sign "
-            "a purchase agreement, and you are free to take advice before you "
-            "do. We will be in touch about next steps."
+            f"Your answer is recorded. {told}Nothing is binding until you "
+            "both sign a purchase agreement, and you are free to take advice "
+            "before you do. We will be in touch about next steps."
         )
     else:
+        told = ("The buyer has been told. " if notified
+                else "We are letting the buyer know. ")
         message = (
-            "Declined, and recorded. Your property is still listed, and other "
-            "buyers can still make offers."
+            f"Declined, and recorded. {told}Your property is still listed, "
+            "and other buyers can still make offers."
         )
 
     return success_envelope({
