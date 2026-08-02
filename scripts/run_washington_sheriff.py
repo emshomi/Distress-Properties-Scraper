@@ -9,77 +9,87 @@ monthly files, parses the per-property sale rows, and writes foreclosure events.
 Usage:
     python -m scripts.run_washington_sheriff [trigger_name]
 
-The trigger_name defaults to "github_actions" and is recorded in the scraper_runs
-table for observability. The script exits with code 0 on success, 1 on any failure
-during fetch/parse/write so GitHub Actions correctly marks the run as failed.
+Exit code 0 on success or partial success, 1 on failure, so GitHub Actions
+marks a genuinely broken run as failed.
+
+=== WHY THIS CALLS run() INSTEAD OF fetch/parse/write (2026-08-02) ===
+It used to drive the three lifecycle steps itself and call
+source_health_tracker directly. ONLY BaseScraper._run_locked writes
+audit.scraper_runs, so every Actions run of this scraper was INVISIBLE in the
+run log — audit.scraper_runs has never held a single washington_sheriff row.
+
+MIGRATION_cadence_fix_2026-07-13.sql records the downstream effect: no
+source_health row exists for washington_sheriff either, and the note there
+attributes it to record_success never firing. Worth being precise, because
+that note is misleading: the old code DID call record_success on the success
+path. The row is missing because the run is not reaching it — the last
+washington_sheriff write to signals.distress_events was 2026-07-05. Whatever
+is wrong is in the fetch or the workflow, not the health call, and going
+through run() is what will finally record it either way: a failure now writes
+a run row with a status and an error message instead of vanishing.
+
+Washington is also the county Part 7 flags as MIXED on redemption periods —
+44 stated, 118 assumed — so the calculator drives its confidence line off
+period_source per row rather than a per-county rule. A silently dead feed
+here degrades that quietly rather than obviously.
+
+run() does everything this file used to do by hand — the audit run row, the
+health row, the per-class lock, and the success/partial/failed decision — in
+ONE place, instead of five runners each keeping their own copy.
+
+=== EXIT CODE ===
+run() CATCHES exceptions and returns a RunResult with status='failed' rather
+than raising, so the exit code must come from result.status. A try/except
+around it would see nothing and exit 0 on a broken scrape.
+
+'partial' exits 0 deliberately: a red mark for a few failed rows out of many
+is how people learn to ignore red marks. The count is printed and the run row
+records 'partial', which is the honest label.
 """
 from __future__ import annotations
+
 import asyncio
 import sys
-import traceback
+
 # Import is at top level so a missing env var / config error fails fast
 # (before we waste time on imports inside main()).
 from src.scrapers.washington_sheriff import WashingtonSheriffScraper
-from src.services import source_health_tracker
 from src.utils.logger import logger
+
+
 async def main() -> int:
     trigger = sys.argv[1] if len(sys.argv) > 1 else "github_actions"
+
     logger.info("Washington runner starting", trigger=trigger)
     print(f"[washington-runner] trigger={trigger}", flush=True)
+
     scraper = WashingtonSheriffScraper()
-    # --- Fetch ---
-    try:
-        print("[washington-runner] fetch: contacting washingtoncountymn.gov archive ...", flush=True)
-        raw_records = await scraper.fetch(trigger)
-        print(f"[washington-runner] fetch: OK, got {len(raw_records)} raw rows", flush=True)
-    except Exception as e:
-        print(f"[washington-runner] fetch: FAILED — {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        source_health_tracker.record_failure(
-            scraper.source_name, notes=f"fetch failed: {type(e).__name__}: {e}"[:500]
-        )
-        return 1
-    # --- Parse ---
-    try:
-        signals = await scraper.parse(raw_records)
-        print(f"[washington-runner] parse: OK, produced {len(signals)} signals", flush=True)
-    except Exception as e:
-        print(f"[washington-runner] parse: FAILED — {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        source_health_tracker.record_failure(
-            scraper.source_name, notes=f"parse failed: {type(e).__name__}: {e}"[:500]
-        )
-        return 1
-    # --- Write ---
-    try:
-        new, updated, failed = await scraper.write(signals)
-        print(
-            f"[washington-runner] write: OK — new={new} updated={updated} failed={failed}",
-            flush=True,
-        )
-    except Exception as e:
-        print(f"[washington-runner] write: FAILED — {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        source_health_tracker.record_failure(
-            scraper.source_name, notes=f"write failed: {type(e).__name__}: {e}"[:500]
-        )
-        return 1
-    if failed > 0:
-        print(
-            f"[washington-runner] completed with {failed} failed events — exit 1",
-            flush=True,
-        )
-        source_health_tracker.record_failure(
-            scraper.source_name,
-            notes=f"{failed} of {new + updated + failed} record writes failed",
-        )
-        return 1
-    source_health_tracker.record_success(scraper.source_name)
+
+    # trigger="manual" so a disabled scraper RAISES ScraperDisabledError
+    # instead of returning status='skipped' silently. Given this scraper has
+    # no run history at all, a config flag turning it off is a live
+    # possibility and must not present as a green workflow.
+    result = await scraper.run(
+        trigger="manual",
+        metadata={"trigger_source": "github_actions", "runner": "washington"},
+    )
+
     print(
-        f"[washington-runner] done. (health: success recorded, "
-        f"new={new} updated={updated})",
+        f"[washington-runner] {result.status} — run_id={result.run_id} "
+        f"fetched={result.records_fetched} new={result.records_new} "
+        f"updated={result.records_updated} failed={result.records_failed} "
+        f"({result.duration_seconds:.1f}s)",
         flush=True,
     )
-    return 0
+    if result.error_message:
+        print(f"[washington-runner] note: {result.error_message}", flush=True)
+
+    if result.status in ("success", "partial"):
+        return 0
+
+    print("[washington-runner] FAILED — exit 1", flush=True)
+    return 1
+
+
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
