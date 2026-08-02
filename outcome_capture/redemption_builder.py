@@ -70,6 +70,11 @@ point: run it after every sheriff scrape.
 
 Never downgrades. A row already on a county-published date is not
 overwritten by a computed default.
+
+The upsert also recomputes next_check_date on UPDATE, not only on INSERT
+(fixed 2026-08-02). See the comment in UPSERT_SQL: a corrected expiry that
+left a stale check date caused outcome_checker to run before the window had
+closed and record an outcome for a redemption that was still open.
 """
 
 from __future__ import annotations
@@ -284,6 +289,47 @@ SET redemption_expiry_date   = EXCLUDED.redemption_expiry_date,
     redemption_period_months = EXCLUDED.redemption_period_months,
     period_source            = EXCLUDED.period_source,
     anchor_date              = EXCLUDED.anchor_date,
+    -- next_check_date MUST be recomputed here too, not only on INSERT.
+    -- ADDED 2026-08-02. Until today this clause moved the expiry date and
+    -- left next_check_date on the ladder derived from the OLD expiry. Any
+    -- row whose window was corrected LATER — a postponed sheriff sale, or a
+    -- county-published expiry replacing a computed one — kept a check date
+    -- that had already passed relative to its new window. Measured live:
+    -- 56 rows across 43 parcels, the worst scheduled 164 days BEFORE its
+    -- own expiry, six of them having already burned a ladder rung.
+    --
+    -- The consequence is not a wrong date shown to an owner; it is a wrong
+    -- OUTCOME. outcome_checker selects on `next_check_date <= today`, looks
+    -- for an REO owner match or a post-expiry sale, finds neither because
+    -- the window is still open, advances the stage and reschedules. A row
+    -- can burn all four rungs before its window closes and then resolve to
+    -- 'unknown' — the same stranding as the 266 NULL rows of 2026-07-28,
+    -- reached from the opposite direction.
+    --
+    -- GREATEST() so a check date can only ever move LATER. If the expiry is
+    -- ever corrected EARLIER, the existing (later) check still stands: a
+    -- check that runs late costs a delayed label, one that runs early
+    -- records a conclusion about a window that had not closed. GREATEST
+    -- also ignores NULL, so a row stranded with no check date at all is
+    -- repaired on the next run rather than staying invisible forever.
+    next_check_date = GREATEST(
+      outcomes.redemption_tracker.next_check_date,
+      CASE
+        WHEN EXCLUDED.redemption_expiry_date + 30  > CURRENT_DATE
+          THEN EXCLUDED.redemption_expiry_date + 30
+        WHEN EXCLUDED.redemption_expiry_date + 60  > CURRENT_DATE
+          THEN EXCLUDED.redemption_expiry_date + 60
+        WHEN EXCLUDED.redemption_expiry_date + 90  > CURRENT_DATE
+          THEN EXCLUDED.redemption_expiry_date + 90
+        WHEN EXCLUDED.redemption_expiry_date + 180 > CURRENT_DATE
+          THEN EXCLUDED.redemption_expiry_date + 180
+        -- Ladder exhausted: hand it to the checker NOW. next_ladder_date()
+        -- returns None in that state and decide() resolves the row to
+        -- 'unknown', so checking today RESOLVES it. Parking it further out
+        -- would only delay that.
+        ELSE CURRENT_DATE
+      END
+    ),
     updated_at               = now()
 -- NEVER downgrade: a row already on a county-published date is not
 -- replaced by a computed default.
