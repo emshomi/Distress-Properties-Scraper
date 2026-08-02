@@ -1,0 +1,70 @@
+name: Parcel Geom Backfill
+# Populates core.parcels.geom from lat/lng, in batches.
+#
+# ADDED 2026-08-02. core.parcels has carried a geography(Point,4326) column
+# AND an index on it since the schema was designed, and nothing ever wrote to
+# it: 0 rows had geometry while 860,687 had perfectly good lat and lng. Same
+# shape as scraper_run_id being NULL on every distress_events row — a column
+# built for a purpose nobody wired up.
+#
+# It blocks neighbourhood-level questions entirely. "Distressed properties in
+# Highland Park" is not a city filter; Highland Park is one of Saint Paul's 17
+# District Council areas and isolating it needs a point-in-polygon join. No
+# geometry, no join.
+#
+# WHY NOT JUST RUN THE UPDATE IN THE SQL EDITOR
+# It times out. Not statement_timeout — the Supabase API gateway gives up while
+# the statement may well still be running server-side, so you cannot tell a
+# slow success from a failure. Even 15,741 rows (Wabasha alone) died. The cost
+# is index maintenance: core.parcels has an index ON geom, so updating it
+# writes new index entries per row and blocks HOT updates. 1,000 rows per batch
+# was measured comfortable; the script commits each batch separately.
+#
+# workflow_dispatch ONLY, no schedule. This is a one-time backfill. Once
+# complete it does nothing on every subsequent run, and a daily cron for a
+# finished job becomes a source in the health digest nobody can explain.
+# Re-runnable at will: the predicate is `geom IS NULL`, so it always resumes
+# where it stopped and never revisits a completed row.
+#
+# Run it again after onboarding a county, or after any parcel loader backfills
+# lat/lng where there was none — washington (118,591 parcels) and dakota
+# (167,494) currently have NO coordinates at all, so neither can participate in
+# spatial work until their loaders are fixed.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Set to 1 to report how many need geom, without writing'
+        required: false
+        default: '0'
+jobs:
+  backfill:
+    name: Backfill parcel geometry
+    runs-on: ubuntu-latest
+    # 860k rows at 1,000 per batch is ~860 batches. Generous, because the
+    # script is self-resuming: a run cut off half way costs nothing but a
+    # re-run, while a run killed at 95% that had to start over would.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      # outcome_capture/ scripts talk to Postgres directly via psycopg2 and do
+      # not use the FastAPI service's dependency set. requirements.txt has no
+      # Postgres driver — the service uses PostgREST. Mirrors how
+      # redemption-builder.yml and outcome-checker.yml install.
+      #
+      # ST_MakePoint / ST_SetSRID run server-side in PostGIS, so nothing
+      # geospatial is needed on the client.
+      - name: Install Python dependencies
+        run: pip install psycopg2-binary
+      - name: Backfill parcel geom
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python outcome_capture/backfill_parcel_geom.py
