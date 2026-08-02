@@ -185,6 +185,41 @@ def _synthetic_pid(county: Optional[str], source_id: str) -> str:
     return f"{_county_upper(county)}-FC-{source_id}"
 
 
+# Label to fall back on when an extraction somehow has no source_name.
+# Verified 2026-08-02: source_name is populated on 371 of 371 rows in
+# ai.extracted_foreclosures, so this should never fire. It exists so a
+# malformed row produces a WRONG-BUT-KNOWN label rather than an empty string
+# that would silently break every source-based join downstream.
+_FALLBACK_SOURCE = "startribune_legal"
+
+
+def derive_source(extracted: dict[str, Any]) -> str:
+    """Which feed this notice actually came from.
+
+    ADDED 2026-08-02. Until today this module hardcoded "startribune_legal"
+    into distress_event.source, raw_data._source and parcel_row.data_sources.
+
+    That was true when the Star Tribune scraper was the only feeder. It stopped
+    being true when mnpublicnotice took over and nobody updated the constant.
+    Measured: of 371 extractions, 369 are mnpublicnotice and 2 are
+    startribune_legal (ONE of which is approved, from 2026-06-07). Of the 238
+    promoted distress_events rows carrying the Star Tribune label, 237 are
+    misattributed.
+
+    Why it matters beyond tidiness: `source` is how coverage is attributed and
+    what source_county_map keys on to assign county slugs. A mislabelled source
+    is the documented mechanism by which a new source silently gets a NULL
+    slug. It also made the run log unreadable — a source with 238 events and
+    one approved notice is a contradiction that costs time to unpick.
+
+    The extraction row already knows the answer; it just was not being asked.
+    """
+    name = extracted.get("source_name")
+    if name and str(name).strip():
+        return str(name).strip()
+    return _FALLBACK_SOURCE
+
+
 def derive_source_id(extracted: dict[str, Any]) -> str:
     """Stable, unique id for this notice on the foreclosure tab. Prefer the
     attorney file number (stable per notice); fall back to the ai row id."""
@@ -202,6 +237,8 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     county_lo = _county_lower(county)
     county_code = _county_slug(county)  # FK-valid slug for core.counties
     source_id = derive_source_id(extracted)
+    # Real feed name, not a hardcoded constant. See derive_source().
+    source = derive_source(extracted)
     real_pid = extracted.get("parcel_id")  # the real GIS PID, e.g. '220570230'
     synthetic_pid = _synthetic_pid(county, source_id)
 
@@ -217,7 +254,7 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     # detail block (gis_pid is the path the overlay view reads today; county is
     # for the follow-up view edit).
     raw_data: dict[str, Any] = {
-        "_source": "startribune_legal",
+        "_source": source,
         "address": address,
         "city": city or None,
         "mortgagee": mortgagee,
@@ -253,7 +290,7 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
         "event_subtype": "scheduled",
         "event_date": sale_date,
         "event_value": amount_due,
-        "source": "startribune_legal",
+        "source": source,
         "source_id": source_id,
         "severity": "medium",
         "title": title,
@@ -287,7 +324,7 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
         "county_code": county_code,
         "address": address if address != "address not stated" else None,
         "city": city or None,
-        "data_sources": ["startribune_legal"],
+        "data_sources": [source],
         "raw_data": {
             "gis_pid": real_pid,
             "source_url": extracted.get("source_url"),
@@ -303,4 +340,4 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["build_promotion_rows", "derive_source_id"]
+__all__ = ["build_promotion_rows", "derive_source", "derive_source_id"]
