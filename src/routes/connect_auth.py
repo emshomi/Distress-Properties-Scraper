@@ -238,6 +238,33 @@ async def send_listing_confirmation(
     and it is the next thing to build — repeating it here would double the
     number of places we owe someone a message we cannot send.
 
+    Deliberately does NOT say "verified buyers", which is what this said
+    until 2026-08-02. "Verified" meant nothing more than holding a basic
+    subscription. To an owner in foreclosure it implies vetting Govire does
+    not perform, and it is the kind of claim someone relies on when deciding
+    whether to trust the offer that follows.
+
+    It was not replaced with "subscribers" or "paid buyers" either. _OFFER_TIERS
+    in middleware/investor.py is explicitly a candidate for adding "free" if
+    the buy side stays empty — a one-line config change that would silently
+    falsify every email already delivered. An email cannot be recalled, so it
+    may only carry claims that a later config flag cannot turn into a lie.
+
+    What buyers actually see is stated instead: county, a value band, a
+    timing window. That is the reassurance "verified" was standing in for,
+    and unlike "verified" it is enforced in code (routes/marketplace.py).
+    Note it slightly OVERSTATES what reaches a buyer — the value band and the
+    timing window each render only when the source data exists. Erring that
+    way understates the owner's privacy rather than overstating it, which is
+    the only safe direction for this sentence.
+
+    Says nothing about the 72-hour minimum on offer expiry, true and enforced
+    though it is. Mentioning a response window implies the owner can respond,
+    and nothing accepts, declines or opens a conversation yet. That is the
+    same defect as "verified buyers" in a different coat: an email asserting
+    a capability the product does not have. It belongs here once
+    POST /connect/offers/{id}/respond exists, and not before.
+
     The subject line names no distress. An email subject is visible on a lock
     screen to whoever is standing there, and an owner in foreclosure has not
     necessarily told the people around them.
@@ -273,10 +300,11 @@ async def send_listing_confirmation(
     body = (
         "Your property is on file with Govire.\n\n"
         f"{property_line}"
-        "What this means: verified buyers can see that a property is "
-        "available and make an offer on it. Nobody has your address, your "
-        "name or your contact details, and nobody gets them unless you "
-        "choose to open an offer.\n\n"
+        "What this means: buyers using Govire can see that a property is "
+        "available and make an offer on it. They are shown your county, a "
+        "value range and a rough timeframe — nothing more. They do not have "
+        "your address, your name or your contact details, and nobody gets "
+        "them unless you choose to open an offer.\n\n"
         "You are not committed to anything. You can change your answers or "
         "withdraw at any time here:\n\n"
         f"{base}/connect/me\n\n"
