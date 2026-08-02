@@ -18,7 +18,18 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.config import settings
 from src.db.supabase_client import ping_supabase
-from src.routes import access, admin, ai, connect, discover, health, properties, status, trigger
+from src.routes import (
+    access,
+    admin,
+    ai,
+    connect,
+    discover,
+    health,
+    marketplace,
+    properties,
+    status,
+    trigger,
+)
 from src.scheduler.cron import start_scheduler, stop_scheduler
 from src.utils.errors import ServiceError, error_envelope
 from src.utils.logger import logger
@@ -195,6 +206,14 @@ app.include_router(ai.router)
 # resolve_tier or redact_property: different consent basis, and gating it
 # would kill the organic search that is the whole point.
 app.include_router(connect.router)
+# Govire marketplace — the INVESTOR side of Connect. Separate router from
+# connect.py because it is the opposite side of the wall: app_auth JWT
+# identity instead of an owner magic-link session, and its job is to WITHHOLD
+# the numbers connect.py exists to show. Deliberately NOT behind resolve_tier
+# either — resolve_tier never raises and falls through to "free", which is
+# right for browsing locked cards and wrong for anything that writes. It uses
+# resolve_investor, which 401s.
+app.include_router(marketplace.router)
 
 
 # ============================================================
