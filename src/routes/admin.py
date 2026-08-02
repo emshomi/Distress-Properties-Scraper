@@ -45,6 +45,25 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # The public site origin, used to build the access link in the email.
 _SITE_ORIGIN = "https://govire.com"
 
+# Every source label a promoted foreclosure row may carry.
+#
+# ADDED 2026-08-02. foreclosure_promotion.py used to stamp "startribune_legal"
+# onto every promoted row regardless of which feed produced it. It now uses the
+# extraction's real source_name (369 of 371 are mnpublicnotice), and the 237
+# misattributed distress_events rows are being migrated.
+#
+# The lookups below match on EITHER label, deliberately, because the code and
+# the data cannot change in the same instant. Matching only the new label would
+# mean the idempotency guard finds nothing among the un-migrated rows and
+# re-inserts every foreclosure as a DUPLICATE; matching only the old one breaks
+# the moment a row is migrated. Accepting both removes the window entirely and
+# makes the deploy order irrelevant.
+#
+# Safe to narrow to the real source once the migration is verified and no rows
+# carry a mislabelled source — but there is no cost to leaving it, and a third
+# feeder would slot in here rather than needing this reasoning rediscovered.
+_PROMOTION_SOURCES = ("startribune_legal", "mnpublicnotice")
+
 
 # ============================================================
 # GET /admin/requests — list all requests
@@ -308,7 +327,8 @@ def _apply_postponement(existing_row: dict[str, Any],
         "raw_data": new_event.get("raw_data"),
         "title": new_event.get("title"),
         "description": new_event.get("description"),
-    }).eq("source", "startribune_legal").eq("source_id", source_id).execute()
+    }).in_("source", list(_PROMOTION_SOURCES)).eq(
+        "source_id", source_id).execute()
 
     # sheriff_sales has no source_id column; parcel_id is the handle, and the
     # synthetic PID is built from source_id so it identifies the same
@@ -390,13 +410,11 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
     copies would drift. Correcting the SOURCE rows is what makes the fix
     durable: the builder derives the right anchor on its next run.
 
-    NOTE on the hardcoded "startribune_legal" source below: it is wrong. 353
-    of 355 extractions come from mnpublicnotice, and foreclosure_promotion.py
-    stamps every promoted row with the Star Tribune name regardless. It is
-    left alone HERE on purpose — all 238 existing distress_events rows carry
-    that label, so changing the lookup without migrating them first would
-    match nothing and re-insert every foreclosure as a duplicate. The relabel
-    needs its own change plus a data migration."""
+    SOURCE LABEL (resolved 2026-08-02): foreclosure_promotion.py no longer
+    hardcodes "startribune_legal" — it reads the extraction's real source_name,
+    of which 369 of 371 are mnpublicnotice. The lookups here match EITHER label
+    via _PROMOTION_SOURCES so the code change and the data migration do not
+    have to land in the same instant. See that constant for the reasoning."""
     try:
         row_result = (
             ai_table("extracted_foreclosures")
@@ -424,8 +442,8 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
         # date, same source_id) apart from a re-scrape of the same notice.
         existing = (
             signals_table("distress_events")
-            .select("id, event_date")
-            .eq("source", "startribune_legal")
+            .select("id, event_date, source")
+            .in_("source", list(_PROMOTION_SOURCES))
             .eq("source_id", source_id)
             .limit(1)
             .execute()
