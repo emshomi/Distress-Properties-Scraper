@@ -17,7 +17,7 @@ Routes:
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, status as http_status
@@ -243,6 +243,114 @@ async def list_extractions(status: str = "pending") -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to list extractions.")
 
 
+def _as_date(value: Any) -> Optional[date]:
+    """Parse an ISO date out of whatever the API layer hands back.
+
+    PostgREST returns dates as strings, build_promotion_rows carries through
+    whatever the extractor produced. Returns None rather than raising: an
+    unparseable date must mean "cannot compare", never "treat as earlier".
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def _apply_postponement(existing_row: dict[str, Any],
+                        built: dict[str, Any],
+                        source_id: str) -> bool:
+    """A notice arrived for a foreclosure already on file. If it moved the
+    sale LATER, update the live rows. Returns True if anything changed.
+
+    Returns False — changing nothing — whenever the comparison cannot be made
+    safely: either date missing or unparseable, incoming date not strictly
+    later. Silence is the correct outcome there. The overwhelmingly common
+    case is the same notice re-scraped (one Golden Valley notice was
+    re-extracted twice daily for eleven days), and re-stamping identical
+    values on every one of those would be noise at best.
+
+    Updates BOTH source tables. redemption_builder reads
+    raw_data->>'dateOfSale' FIRST and falls back to event_date, so correcting
+    only one of them leaves the builder deriving the old anchor. Verified
+    2026-08-02: all 14 affected rows had event_date and raw_data.dateOfSale
+    holding the same stale value.
+    """
+    new_event = built["distress_event"]
+    new_sale = built["sheriff_sale"]
+
+    old_date = _as_date(existing_row.get("event_date"))
+    new_date = _as_date(new_event.get("event_date"))
+
+    if old_date is None or new_date is None:
+        logger.info("postponement check skipped — date missing",
+                    source_id=source_id)
+        return False
+    if new_date <= old_date:
+        return False
+
+    # distress_events: the whole raw_data blob is replaced rather than one key
+    # patched. It is rebuilt from the NEWER notice, so it also carries the
+    # newer source_url, confidence and extraction flags — strictly better than
+    # the superseded copy. title and description embed the sale date in prose
+    # and would otherwise still read the old one back to a human.
+    signals_table("distress_events").update({
+        "event_date": new_event.get("event_date"),
+        "event_value": new_event.get("event_value"),
+        "raw_data": new_event.get("raw_data"),
+        "title": new_event.get("title"),
+        "description": new_event.get("description"),
+    }).eq("source", "startribune_legal").eq("source_id", source_id).execute()
+
+    # sheriff_sales has no source_id column; parcel_id is the handle, and the
+    # synthetic PID is built from source_id so it identifies the same
+    # foreclosure. postponement_count is read then incremented — it was
+    # hardcoded to 0 at promotion and had never moved, so the fact that a sale
+    # had been postponed at all was recorded nowhere.
+    parcel_id = new_sale.get("parcel_id")
+    prior = 0
+    try:
+        found = (
+            signals_table("sheriff_sales")
+            .select("postponement_count")
+            .eq("parcel_id", parcel_id)
+            .limit(1)
+            .execute()
+        )
+        if found.data:
+            prior = int(found.data[0].get("postponement_count") or 0)
+    except Exception as e:
+        # Non-fatal: a missed increment is a lost statistic, while failing the
+        # approval would leave the WRONG DATE live in front of an owner. The
+        # date update above has already committed.
+        logger.warning("postponement count read failed",
+                       source_id=source_id, error_type=type(e).__name__)
+
+    signals_table("sheriff_sales").update({
+        "sale_date": new_sale.get("sale_date"),
+        "sale_time": new_sale.get("sale_time"),
+        "sale_location": new_sale.get("sale_location"),
+        "postponement_count": prior + 1,
+    }).eq("parcel_id", parcel_id).execute()
+
+    logger.info(
+        "sheriff sale POSTPONED — live rows updated",
+        source_id=source_id,
+        old_sale_date=str(old_date),
+        new_sale_date=str(new_date),
+        days_later=(new_date - old_date).days,
+    )
+    return True
+
+
 @router.post(
     "/extractions/approve",
     status_code=http_status.HTTP_200_OK,
@@ -251,9 +359,44 @@ async def list_extractions(status: str = "pending") -> dict[str, Any]:
 )
 async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
     """Promote one extraction into core.parcels + signals.distress_events +
-    signals.sheriff_sales, then stamp it approved/promoted. Idempotent: if a
-    distress_events row with the same (source, source_id) already exists, we
-    skip the inserts but still mark the extraction approved."""
+    signals.sheriff_sales, then stamp it approved/promoted.
+
+    Idempotent on (source, source_id). source_id is the attorney file number,
+    which is stable PER FORECLOSURE, not per notice — so a POSTPONED sale
+    republished as a new statutory notice arrives with the SAME source_id and
+    a LATER sale_date.
+
+    Until 2026-08-02 a match meant "skip the inserts entirely". That silently
+    discarded every postponement. Measured live: 14 properties across 10
+    counties were anchored to a superseded sale date, understating the
+    redemption window by 30 to 84 days — 2500 Auburn Dr, Victoria was showing
+    13 July when the sale had moved to 27 August. The failure is in the
+    dangerous direction for an owner: they are told the door shut earlier than
+    it did, and an owner who believes the deadline passed stops fighting.
+
+    Now a match compares dates:
+      * incoming sale_date LATER  -> UPDATE the existing rows (postponement)
+      * incoming sale_date SAME or EARLIER -> skip, as before
+
+    A postponement never moves a deadline backwards here. If a notice ever
+    republished an earlier date we do not act on it: shortening someone's
+    window on the strength of a re-published notice needs a human, not a rule.
+
+    What this deliberately does NOT do is touch outcomes.redemption_tracker.
+    redemption_builder.py owns the precedence ladder (county-published expiry
+    > notice-stated period > statutory default) and rebuilds the tracker daily
+    from these rows. Recomputing the expiry here would be a second copy of
+    that logic — the owner-classifier-in-five-files mistake — and the two
+    copies would drift. Correcting the SOURCE rows is what makes the fix
+    durable: the builder derives the right anchor on its next run.
+
+    NOTE on the hardcoded "startribune_legal" source below: it is wrong. 353
+    of 355 extractions come from mnpublicnotice, and foreclosure_promotion.py
+    stamps every promoted row with the Star Tribune name regardless. It is
+    left alone HERE on purpose — all 238 existing distress_events rows carry
+    that label, so changing the lookup without migrating them first would
+    match nothing and re-insert every foreclosure as a duplicate. The relabel
+    needs its own change plus a data migration."""
     try:
         row_result = (
             ai_table("extracted_foreclosures")
@@ -277,15 +420,26 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
         source_id = built["source_id"]
 
         # Idempotency guard: does the distress_events row already exist?
+        # event_date is selected too — it is what tells a postponement (later
+        # date, same source_id) apart from a re-scrape of the same notice.
         existing = (
             signals_table("distress_events")
-            .select("id")
+            .select("id, event_date")
             .eq("source", "startribune_legal")
             .eq("source_id", source_id)
             .limit(1)
             .execute()
         )
-        already = bool(existing.data)
+        existing_rows = existing.data or []
+        already = bool(existing_rows)
+        postponed = False
+
+        if already:
+            postponed = _apply_postponement(
+                existing_row=existing_rows[0],
+                built=built,
+                source_id=source_id,
+            )
 
         if not already:
             # FK chain: distress_events.parcel_id -> core.parcels.parcel_id,
@@ -355,12 +509,18 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
             extraction_id=payload.id,
             source_id=source_id,
             already_existed=already,
+            postponed=postponed,
         )
         return success_envelope({
             "id": payload.id,
             "status": "approved",
             "promoted": not already,
-            "duplicate": already,
+            # A postponement is neither a fresh promotion nor a no-op
+            # duplicate. The review UI needs to tell them apart: "already on
+            # file" and "sale date moved, deadline extended" are different
+            # facts about a property.
+            "duplicate": already and not postponed,
+            "postponed": postponed,
             "source_id": source_id,
         })
 
