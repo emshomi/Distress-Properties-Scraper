@@ -70,6 +70,16 @@ from fastapi import APIRouter, Body, HTTPException, Query, status as http_status
 
 from src.middleware.investor import InvestorContext, InvestorResolved
 from src.routes.connect_auth import pg, send_offer_notification
+# The SAME deal math /data shows. Imported rather than reimplemented: the
+# ratios are calibrated against real sale data and get retuned, and a second
+# copy would drift from the first the moment either changed. The owner
+# classifier lived in five files once and disagreed in all of them.
+#
+# Private name imported across modules, which is not lovely. The alternative
+# is extracting it into a shared module, which means editing a 3,489-line
+# file to move a function that already works. Cross-route imports are already
+# how this file gets pg() and send_offer_notification().
+from src.routes.properties import _compute_deal_math
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
 
@@ -337,6 +347,12 @@ async def marketplace_listings(
                -- ownership_verified is deliberately NOT selected. See the
                -- note above _LISTING_PUBLIC_QUALITATIVE.
                p.county_code,
+               -- SERVER-SIDE ONLY. The calibration picks a city-level sale
+               -- ratio when one exists, falling back to county then metro.
+               -- The city itself is NEVER emitted: Crystal is 23,000 people,
+               -- and city plus a value band plus "vacant, needs work" narrows
+               -- to a handful.
+               p.city,
                r.days_remaining,
                r.outcome,
                c.n            AS comparable_parcels,
@@ -413,6 +429,48 @@ async def marketplace_listings(
             value_band = None
             equity = None
 
+        # The same deal math /data shows, on a property whose owner ASKED for
+        # offers. No tier gate: on /data these numbers are a prospecting tool
+        # aimed at someone who never asked to be found, and premium is the
+        # right price for that. Here the owner raised their hand, and more
+        # buyers seeing the arithmetic means more offers — which is the thing
+        # they came for.
+        #
+        # Returns None unless the redemption window is OPEN. A resolved window
+        # has no negotiation left, and a tax-delinquency listing with no
+        # sheriff sale has no debt to work from. The client renders absence as
+        # absence — never a zero, which would read as "nothing is owed".
+        deal_math = _compute_deal_math({
+            "redemption_state": (
+                "expiring_soon"
+                if isinstance(row.get("days_remaining"), int)
+                and row["days_remaining"] <= 90
+                else "in_redemption"
+            ),
+            "amount": (
+                float(row["amount_owed"])
+                if row.get("amount_owed") is not None else None
+            ),
+            "market_value": (
+                float(row["assessed_value_at_listing"])
+                if row.get("assessed_value_at_listing") is not None else None
+            ),
+            "county": row.get("county_code"),
+            # Server-side only. Picks a city-level ratio where one exists;
+            # never emitted below.
+            "city": row.get("city"),
+        }) if row.get("outcome") in (None, "pending") else None
+
+        if deal_math:
+            # ratio_scope is dropped. Its value is "city", "county" or
+            # "metro", and "city" tells a buyer a city-level calibration
+            # existed for this parcel — a fact about the property's location
+            # that the rest of the payload deliberately withholds. The sample
+            # sizes stay: they are what makes the numbers checkable.
+            deal_math = {
+                k: v for k, v in deal_math.items() if k != "ratio_scope"
+            }
+
         item: dict[str, Any] = {
             # The buyer's ONLY handle. Opaque, and not resolvable to a parcel
             # without database access.
@@ -427,6 +485,12 @@ async def marketplace_listings(
             # absent, never as "no equity" — opposite claims, one of them
             # false.
             "equity": equity,
+            # payoff_floor, est_market_value, the in-window band, seller net,
+            # equity spread, the REO benchmark and the basis line. The basis
+            # carries the sample sizes and "Not an appraisal", and says the
+            # floor is the FORECLOSING DEBT ONLY — a buyer who misses that
+            # underestimates what it takes to clear the property. Show it.
+            "deal_math": deal_math,
         }
         for col in _LISTING_PUBLIC_QUALITATIVE:
             item[col] = row.get(col)
