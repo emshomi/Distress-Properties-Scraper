@@ -401,6 +401,29 @@ async def marketplace_listings(
 
     items: list[dict[str, Any]] = []
     for row in rows:
+        # Computed FIRST: the equity band below is derived from its calibrated
+        # market value, so the two can never disagree on one card.
+        deal_math_raw = _compute_deal_math({
+            "redemption_state": (
+                "expiring_soon"
+                if isinstance(row.get("days_remaining"), int)
+                and row["days_remaining"] <= 90
+                else "in_redemption"
+            ),
+            "amount": (
+                float(row["amount_owed"])
+                if row.get("amount_owed") is not None else None
+            ),
+            "market_value": (
+                float(row["assessed_value_at_listing"])
+                if row.get("assessed_value_at_listing") is not None else None
+            ),
+            "county": row.get("county_code"),
+            # Server-side only. Picks a city-level ratio where one exists;
+            # never emitted.
+            "city": row.get("city"),
+        }) if row.get("outcome") in (None, "pending") else None
+
         # k-anonymity gate. Below the floor NEITHER band is published, because
         # they compound: value alone drives 36.6% of cell uniqueness and
         # equity adds ~10 points on top. Suppressing equity while publishing
@@ -418,10 +441,34 @@ async def marketplace_listings(
 
         if dense_enough:
             value_band = _band_value(row["assessed_value_at_listing"])
-            equity = _band_equity(
-                row["assessed_value_at_listing"],
-                row.get("amount_owed"),
-            )
+            # Banded from the CALIBRATED market value when deal math produced
+            # one, not from the raw assessed value.
+            #
+            # They disagree, and materially. On 2026-08-03 the live Hennepin
+            # listing gave 246,800 - 223,640 = 23,160 (9.4%) from the raw
+            # assessed figure, against 270,246 - 223,640 = 46,606 (17%) once
+            # the 1.095 Crystal ratio from 313 real city sales was applied.
+            # Same property, one card, one of them nearly double the other.
+            #
+            # Deal math's is the better number: it is calibrated against sales
+            # that actually happened, where the raw assessed value assumes the
+            # assessor is right. Publishing both would put two figures for the
+            # same quantity in front of a buyer with nothing to say which to
+            # believe.
+            #
+            # The fallback to the raw value matters less than it looks: no
+            # deal math means no debt figure, and _band_equity returns None
+            # without one anyway.
+            if deal_math_raw:
+                equity = _band_equity(
+                    deal_math_raw.get("est_market_value"),
+                    row.get("amount_owed"),
+                )
+            else:
+                equity = _band_equity(
+                    row["assessed_value_at_listing"],
+                    row.get("amount_owed"),
+                )
         else:
             # Withheld, not missing. The card omits the field entirely rather
             # than showing a placeholder — an owner in a thin cell is exactly
@@ -436,30 +483,11 @@ async def marketplace_listings(
         # buyers seeing the arithmetic means more offers — which is the thing
         # they came for.
         #
-        # Returns None unless the redemption window is OPEN. A resolved window
-        # has no negotiation left, and a tax-delinquency listing with no
-        # sheriff sale has no debt to work from. The client renders absence as
-        # absence — never a zero, which would read as "nothing is owed".
-        deal_math = _compute_deal_math({
-            "redemption_state": (
-                "expiring_soon"
-                if isinstance(row.get("days_remaining"), int)
-                and row["days_remaining"] <= 90
-                else "in_redemption"
-            ),
-            "amount": (
-                float(row["amount_owed"])
-                if row.get("amount_owed") is not None else None
-            ),
-            "market_value": (
-                float(row["assessed_value_at_listing"])
-                if row.get("assessed_value_at_listing") is not None else None
-            ),
-            "county": row.get("county_code"),
-            # Server-side only. Picks a city-level ratio where one exists;
-            # never emitted below.
-            "city": row.get("city"),
-        }) if row.get("outcome") in (None, "pending") else None
+        # None unless the redemption window is OPEN. A resolved window has no
+        # negotiation left, and a tax-delinquency listing with no sheriff sale
+        # has no debt to work from. The client renders absence as absence —
+        # never a zero, which would read as "nothing is owed".
+        deal_math = deal_math_raw
 
         if deal_math:
             # ratio_scope is dropped. Its value is "city", "county" or
