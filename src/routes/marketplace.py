@@ -133,6 +133,77 @@ def _band_value(amount: Any) -> Optional[dict[str, Any]]:
     }
 
 
+# Equity bands, as a SHARE of value. Boundaries are the real quartiles of 723
+# sheriff-sale parcels measured on 2026-08-03, not invented thresholds:
+# p25 = 19%, median = 33%, p75 = 60%. 8.2% of that population is underwater.
+#
+# A SHARE, never the dollar figure and never the percentage. The dollar spread
+# is (value - debt), and a buyer who holds both it and the value band can
+# solve for the debt — which is the AMOUNT DUE column on /data, and therefore
+# a lookup key straight to the address, the owner's name and their mailing
+# address. Govire sells that product to these same subscribers. The band label
+# tells a buyer what they need to judge the deal and reverses into nothing.
+_EQUITY_BANDS: list[tuple[Decimal, str, str]] = [
+    (Decimal("0"), "underwater",
+     "Owed more than the property is worth"),
+    (Decimal("19"), "thin",
+     "Little room between what is owed and what it is worth"),
+    (Decimal("60"), "moderate",
+     "Some room between what is owed and what it is worth"),
+]
+_EQUITY_BEYOND = ("wide", "Substantial room between what is owed and what it is worth")
+
+# k-anonymity floor.
+#
+# County plus a $50k value bucket is ALREADY 36.6% unique by cell across 723
+# sheriff-sale parcels — before equity is published at all. Measured by
+# PARCEL rather than by cell the picture is far better: 81.1% sit in cells of
+# 11 or more, and only 3.6% are genuinely unique. The exposure is a long tail
+# of unusual values in small counties, not a general failure.
+#
+# So the fix is to suppress the tail, not to widen the bands: widening the
+# bucket from $50k to $100k moved uniqueness by 0.1 points, because one $850k
+# property in a small county is unique at any width. Below this floor BOTH the
+# value band and the equity band are withheld and the card simply omits them.
+# Costs 12.7% of listings their value band; protects the 8.3% that sit in
+# cells of three or fewer.
+_MIN_COMPARABLE_PARCELS = 5
+
+
+def _band_equity(value: Any, owed: Any) -> Optional[dict[str, Any]]:
+    """Equity as a band, from a snapshotted value and a live debt.
+
+    Returns None when either side is missing — which is the common case, not
+    an edge case: only ~210 of 726 sheriff-sale parcels carry a usable latest
+    event_value. A caller must render None as ABSENT, never as "no equity".
+    Those are opposite claims and only one of them is true.
+
+    The value is assessed_value_at_listing (what the owner saw at listing
+    time) and the debt is live. Deliberately mismatched vintages: an assessed
+    value is annual, while a foreclosure payoff accrues interest and fees
+    continuously, so a snapshotted debt would be stale within a week. Because
+    debt only grows, the live figure understates equity relative to a
+    same-vintage comparison — which is the safe direction to be wrong in.
+    """
+    if value is None or owed is None:
+        return None
+    try:
+        val = Decimal(str(value))
+        debt = Decimal(str(owed))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+
+    pct = ((val - debt) / val) * Decimal("100")
+
+    for ceiling, band, label in _EQUITY_BANDS:
+        if pct <= ceiling:
+            return {"band": band, "label": label}
+    band, label = _EQUITY_BEYOND
+    return {"band": band, "label": label}
+
+
 def _band_timing(days_remaining: Any) -> Optional[dict[str, Any]]:
     """A timing WINDOW from days_remaining. Never the date, never the count."""
     if days_remaining is None:
@@ -189,7 +260,43 @@ async def marketplace_listings(
     display preference — an owner who excluded investors must not have the
     listing rendered and then filtered client-side.
     """
+    # Two CTEs, both fixed-cost.
+    #
+    # `cells` counts comparable distressed parcels per county + $50k bucket.
+    # It is computed over the WHOLE sheriff-sale population, not over
+    # marketplace.listings — counting listings would return 1 for every cell
+    # while the marketplace is small and suppress everything. The question is
+    # how many comparable properties exist to hide among, and that is a
+    # property of the distress data.
+    #
+    # `debt` uses DISTINCT ON so a parcel carrying several signals yields
+    # exactly ONE row. Structural rather than a LIMIT 1 in a correlated
+    # subquery: a fan-out here would silently duplicate listings in the browse
+    # response. Measured at 20ms total against a LATERAL's 16ms + 1.3ms per
+    # listing, so it is slower for one listing and flat thereafter.
     sql = """
+        WITH cells AS (
+            SELECT p.county_code,
+                   floor(p.estimated_market_value / 50000) AS value_bucket,
+                   count(*) AS n
+              FROM signals.distress_with_parcel s
+              JOIN core.parcels p
+                    ON p.parcel_id   = s.eff_parcel_id
+                   AND p.county_code = s.county_slug
+             WHERE s.event_type = 'sheriff_sale'
+               AND p.estimated_market_value IS NOT NULL
+             GROUP BY 1, 2
+        ),
+        debt AS (
+            SELECT DISTINCT ON (s.eff_parcel_id, s.county_slug)
+                   s.eff_parcel_id,
+                   s.county_slug,
+                   s.event_value
+              FROM signals.distress_with_parcel s
+             WHERE s.event_type = 'sheriff_sale'
+               AND s.event_value IS NOT NULL
+             ORDER BY s.eff_parcel_id, s.county_slug, s.event_date DESC
+        )
         SELECT l.id,
                l.created_at,
                l.assessed_value_at_listing,
@@ -206,6 +313,8 @@ async def marketplace_listings(
                p.county_code,
                r.days_remaining,
                r.outcome,
+               c.n            AS comparable_parcels,
+               d.event_value  AS amount_owed,
                (SELECT COUNT(*) FROM marketplace.offers o
                  WHERE o.listing_id = l.id) AS offer_count
           FROM marketplace.listings l
@@ -214,6 +323,12 @@ async def marketplace_listings(
           LEFT JOIN outcomes.redemption_current r
                  ON r.parcel_id = l.parcel_id
                 AND r.county_code = p.county_code
+          LEFT JOIN cells c
+                 ON c.county_code  = p.county_code
+                AND c.value_bucket = floor(l.assessed_value_at_listing / 50000)
+          LEFT JOIN debt d
+                 ON d.eff_parcel_id = l.parcel_id
+                AND d.county_slug   = p.county_code
          WHERE l.status = 'active'
            -- Owner consent. 'investor' is in the default array; an owner who
            -- narrowed it to {retail} is excluded here.
@@ -244,6 +359,34 @@ async def marketplace_listings(
 
     items: list[dict[str, Any]] = []
     for row in rows:
+        # k-anonymity gate. Below the floor NEITHER band is published, because
+        # they compound: value alone drives 36.6% of cell uniqueness and
+        # equity adds ~10 points on top. Suppressing equity while publishing
+        # the value band that causes most of the exposure would protect the
+        # wrong field.
+        #
+        # A NULL count means the listing has no assessed value, so there was
+        # no cell to join to and nothing to suppress — _band_value returns
+        # None for it anyway.
+        comparable = row.get("comparable_parcels")
+        dense_enough = (
+            comparable is not None
+            and int(comparable) >= _MIN_COMPARABLE_PARCELS
+        )
+
+        if dense_enough:
+            value_band = _band_value(row["assessed_value_at_listing"])
+            equity = _band_equity(
+                row["assessed_value_at_listing"],
+                row.get("amount_owed"),
+            )
+        else:
+            # Withheld, not missing. The card omits the field entirely rather
+            # than showing a placeholder — an owner in a thin cell is exactly
+            # the one a placeholder would draw attention to.
+            value_band = None
+            equity = None
+
         item: dict[str, Any] = {
             # The buyer's ONLY handle. Opaque, and not resolvable to a parcel
             # without database access.
@@ -251,8 +394,13 @@ async def marketplace_listings(
             "county": row["county_code"],
             "listed_at": row["created_at"],
             "offer_count": int(row["offer_count"] or 0),
-            "value_band": _band_value(row["assessed_value_at_listing"]),
+            "value_band": value_band,
             "timing": _band_timing(row["days_remaining"]),
+            # None on ~70% of sheriff-sale parcels, which have a value but no
+            # usable latest event_value. The client MUST render None as
+            # absent, never as "no equity" — opposite claims, one of them
+            # false.
+            "equity": equity,
         }
         for col in _LISTING_PUBLIC_QUALITATIVE:
             item[col] = row.get(col)
