@@ -239,8 +239,33 @@ _LISTING_PUBLIC_QUALITATIVE = (
     "leaseback_interest",
     "buyback_interest",
     "viewing_access",
-    "ownership_verified",
 )
+
+# ownership_verified is NOT here. Removed 2026-08-03.
+#
+# It was being sent to buyers, and on 2026-08-03 the single listing carrying
+# the value "verified" had ownership_check_basis = 'no_name_given'. The owner
+# submitted no name, so no name could be compared against the county record,
+# so nothing was verified. The word was published anyway.
+#
+# This is the third appearance of the same defect: the "verified buyers" claim
+# was cut from connect_auth.py on 2026-08-02 and from ConnectPage.tsx on
+# 2026-08-03, both times because "verified" asserted a check Govire does not
+# perform. Here it was worse, because it was a per-listing claim rather than
+# marketing copy — a buyer reads it as "Govire confirmed this person owns the
+# house", and acts on it.
+#
+# Do not re-add it as a display field. Two things have to be true first: the
+# writer must stop stamping 'verified' when there is nothing to check, and the
+# label shown to a buyer must state WHAT was compared. "The name the owner
+# gave matches the county's record" is a fact. "Verified" is a conclusion the
+# reader draws, and they draw a bigger one than the check supports.
+#
+# It also cannot mean the same thing in every county. Dakota and Washington
+# publish no owner records, so no listing there can ever be matched — absence
+# of verification there says nothing about the owner, and a buyer comparing a
+# "verified" Hennepin listing against an unmarked Dakota one would read a
+# difference that does not exist.
 
 
 @router.get(
@@ -309,7 +334,8 @@ async def marketplace_listings(
                l.leaseback_interest,
                l.buyback_interest,
                l.viewing_access,
-               l.ownership_verified,
+               -- ownership_verified is deliberately NOT selected. See the
+               -- note above _LISTING_PUBLIC_QUALITATIVE.
                p.county_code,
                r.days_remaining,
                r.outcome,
