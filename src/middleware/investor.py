@@ -136,12 +136,19 @@ async def resolve_investor(
         # A real, signed-in person who simply has not subscribed. 403, not
         # 401 — re-authenticating would not help them and being sent back to
         # a login screen they already passed is its own kind of dead end.
+        #
+        # The message must be true for EVERY endpoint using this dependency,
+        # not just the offer route. It said "Making an offer requires a
+        # subscription" until 2026-08-03, which is what a free subscriber saw
+        # when they tried to BROWSE — naming an action they had not attempted,
+        # on the first screen a prospective customer reaches.
         logger.info("investor auth: tier not permitted", tier=tier)
         raise HTTPException(
             status_code=http_status.HTTP_403_FORBIDDEN,
             detail={"message": (
-                "Making an offer requires a subscription. Any paid plan "
-                "includes it."
+                "The marketplace is included with any paid plan. Owners here "
+                "have asked for offers directly, and browsing and offering "
+                "both need a subscription."
             )},
         )
 
