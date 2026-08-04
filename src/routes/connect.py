@@ -1064,13 +1064,36 @@ async def connect_raise_hand(
         # No name supplied. This happens on EDIT — an owner correcting their
         # occupancy has no reason to retype their name.
         #
-        # ownership_verified is left OUT of the payload entirely below, so
-        # create_listing preserves whatever verdict was already there. An
-        # earlier version sent 'unverified' here, silently destroying a
-        # verification the owner had already earned and, in the other
-        # direction, offering a way to launder a mismatch by resubmitting
-        # blank.
-        check_basis = "no_name_given"
+        # NOTHING is written. All four evidence columns are left out of the
+        # payload, so they continue to describe, as a set, the one submission
+        # where a comparison actually happened.
+        #
+        # ownership_verified is preserved rather than downgraded. An earlier
+        # version sent 'unverified' here, silently destroying a verification
+        # the owner had already earned and, in the other direction, offering a
+        # way to launder a mismatch by resubmitting blank. Preservation is
+        # symmetric — 'manual_review' is equally sticky — so nothing can be
+        # laundered. DO NOT REVERSE THIS.
+        #
+        # WHY NO BASIS EITHER (2026-08-04). This branch used to set
+        # check_basis = 'no_name_given'. That column is overwritten on every
+        # submission while the verdict is sticky, so the pair desynchronised:
+        # listing 76c17739 carried a 'verified' verdict from 07-31 beside a
+        # 'no_name_given' basis from 08-02, and was read three times over
+        # three days as a writer stamping 'verified' without a check. No
+        # writer ever did. Worse, `ownership_checked_at` below is guarded on
+        # `if check_basis`, and 'no_name_given' is truthy — so the row
+        # asserted a check had run at a moment when nothing was compared.
+        #
+        # 'no_name_given' was never evidence about ownership in any case. It
+        # is a fact about a form submission, and filing it in the evidence
+        # block is what broke the set.
+        #
+        # The cost is one lost distinction: a first-ever submission with no
+        # name now leaves all four NULL, indistinguishable from the
+        # lookup-failure path below. That is recoverable from the logs, and a
+        # column that lies is worse than one that is silent.
+        pass
     else:
         try:
             ow = (
