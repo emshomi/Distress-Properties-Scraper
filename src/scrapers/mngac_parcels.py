@@ -983,7 +983,21 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 context={"scraper_name": self.source_name},
             )
 
-        async with self._class_lock:
+        # `with`, not `async with`. FIXED 2026-08-05.
+        #
+        # _class_lock became a threading.Lock on 2026-08-02 (runs dispatched
+        # to worker threads; an asyncio.Lock guards nothing across threads —
+        # see base_scraper.py). BaseScraper.run() was updated to a plain
+        # `with` in that change. This method OVERRIDES run(), and its copy was
+        # missed, leaving:
+        #     TypeError: '_thread.lock' object does not support the
+        #     asynchronous context manager protocol
+        #
+        # That broke EVERY MNGAC subclass, not just this file's newer
+        # config-driven path — it went unnoticed for three days only because
+        # Wabasha is quarterly (next due October) and no MNGAC job happened to
+        # fire in between. Surfaced on the first Stearns run, 2026-08-05.
+        with self._class_lock:
             return await self._run_streaming(trigger, metadata, start_time)
 
     async def _run_streaming(
