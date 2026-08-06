@@ -769,14 +769,35 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         # Acreage: acres_poly is the populated figure in this layer (100%
         # in Wabasha); acres_deed is a 0.0 sentinel. This INVERTS the
         # fillmore_parcels rule — verified per county, never assumed.
+        #
         # SANITY CAP (fillmore run #1 lesson): a garbage acreage overflowed
         # int4 (2.6e12 sqft) and killed its whole 500-row batch. No MN
-        # county exceeds ~2M acres; anything over 100,000 acres on a single
-        # parcel is source garbage -> honest None (raw stays in raw_data).
+        # county exceeds ~2M acres.
+        #
+        # CAP LOWERED 100,000 -> 49,000 ACRES, 2026-08-05 (Stearns run #1).
+        # 100,000 acres = 4.36e9 sqft, but core.parcels.lot_sqft is int4 and
+        # tops out at 2,147,483,647 = 49,299 ACRES. The cap sat at more than
+        # twice the column's real ceiling, leaving a 50,701-acre window where
+        # a bad row passes the filter and then overflows the column — killing
+        # its entire 500-row batch. Cost two batches (1,000 rows) on the
+        # first Stearns run.
+        #
+        # These are NOT large legitimate parcels. Verified live against the
+        # layer: all three Stearns rows over 40,000 acres_deed have
+        # acres_poly NULL, owner_name NULL, ctu_name NULL and useclass1
+        # '3a Commercial Land And Building' — 49,355 and 49,440 acres (5.5%
+        # of the county each) and one at 180,998 acres, larger than Stearns
+        # County's entire 889,600. Source garbage.
+        #
+        # For scale: the largest lot_sqft across all 1.2M rows already loaded
+        # is 10,256 acres. 49,000 leaves nearly five times that headroom and
+        # still sits safely under int4. Widening the column to bigint was
+        # considered and REJECTED — a 5.6 GB table rewrite to preserve
+        # garbage, and it would have hidden this defect rather than fixing it.
         acres = _safe_float(attributes.get("acres_poly"))
         if not acres or acres <= 0:
             acres = _safe_float(attributes.get("acres_deed"))
-        if acres and 0 < acres <= 100000:
+        if acres and 0 < acres <= 49000:
             lot_sqft = int(acres * 43560)
         else:
             lot_sqft = None
