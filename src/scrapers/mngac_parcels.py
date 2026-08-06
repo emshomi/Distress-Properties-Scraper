@@ -468,6 +468,7 @@ def _compose_owner_name(attrs: dict[str, Any]) -> str | None:
 
 def _build_owner_row(
     parcel_id: str,
+    county_code: str,
     attrs: dict[str, Any],
     site_address: str | None,
     source_name: str,
@@ -523,6 +524,11 @@ def _build_owner_row(
     )
     return {
         "parcel_id": parcel_id,
+        # REQUIRED since 2026-08-06: core.owners FKs to the composite
+        # (county_code, parcel_id) and its dedup index keys on it too.
+        # Without this every owner row violates the FK and the whole batch
+        # is rejected.
+        "county_code": county_code,
         "owner_name": owner_name,
         "owner_type": _classify_owner(owner_name),
         "mailing_address": mailing_address,
@@ -940,6 +946,7 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
             owner_row = _build_owner_row(
                 sig["parcel_id"],
+                self.county_code,
                 sig.get("raw_data") or {},
                 sig.get("address"),
                 self.source_name,
@@ -982,7 +989,16 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         try:
             result = (
                 core_table("parcels")
-                .upsert(batch, on_conflict="parcel_id")
+                # (county_code, parcel_id) — the PK became composite on
+                # 2026-08-06. A conflict target of parcel_id alone no longer
+                # matches any unique constraint, and BEFORE the key change it
+                # was actively destructive: Minnesota PINs are not globally
+                # unique (14 counties share 9-char PINs), so an upsert keyed
+                # on parcel_id alone OVERWROTE the other county's row and
+                # reassigned its county_code. Silently: no error, no log,
+                # ~191,600 rows lost across the statewide load, including 56%
+                # of Fillmore and 47% of Wabasha.
+                .upsert(batch, on_conflict="county_code,parcel_id")
                 .execute()
             )
             written = len(result.data) if result.data else len(batch)
@@ -1005,7 +1021,11 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         try:
             (
                 core_table("owners")
-                .upsert(batch, on_conflict="parcel_id,source")
+                # county_code added 2026-08-06 to match the rebuilt
+                # owners_parcel_source_key index. Without it two counties'
+                # owner rows for the same PIN collapse into one — the same
+                # failure that destroyed ~191,600 parcels, one level down.
+                .upsert(batch, on_conflict="county_code,parcel_id,source")
                 .execute()
             )
         except Exception as e:
