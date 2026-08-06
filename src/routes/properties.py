@@ -1007,7 +1007,11 @@ def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
 
     overlay_map: dict[tuple[str, str], dict[str, Any]] = {}
     for r in rows:
-        county = (r.get("county") or "").lower()
+        # Fold through the SAME rule the lookup side uses (see _eff_key in
+        # _shape_property_row). The view already emits a core.counties slug,
+        # so this is a no-op today — it exists so the two sides cannot drift
+        # if the view's county expression is ever changed.
+        county = _county_slug(r.get("county")) or ""
         pid = r.get("parcel_id")
         if not pid:
             continue
@@ -2069,13 +2073,21 @@ def _shape_property_row(
         **redemption,
     }
 
-    # Compute the effective parcel key (county_lower, real_parcel_id) — the
+    # Compute the effective parcel key (county_slug, real_parcel_id) — the
     # SAME key the overlay groups on. Stashed under a private field so the
     # multi_signal path can de-duplicate to one row per parcel (a parcel can
     # have many event rows — e.g. 9 condemned-building notices). Stripped
     # before the response is returned.
+    #
+    # CHANGED 2026-08-05: was (_resolve_county(...) or "").lower(), which
+    # lowercases the DISPLAY name — 'St. Louis' -> 'st. louis', 'Otter Tail'
+    # -> 'otter tail'. Identical to the slug for every single-word county,
+    # which is why it went unnoticed; wrong for every multi-word one. The
+    # overlay view keys on the core.counties slug, so the two sides must fold
+    # through the SAME rule. This matters now because the MnGeo statewide
+    # spine adds 53 counties, several of them multi-word.
     _eff_pid = _effective_parcel_id(source, raw, row)
-    _county_lower = (_resolve_county(source, raw) or "").lower()
+    _county_lower = _county_slug(_resolve_county(source, raw)) or ""
     shaped["_eff_key"] = (_county_lower, _eff_pid) if _eff_pid else None
 
     # Deal math: only meaningful while the redemption window is open, and
