@@ -766,6 +766,34 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         emv_land = _safe_decimal(attributes.get("emv_land"))
         emv_building = _safe_decimal(attributes.get("emv_bldg"))
 
+        # DERIVE emv_total FROM COMPONENTS when the county leaves the total
+        # field empty. ADDED 2026-08-05 (Koochiching).
+        #
+        # Not every county fills every field of its MnGeo submission.
+        # Koochiching publishes emv_land on essentially every parcel but
+        # NEVER populates emv_total, so it loaded with 54,709 parcels and
+        # 0.0% EMV — the one figure /connect/lookup exists to show. An owner
+        # in foreclosure would find their property and see a blank where the
+        # equity number belongs, which reads as "worthless" rather than
+        # "unknown".
+        #
+        # Measured across all eight counties loaded so far: Koochiching
+        # 54,627 of 54,709 recoverable (99.9%), every other county 0.0%. So
+        # this rescues an entire county and is a no-op everywhere else.
+        #
+        # Safe because emv_bldg 0 is a REAL zero here, not a missing value —
+        # the layer's bare-land parcels carry emv_bldg 0 with a populated
+        # emv_land, verified live on Koochiching (land 7000/6900/500/31900,
+        # bldg 0). Requires emv_land > 0 so a wholly-unvalued parcel stays
+        # an honest None rather than becoming a fabricated $0.
+        #
+        # Does NOT help Otter Tail: that county submits emv_total, emv_land,
+        # emv_bldg AND total_tax all null. Nothing to derive from. It stays
+        # spine-only (address + coords) unless a county-direct loader is
+        # built.
+        if emv_total is None and emv_land is not None and emv_land > 0:
+            emv_total = emv_land + (emv_building or 0)
+
         # Acreage: acres_poly is the populated figure in this layer (100%
         # in Wabasha); acres_deed is a 0.0 sentinel. This INVERTS the
         # fillmore_parcels rule — verified per county, never assumed.
