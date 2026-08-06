@@ -197,6 +197,25 @@ class Settings(BaseSettings):
     scraper_hennepin_tax_roll_enabled: bool = Field(default=True)
     scraper_olmsted_delq_list_enabled: bool = Field(default=True)
 
+    # ADDED 2026-08-05 — MnGeo statewide parcel spine.
+    #
+    # ONE field for FIFTY-ONE counties, deliberately. The config-driven
+    # loader keeps a per-county source_name ('stearns_parcels') because
+    # core.parcels.data_sources and core.owners.source must stay per-county
+    # or provenance collapses — but it gates on this single umbrella key via
+    # its enable_key attribute. Adding a field per county would re-create the
+    # exact per-county artefact multiplication core.mngeo_county_load was
+    # built to remove, and 51 more chances at the hennepin_tax_roll failure
+    # documented in scraper_enabled() below.
+    #
+    # Per-county control lives in core.mngeo_county_load.enabled, so turning
+    # a county on is an UPDATE, not a redeploy. This field is the master kill
+    # switch for all of them.
+    #
+    # Defaults FALSE: 51 counties / 1,562,648 parcels should not start moving
+    # because a deploy happened. Set it true deliberately when loading.
+    scraper_mngeo_parcels_enabled: bool = Field(default=False)
+
     # ----- Scraper behavior -----
 
     scraper_request_timeout_seconds: int = Field(
