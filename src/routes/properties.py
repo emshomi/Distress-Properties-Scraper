@@ -18,6 +18,7 @@ Routes:
 
 from __future__ import annotations
 
+import re as _re
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status as http_status
@@ -130,22 +131,70 @@ _SLUG_TO_COUNTY_NAME: dict[str, str] = {
 }
 
 # Sources whose county is NOT one-to-one with the source name (statewide
-# feeds). For these we resolve county per-row from raw_data.detail.county
-# (a lowercase slug), mapped back to the display name. Everything else uses
-# the fixed _SOURCE_TO_COUNTY map.
-_PER_ROW_COUNTY_SOURCES = {"startribune_legal"}
+# feeds). For these we resolve county per-row from raw_data.detail.county,
+# mapped back to the display name. Everything else uses the fixed
+# _SOURCE_TO_COUNTY map.
+#
+# ADDED 2026-08-05: mnpublicnotice. It was absent from this set AND from
+# _SOURCE_TO_COUNTY, so _resolve_county returned None for every one of its
+# 240 rows (em-dash county). Cause: derive_source() in
+# src/llm/foreclosure_promotion.py was fixed 2026-08-02 to stop hardcoding
+# "startribune_legal"; 237 rows were relabelled to their true feed. Every
+# gate in this file keyed on the OLD label, so correcting attribution
+# silently moved those rows out of all of them. See also
+# _FORECLOSURE_SOURCES.
+_PER_ROW_COUNTY_SOURCES = {"startribune_legal", "mnpublicnotice"}
+
+
+# raw_data.detail.county is NOT a slug — despite what this module previously
+# claimed. foreclosure_promotion.py writes it with _county_lower(): the bare
+# county name, lowercased, nothing else. So it arrives as 'st. louis',
+# 'saint louis', 'le sueur' — and on 5 rows promoted before the 2026-07-28
+# _county_bare fix, as 'washington county' / 'ramsey county' / 'polk county'
+# (that fix was forward-only; historical raw_data was never repaired).
+#
+# These MUST be folded to the seeded core.counties slug before lookup. The
+# rule below mirrors _county_slug() in src/llm/foreclosure_promotion.py
+# exactly — strip trailing County/Counties, lowercase, collapse
+# non-alphanumerics to single underscores, then alias saint_louis ->
+# st_louis. Any divergence between the two re-creates the duplicate-key bug
+# that fix was written to kill.
+_COUNTY_SUFFIX_RE = _re.compile(r"\s*\bcount(?:y|ies)\b\s*$", _re.IGNORECASE)
+_COUNTY_SLUG_ALIASES = {
+    "saint_louis": "st_louis",
+    "st_louis": "st_louis",
+}
+
+
+def _county_slug(county: Optional[str]) -> Optional[str]:
+    """Fold a county name into the core.counties county_code slug.
+
+    'St. Louis' -> 'st_louis', 'Saint Louis' -> 'st_louis',
+    'Washington County' -> 'washington', 'Otter Tail' -> 'otter_tail'.
+    Returns None when nothing usable is left."""
+    if not county:
+        return None
+    bare = _COUNTY_SUFFIX_RE.sub("", str(county)).strip()
+    if not bare:
+        return None
+    s = _re.sub(r"[^a-z0-9]+", "_", bare.lower())
+    s = _re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        return None
+    return _COUNTY_SLUG_ALIASES.get(s, s)
 
 
 def _resolve_county(source: str, raw: dict) -> Optional[str]:
     """County display name for a row.
 
     Statewide/extracted sources carry their own county in
-    raw_data.detail.county (slug, e.g. 'scott'); we map that back to a display
+    raw_data.detail.county (a bare lowercase NAME, not a slug — see
+    _county_slug above); we fold it to a slug and map that back to a display
     name. All other sources use the fixed source->county map. Returns None
     when no county is resolvable (honest em-dash)."""
     if source in _PER_ROW_COUNTY_SOURCES:
         detail = raw.get("detail") or {}
-        slug = (detail.get("county") or "").strip().lower()
+        slug = _county_slug(detail.get("county"))
         if not slug:
             return None
         return _SLUG_TO_COUNTY_NAME.get(slug, slug.replace("_", " ").title())
@@ -1726,6 +1775,20 @@ _REDEMPTION_DEFAULT_DAYS = 182  # ~6 months, MN statutory default
 _REDEMPTION_EXPIRING_SOON_DAYS = 90
 
 # Sources that are sheriff foreclosure sales (carry a redemption window).
+#
+# ADDED 2026-08-05: mnpublicnotice. Membership here does two things — it
+# routes _effective_parcel_id to raw_data.detail.gis_pid, and (via
+# _REDEMPTION_SOURCES) it lets _redemption_fields compute a window instead of
+# returning all-null.
+#
+# Both were broken for all 240 mnpublicnotice rows. Measured 2026-08-05:
+# 235 of 238 have a real redemption_period_months in signals.sheriff_sales
+# and all 238 have a valid county_code — the data was correct the whole time
+# and this file was discarding it, so no owner was shown their redemption
+# deadline. The rows are promoted by the same builder as startribune_legal
+# (foreclosure_promotion.build_promotion_rows), so they carry the identical
+# synthetic-PID + detail.gis_pid shape and belong in this set on the same
+# grounds. Cause of the omission: see _PER_ROW_COUNTY_SOURCES.
 _FORECLOSURE_SOURCES = {
     "anoka_sheriff",
     "dakota_sheriff",
@@ -1735,6 +1798,7 @@ _FORECLOSURE_SOURCES = {
     "scott_sheriff",
     "carver_sheriff",
     "startribune_legal",
+    "mnpublicnotice",
 }
 
 # Sources that carry a redemption window in _redemption_fields. This is
