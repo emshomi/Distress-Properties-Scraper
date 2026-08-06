@@ -109,6 +109,7 @@ What it does NOT write:
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -533,6 +534,80 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     max_pages: ClassVar[int] = 100
     progress_log_every: ClassVar[int] = 5000
 
+    # Config key consulted by settings.scraper_enabled(). Empty = fall back to
+    # source_name, which is what all six hand-written subclasses do — they are
+    # unaffected by this attribute existing.
+    #
+    # The config-table instances set it to 'mngeo_parcels' so FIFTY-ONE
+    # counties share ONE toggle. source_name stays per-county because
+    # core.parcels.data_sources and core.owners.source key on it and owner
+    # provenance would collapse into a single statewide blob otherwise.
+    # Per-county control lives in core.mngeo_county_load.enabled — an UPDATE,
+    # not a redeploy.
+    enable_key: ClassVar[str] = ""
+
+    def __init__(
+        self,
+        *,
+        co_code: str | None = None,
+        county_code: str | None = None,
+        source_name: str | None = None,
+        max_pages: int | None = None,
+        enable_key: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Optionally configure this instance at RUNTIME instead of by subclass.
+
+        ADDED 2026-08-05 for the statewide load. Called with no arguments —
+        which is how every existing subclass and runner constructs one — this
+        is a pass-through and behaviour is byte-identical. The six subclasses
+        set ClassVars and never pass these, so they are untouched.
+
+        When arguments ARE passed, they are set as INSTANCE attributes, which
+        shadow the ClassVars on every `self.` lookup in this file. That is why
+        __init_subclass__ below did not need to change: where_clause is simply
+        re-derived here from the same co_code, by the same rule, so the two
+        paths cannot drift.
+
+        Subclassing per county was right when counties arrived one at a time.
+        At 51 it inverts: five artefacts each (subclass, config flag,
+        core.counties row, runner, workflow), 51 cron schedules to offset and
+        51 audit.source_health rows. This is the same move already made twice
+        for the same reason — source_county_map replaced a hardcoded CASE,
+        ecrv_county_map replaced a hardcoded county list.
+        """
+        super().__init__(**kwargs)
+        if co_code:
+            self.co_code = co_code
+            # SAME derivation as __init_subclass__. Filtering on co_code and
+            # never co_name is deliberate: co_name is Title Case in this layer
+            # and casing drift across compiles would silently return 0 rows.
+            self.where_clause = f"co_code = '{co_code}'"
+        if county_code:
+            self.county_code = county_code
+        if source_name:
+            self.source_name = source_name
+        if max_pages is not None:
+            self.max_pages = max_pages
+        if enable_key is not None:
+            self.enable_key = enable_key
+
+    @classmethod
+    def from_config_row(cls, row: dict[str, Any]) -> "MNGACParcelsScraper":
+        """Build a loader for one core.mngeo_county_load row.
+
+        The row's max_pages is a SEED. _run_streaming re-derives it from a
+        live returnCountOnly before paging, so a county that grows past its
+        seeded figure cannot silently truncate.
+        """
+        return cls(
+            co_code=str(row["co_code"]),
+            county_code=str(row["county_code"]),
+            source_name=str(row["source_name"]),
+            max_pages=row.get("max_pages"),
+            enable_key="mngeo_parcels",
+        )
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Derive the county filter from co_code so the two can never drift.
 
@@ -595,6 +670,48 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 error=str(e)[:200],
             )
         return info
+
+    async def _fetch_live_count(
+        self, client: httpx.AsyncClient
+    ) -> int | None:
+        """This county's CURRENT row count, for deriving max_pages.
+
+        ADDED 2026-08-05. max_pages defaults to 100 (= 100,000 rows) and every
+        hand-written subclass overrides it by hand — Wabasha 40, Anoka 200.
+        That does not survive 51 counties: St. Louis is 186,455 rows and needs
+        290 pages. A run capped at 100 would stop at 100,000 and report
+        SUCCESS, which is the silent-failure class the runbook names as the
+        dangerous one — no error, no short-page signal, just a county that is
+        quietly 46% loaded.
+
+        Deriving from a live count rather than the seeded core.mngeo_county_load
+        figure means a county that grows between compiles self-corrects. The
+        stored figure is a seed and a sanity check, never the cap.
+
+        Advisory: on failure this returns None and the caller keeps the
+        configured max_pages. Never blocks the run.
+        """
+        try:
+            response = await client.get(
+                f"{self.feature_service_url}/query",
+                params={
+                    "where": self.where_clause,
+                    "returnCountOnly": "true",
+                    "f": "json",
+                },
+            )
+            data = response.json()
+            count = data.get("count")
+            if isinstance(count, int) and count >= 0:
+                return count
+        except Exception as e:
+            logger.warning(
+                "MNGAC live count preflight failed (using configured "
+                "max_pages)",
+                scraper=self.source_name,
+                error=str(e)[:200],
+            )
+        return None
 
     # ---- parse_feature: one ArcGIS feature -> parcel dict ----
 
@@ -839,10 +956,16 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         """
         start_time = time.monotonic()
 
-        if not settings.scraper_enabled(self.source_name):
+        # enable_key, not source_name: the config-table instances all gate on
+        # a single 'mngeo_parcels' toggle while keeping a per-county
+        # source_name for provenance. Empty enable_key => source_name, which
+        # is exactly what the six hand-written subclasses do today.
+        enable_name = self.enable_key or self.source_name
+
+        if not settings.scraper_enabled(enable_name):
             if trigger == "manual":
                 raise ScraperDisabledError(
-                    f"Scraper '{self.source_name}' is disabled in settings",
+                    f"Scraper '{enable_name}' is disabled in settings",
                     source=self.source_name,
                 )
             return RunResult(
@@ -906,6 +1029,24 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 headers={"User-Agent": "DistressProperties/1.0"},
             ) as client:
                 await self._fetch_freshness(client)
+
+                # Derive the page cap from a LIVE count, not the configured
+                # figure. See _fetch_live_count: a 100-page default against
+                # St. Louis's 186,455 rows stops at 100,000 and reports
+                # success. 1.5x headroom + 10 absorbs growth and short pages.
+                live_count = await self._fetch_live_count(client)
+                if live_count:
+                    derived = math.ceil(live_count / page_size * 1.5) + 10
+                    if derived > max_pages:
+                        logger.info(
+                            "MNGAC max_pages raised from live count",
+                            scraper=self.source_name,
+                            live_count=live_count,
+                            configured_max_pages=max_pages,
+                            derived_max_pages=derived,
+                        )
+                        max_pages = derived
+                    run_metadata["live_count"] = live_count
 
                 for page in range(max_pages):
                     if record_cap is not None and total_fetched >= record_cap:
