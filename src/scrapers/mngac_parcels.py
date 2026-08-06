@@ -155,6 +155,32 @@ _ZERO_IS_NULL_INT = (
 # String placeholders that mean ABSENT.
 _PLACEHOLDER_STRINGS = {"N/A", "NO VALUE", "NONE", "UNKNOWN"}
 
+
+def _plausible_year(value: int | None) -> int | None:
+    """Drop a year_built outside 1700..(this year + 2) to an honest None.
+
+    ADDED 2026-08-05 (Sherburne). ParcelUpsert enforces year_built >= 1700,
+    which is a correct model constraint — but a violation raises during
+    validation and the ENTIRE parcel is discarded. Sherburne published 205 on
+    parcel 35004910015 and the row was lost: valid address, valid EMV, valid
+    coordinates, all thrown away over a typo in a field that is 0% populated
+    in every county loaded so far.
+
+    Same principle as the acreage cap: the MODEL should not be the thing
+    catching source garbage when the cost is the whole record. Coerce here,
+    keep the parcel, and leave the raw value in raw_data for anyone who wants
+    to audit it.
+
+    Upper bound allows new construction assessed slightly ahead of the
+    calendar year; anything beyond that is a data-entry error, not a
+    building.
+    """
+    if value is None:
+        return None
+    if 1700 <= value <= datetime.now(timezone.utc).year + 2:
+        return value
+    return None
+
 # Date fields worth surfacing in raw_data as readable ISO alongside the
 # raw epoch-millis the service returns.
 _RAW_DATE_FIELDS = ("sale_date", "agpre_enrd", "agpre_expd", "edit_date", "exp_date")
@@ -843,7 +869,9 @@ class MNGACParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "lat": lat,
             "lng": lng,
             # Sentinel coercion: 0 means ABSENT in this layer.
-            "year_built": _nonzero_int(attributes.get("year_built")),
+            "year_built": _plausible_year(
+                _nonzero_int(attributes.get("year_built"))
+            ),
             "property_type": property_type,
             "estimated_market_value": emv_total,
             "emv_total": emv_total,
