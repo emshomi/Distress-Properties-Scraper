@@ -290,12 +290,35 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             row = sig.model_dump(mode="json", exclude_none=True)
             for k in _IN_MEMORY_ONLY:
                 row.pop(k, None)
+            # county_code is set EXPLICITLY, not inherited from the model.
+            # `county_code` on this class is a ClassVar, so it is not a
+            # pydantic field and never appears in model_dump — every row
+            # reached PostgREST without it. That was survivable while the
+            # dedup index was (parcel_id, date_entered_registry); it is not
+            # survivable now that county_code is the FIRST column of
+            # vacant_registrations_dedup. The index is NULLS NOT DISTINCT,
+            # so a NULL-county row dedups against other NULL-county rows and
+            # looks healthy, while never matching the correctly-labelled row
+            # for the same property. That is precisely how 1,451 duplicate
+            # distress_events accumulated in 24 hours on 2026-08-07.
+            row["county_code"] = self.county_code
             signal_rows.append(row)
 
+        # Conflict target must match signals.vacant_registrations_dedup, rebuilt
+        # in Phase 5 of the composite-key migration as
+        #   (county_code, parcel_id, date_entered_registry) NULLS NOT DISTINCT
+        # because Minnesota county PINs are not globally unique (51,662 nine-char
+        # PINs are shared across counties). Columns are listed in index order.
+        # write_typed_signals_dedup passes ignore_duplicates=False, so this is a
+        # real upsert-update: a target matching no unique index raises 42P10 and
+        # PostgREST rejects the ENTIRE batch. event_writer catches that into a
+        # logger.warning and the run still reports counts, so the scraper looks
+        # like it completed. Never change this without re-reading the index from
+        # pg_catalog.
         new_typed, failed_typed = write_typed_signals_dedup(
             "vacant_registrations",
             signal_rows,
-            on_conflict="parcel_id,date_entered_registry",
+            on_conflict="county_code,parcel_id,date_entered_registry",
         )
 
         # --- Step 3: Write unified distress_events ---
