@@ -230,6 +230,7 @@ def _norm_street(value: str | None) -> str | None:
 
 def _build_owner_row(
     parcel_id: str,
+    county_code: str,
     attrs: dict[str, Any],
     site_address: str | None,
     now_iso: str,
@@ -265,6 +266,9 @@ def _build_owner_row(
     )
     return {
         "parcel_id": parcel_id,
+        # REQUIRED since 2026-08-06: core.owners FKs to the composite
+        # (county_code, parcel_id) and owners_parcel_source_key keys on it.
+        "county_code": county_code,
         "owner_name": owner_name,
         "owner_type": _classify_owner(owner_name),
         "mailing_address": mailing_address,
@@ -398,6 +402,7 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             # Owner projection: rides alongside, never blocks parcels.
             owner_row = _build_owner_row(
                 sig["parcel_id"],
+                self.county_code,
                 sig.get("raw_data") or {},
                 sig.get("address"),
                 now_iso,
@@ -429,7 +434,10 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         try:
             result = (
                 core_table("parcels")
-                .upsert(batch, on_conflict="parcel_id")
+                # (county_code, parcel_id) — PK became composite 2026-08-06.
+                # 51,662 nine-char PINs are shared across MN counties; a
+                # parcel_id-only target silently overwrote other counties.
+                .upsert(batch, on_conflict="county_code,parcel_id")
                 .execute()
             )
             written = len(result.data) if result.data else len(batch)
@@ -452,7 +460,7 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         try:
             (
                 core_table("owners")
-                .upsert(batch, on_conflict="parcel_id,source")
+                .upsert(batch, on_conflict="county_code,parcel_id,source")
                 .execute()
             )
         except Exception as e:
@@ -503,7 +511,10 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 context={"scraper_name": self.source_name},
             )
 
-        async with self._class_lock:
+        # `with`, not `async with`. FIXED 2026-08-06. _class_lock became a
+        # threading.Lock on 2026-08-02; BaseScraper.run() was updated but
+        # every scraper OVERRIDING run() was missed.
+        with self._class_lock:
             return await self._run_streaming(trigger, metadata, start_time)
 
     async def _run_streaming(
