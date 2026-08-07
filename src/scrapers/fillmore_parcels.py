@@ -263,7 +263,7 @@ def _compose_owner_mailing(attrs: dict[str, Any]) -> str | None:
 
 
 def _build_owner_row(
-    parcel_id: str, attrs: dict[str, Any], now_iso: str
+    parcel_id: str, county_code: str, attrs: dict[str, Any], now_iso: str
 ) -> dict[str, Any] | None:
     """Project one Fillmore feature's owner fields into a core.owners row.
     Returns None when the feature carries no owner (honest absence)."""
@@ -285,6 +285,10 @@ def _build_owner_row(
     )
     return {
         "parcel_id": parcel_id,
+        # REQUIRED since 2026-08-06: core.owners FKs to the composite
+        # (county_code, parcel_id) and owners_parcel_source_key keys on it.
+        # Without this every owner row violates the FK.
+        "county_code": county_code,
         "owner_name": owner_name,
         "owner_type": _classify_owner(owner_name),
         "mailing_address": mailing_address,
@@ -455,7 +459,8 @@ class FillmoreParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             batch.append(row)
 
             owner_row = _build_owner_row(
-                sig["parcel_id"], sig.get("raw_data") or {}, now_iso
+                sig["parcel_id"], self.county_code,
+                sig.get("raw_data") or {}, now_iso
             )
             if owner_row is not None:
                 owner_batch.append(owner_row)
@@ -494,7 +499,14 @@ class FillmoreParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         try:
             result = (
                 core_table("parcels")
-                .upsert(batch, on_conflict="parcel_id")
+                # (county_code, parcel_id) — core.parcels PK became composite
+                # on 2026-08-06. Minnesota PINs are NOT globally unique (14
+                # counties share 9-char PINs; 51,662 nine-char PINs are shared
+                # across counties). A conflict target of parcel_id alone no
+                # longer matches any unique constraint, and BEFORE the key
+                # change it silently overwrote other counties' rows —
+                # destroying 56% of Fillmore and 47% of Wabasha.
+                .upsert(batch, on_conflict="county_code,parcel_id")
                 .execute()
             )
             written = len(result.data) if result.data else len(batch)
@@ -517,7 +529,9 @@ class FillmoreParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         try:
             (
                 core_table("owners")
-                .upsert(batch, on_conflict="parcel_id,source")
+                # county_code added 2026-08-06 to match the rebuilt
+                # owners_parcel_source_key index.
+                .upsert(batch, on_conflict="county_code,parcel_id,source")
                 .execute()
             )
         except Exception as e:
