@@ -14,6 +14,7 @@ from typing import Any, Iterable
 
 from src.db.supabase_client import signals_table
 from src.models.signal import DistressEventInsert
+from src.utils.county import resolve_county_code
 from src.utils.logger import logger
 
 # Batch size for bulk inserts
@@ -26,6 +27,30 @@ def _chunked(iterable: list, size: int):
         yield iterable[i : i + size]
 
 
+def _fill_county_codes(events: list[DistressEventInsert]) -> None:
+    """Set county_code on any event that lacks one. Mutates in place.
+
+    Derived centrally rather than in each of the fifteen scrapers: the rule is
+    one expression (core.source_county_map, falling back to the per-row county
+    for statewide publishers) and it resolved 7,460 of 7,472 live events when
+    measured on 2026-08-07. Fifteen copies of it would drift.
+
+    A county that cannot be resolved stays None. That is deliberate — see the
+    field comment on DistressEventInsert. Never substitute a default.
+    """
+    for e in events:
+        if e.county_code:
+            continue
+        try:
+            e.county_code = resolve_county_code(e.source, e.raw_data)
+        except Exception as exc:
+            logger.warning(
+                "county_code resolution failed; leaving NULL",
+                source=e.source,
+                error_type=type(exc).__name__,
+            )
+
+
 def write_events_dedup(events: Iterable[DistressEventInsert]) -> tuple[int, int]:
     """
     Insert events into signals.distress_events, skipping duplicates.
@@ -35,14 +60,15 @@ def write_events_dedup(events: Iterable[DistressEventInsert]) -> tuple[int, int]
     in the underlying table. Postgres' ON CONFLICT DO NOTHING returns 0
     rows for the conflicting ones, which we count as duplicates.
 
-    OUTSTANDING (2026-08-06): callers do not yet populate county_code on
-    DistressEventInsert, so new rows land with it NULL. That is SAFE — the
-    index is NULLS NOT DISTINCT so NULL-county rows still dedup against each
-    other, and the composite FK is not enforced when a key column is NULL
-    (MATCH SIMPLE). But it means a Hennepin event and a Ramsey event for the
-    same PIN can no longer be told apart by this key, which is exactly the
-    collapse the county-aware index was meant to prevent. Add county_code to
-    DistressEventInsert and set it in each scraper to close this properly.
+    county_code is DERIVED HERE when the caller has not set it, so no scraper
+    needs changing. See _fill_county_codes.
+
+    FIXED 2026-08-07. This docstring previously called a NULL county_code
+    "SAFE". It was not. The index is NULLS NOT DISTINCT, so a NULL-county row
+    NEVER matches the correctly-labelled row for the same event — every run
+    re-inserted it. 1,451 duplicate events accumulated in roughly 24 hours,
+    inflating the public signal count from 7,472 to 8,923 and breaking
+    mpls_vbr and saint_paul_vacant outright.
 
     Args:
         events: Iterable of DistressEventInsert.
@@ -53,6 +79,8 @@ def write_events_dedup(events: Iterable[DistressEventInsert]) -> tuple[int, int]
     event_list = list(events)
     if not event_list:
         return 0, 0
+
+    _fill_county_codes(event_list)
 
     records_new = 0
     records_failed = 0
