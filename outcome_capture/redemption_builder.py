@@ -75,6 +75,37 @@ The upsert also recomputes next_check_date on UPDATE, not only on INSERT
 (fixed 2026-08-02). See the comment in UPSERT_SQL: a corrected expiry that
 left a stale check date caused outcome_checker to run before the window had
 closed and record an outcome for a redemption that was still open.
+
+=== COUNTY CODE IS CARRIED, NOT LOOKED UP (fixed 2026-08-07) ===
+This file died on every run for roughly 24 hours with:
+
+    CardinalityViolation: ON CONFLICT DO UPDATE command cannot affect row
+    a second time
+
+core.parcels moved to PRIMARY KEY (county_code, parcel_id) because Minnesota
+county PINs are not globally unique — 51,662 nine-character PINs are shared
+across counties. UPSERT_SQL resolved county_code with
+
+    LEFT JOIN core.parcels p ON p.parcel_id = %(parcel_id)s
+
+which, for a PIN present in two counties, turned the statement's single
+source row into two — two INSERTs proposing the same (source_table,
+source_id), which is precisely what ON CONFLICT DO UPDATE forbids.
+
+Measured 2026-08-07: 1,457 sheriff-sale events produced 1,461 rows through
+that join. FOUR events. main() runs every upsert inside one transaction and
+rolls back on any exception, so four ambiguous PINs discarded all 1,457
+writes and froze the homepage OUTCOMES block from 2026-08-06 14:57.
+
+The join is now GONE rather than made composite. signals.distress_events
+carries county_code directly (backfilled 2026-08-07, 7,460 of 7,472; the 12
+NULLs are orphans whose parcel does not exist), which is the same value the
+join was reaching for. Carrying it through build_rows removes the fanout at
+its source and removes a per-row join from 1,457 statements. The 12 orphans
+land on 'unknown' exactly as the old COALESCE put them.
+
+NEVER reintroduce a single-column parcel_id join here. Under the composite
+key it is not a slow query, it is a wrong one.
 """
 
 from __future__ import annotations
@@ -191,12 +222,31 @@ def build_rows(conn) -> list[dict[str, Any]]:
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         # --- 1. sheriff-sale signals -------------------------------------
+        # de.county_code is SELECTED and carried into the row dict: it is the
+        # value UPSERT_SQL used to reach for via core.parcels. See the
+        # module docstring for why that join is gone.
+        #
+        # The sheriff_sales join is composite. Measured 2026-08-07 it returns
+        # 266 rows with or without county_code, so nothing changes today —
+        # this is a latent trap being closed, not active damage. Under the
+        # composite key a bare parcel_id can match another county's sale and
+        # hand this event ITS redemption period, which is the exact class of
+        # wrong-deadline defect this file was written to eliminate.
+        #
+        # Deliberately NOT also matching ss.sale_date = de.event_date. That
+        # narrows 266 to 262: four events carry an event_date that is not the
+        # sale date, and matching on it would strip their notice-stated
+        # period and silently fall them back to the 6-month default —
+        # inventing a wrong deadline to close a fanout that is not occurring.
         cur.execute(
             """
-            SELECT de.id, de.source, de.parcel_id, de.event_date, de.raw_data,
+            SELECT de.id, de.source, de.parcel_id, de.county_code,
+                   de.event_date, de.raw_data,
                    ss.redemption_period_months AS notice_months
             FROM signals.distress_events de
-            LEFT JOIN signals.sheriff_sales ss ON ss.parcel_id = de.parcel_id
+            LEFT JOIN signals.sheriff_sales ss
+                   ON ss.parcel_id   = de.parcel_id
+                  AND ss.county_code = de.county_code
             WHERE de.event_type = 'sheriff_sale'
             """
         )
@@ -236,7 +286,7 @@ def build_rows(conn) -> list[dict[str, Any]]:
                 period_source = "default_6mo"
 
             rows.append({
-                "county_code": None,          # resolved in SQL below
+                "county_code": r["county_code"],
                 "parcel_id": r["parcel_id"],
                 "source_table": "signals.distress_events",
                 "source_id": r["id"],
@@ -254,13 +304,21 @@ def build_rows(conn) -> list[dict[str, Any]]:
     return rows
 
 
+# A SELECT with no FROM clause yields EXACTLY ONE row, which is the
+# invariant ON CONFLICT DO UPDATE requires: one proposed row per statement.
+# The previous form was `FROM (SELECT 1) x LEFT JOIN core.parcels p ON
+# p.parcel_id = %(parcel_id)s`, and a PIN held by two counties made that two
+# rows. See the module docstring.
+#
+# county_code is cast to ::text because psycopg2 sends an untyped NULL for
+# the 12 orphan events and COALESCE cannot infer a type from two unknowns.
 UPSERT_SQL = """
 INSERT INTO outcomes.redemption_tracker
     (county_code, parcel_id, source_table, source_id,
      anchor_date, anchor_type, redemption_period_months,
      period_source, redemption_expiry_date, check_stage, outcome,
      next_check_date)
-SELECT COALESCE(p.county_code, 'unknown'),
+SELECT COALESCE(%(county_code)s::text, 'unknown'),
        %(parcel_id)s, %(source_table)s, %(source_id)s,
        %(anchor_date)s, %(anchor_type)s, %(redemption_period_months)s,
        %(period_source)s, %(redemption_expiry_date)s, 0, 'pending',
@@ -282,13 +340,19 @@ SELECT COALESCE(p.county_code, 'unknown'),
            THEN %(redemption_expiry_date)s::date + 180
          ELSE CURRENT_DATE
        END
-FROM (SELECT 1) x
-LEFT JOIN core.parcels p ON p.parcel_id = %(parcel_id)s
 ON CONFLICT (source_table, source_id) DO UPDATE
 SET redemption_expiry_date   = EXCLUDED.redemption_expiry_date,
     redemption_period_months = EXCLUDED.redemption_period_months,
     period_source            = EXCLUDED.period_source,
     anchor_date              = EXCLUDED.anchor_date,
+    -- county_code is refreshed on UPDATE too. Rows written before
+    -- 2026-08-07 resolved it through core.parcels while that table was
+    -- keyed on parcel_id ALONE, so a shared PIN could have stamped the
+    -- WRONG county onto a tracker row. Re-running this builder now
+    -- corrects those in place. COALESCE keeps an existing real value
+    -- rather than letting an orphan overwrite it with 'unknown'.
+    county_code              = COALESCE(EXCLUDED.county_code,
+                                        outcomes.redemption_tracker.county_code),
     -- next_check_date MUST be recomputed here too, not only on INSERT.
     -- ADDED 2026-08-02. Until today this clause moved the expiry date and
     -- left next_check_date on the ladder derived from the OLD expiry. Any
@@ -356,6 +420,12 @@ def main() -> int:
         for r in rows:
             by_source[r["period_source"]] = by_source.get(r["period_source"], 0) + 1
         log(f"period_source breakdown: {by_source}")
+
+        no_county = sum(1 for r in rows if not r["county_code"])
+        if no_county:
+            log(f"WARNING: {no_county} rows have no county_code and will be "
+                f"stored as 'unknown' (orphan events whose parcel is absent "
+                f"from core.parcels)")
 
         if dry_run:
             log("DRY_RUN=1 — no writes performed")
