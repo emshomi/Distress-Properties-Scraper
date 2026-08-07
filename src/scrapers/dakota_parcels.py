@@ -326,7 +326,12 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         try:
             result = (
                 core_table("parcels")
-                .upsert(batch, on_conflict="parcel_id")
+                # (county_code, parcel_id) — core.parcels PK became composite
+                # 2026-08-06. Minnesota PINs are NOT globally unique: 51,662
+                # nine-char PINs are shared across counties. parcel_id alone
+                # no longer matches a unique constraint, and before the key
+                # change it silently overwrote other counties' rows.
+                .upsert(batch, on_conflict="county_code,parcel_id")
                 .execute()
             )
             written = len(result.data) if result.data else len(batch)
@@ -361,7 +366,7 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 try:
                     result = (
                         core_table("parcels")
-                        .upsert(chunk, on_conflict="parcel_id")
+                        .upsert(chunk, on_conflict="county_code,parcel_id")
                         .execute()
                     )
                     sub_written += len(result.data) if result.data else len(chunk)
@@ -415,7 +420,13 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 context={"scraper_name": self.source_name},
             )
 
-        async with self._class_lock:
+        # `with`, not `async with`. FIXED 2026-08-06.
+        # _class_lock became a threading.Lock on 2026-08-02; BaseScraper.run()
+        # was updated but every scraper OVERRIDING run() was missed, raising
+        # TypeError: '_thread.lock' object does not support the asynchronous
+        # context manager protocol. Unnoticed because these loaders are
+        # monthly and none had fired since.
+        with self._class_lock:
             return await self._run_streaming(trigger, metadata, start_time)
 
     async def _run_streaming(
