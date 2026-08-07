@@ -768,6 +768,16 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     if not detail_id:
                         continue
 
+                    # Completed Sales rows link to ForeclosureDetail.aspx and
+                    # are keyed by docnum/propid, NOT by the numeric id that
+                    # _DETAIL_URL expects. Requesting
+                    # ForeclosureNotice.aspx?id=053123420040 would fetch an
+                    # unrelated page or bounce. Their list row already carries
+                    # sale date, recorded date, address, city, zip and a real
+                    # propid, which is the substance of the record.
+                    if row.get("detail_kind") == "detail":
+                        continue
+
                     url = _DETAIL_URL.format(id=detail_id)
                     try:
                         await asyncio.sleep(_DETAIL_DELAY_SECONDS)
@@ -875,38 +885,132 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
     def _parse_list_table(self, html: str, mode: str) -> list[dict[str, Any]]:
         """Parse the results table into row dicts.
 
-        Expected columns (per the live page): Details | Scheduled Date |
-        Address | City | Zip. The Details cell links to
-        ForeclosureNotice.aspx?id={id}.
+        THE TWO MODES RENDER DIFFERENT TABLES AND DIFFERENT LINKS.
+
+        Pending Sales — 5 columns, Details link → ForeclosureNotice.aspx?id={n}
+            Details | Scheduled Date | Address | City | Zip
+
+        Completed Sales — 6 columns, Details link → ForeclosureDetail.aspx
+            Details | Sale Date | Recorded Date | Address | City | Zip
+            query string: ?docnum=DOC891S461&propid=053123420040&inputaddress=...
+
+        === WHY THIS EXISTS (fixed 2026-08-07) ===
+        This method matched ONLY `ForeclosureNotice\\.aspx`. Completed Sales
+        rows link to `ForeclosureDetail.aspx`, so every one of them was
+        discarded — silently, on every run, since the scraper went live.
+
+        Measured 2026-08-07: signals.distress_events held 297 anoka_sheriff
+        events dating back to 2026-05-31 and EVERY SINGLE ONE was mode
+        'Pending Sales'. Zero completed sales had ever been captured. The
+        county's own search returns 159 completed records for All Cities.
+
+        The consequence was not just missing rows. Pending sales are sales
+        that HAVE NOT HAPPENED, so they start no redemption clock — Anoka was
+        contributing nothing whatsoever to outcomes.redemption_tracker, and
+        45 of the fabricated future-anchored redemption rows deleted on
+        2026-08-07 were Anoka pending sales. Completed sales are the ones
+        that actually open a redemption window.
+
+        The failure looked like flakiness: fetch() treats a Completed Sales
+        POST failure as non-fatal and logs `rows=0`, which is
+        indistinguishable from "the county had no completed sales". A
+        ReadTimeout on 2026-08-07 made it look like a transient server
+        problem. It was not; the parser could never have matched.
+
+        Completed rows also carry TWO fields the Pending list does not:
+        `propid` (a real Anoka parcel ID) and `docnum` (the recorded document
+        number). Both are captured into the row dict. The synthetic
+        ANOKA-FC-* identity scheme is deliberately NOT changed here — Anoka
+        PIN normalisation is a known open problem (164 tracker rows carry
+        synthetic case-number PINs) and re-keying is a separate change with a
+        different risk profile. propid is carried through to raw_data so that
+        work can use it later.
         """
         soup = BeautifulSoup(html, "lxml")
         rows: list[dict[str, Any]] = []
 
-        # Find every link to a detail page; its containing row holds the data.
-        for link in soup.find_all("a", href=re.compile(r"ForeclosureNotice\.aspx", re.I)):
+        # Match BOTH detail-page shapes. Notice = pending, Detail = completed.
+        link_pattern = re.compile(
+            r"Foreclosure(?:Notice|Detail)\.aspx", re.I
+        )
+
+        for link in soup.find_all("a", href=link_pattern):
             href = link.get("href", "")
-            m = re.search(r"id=(\d+)", href)
-            if not m:
+            is_completed = "foreclosuredetail" in href.lower()
+
+            detail_id: str | None = None
+            propid: str | None = None
+            docnum: str | None = None
+
+            if is_completed:
+                # ?docnum=DOC891S461&propid=053123420040&inputaddress=...
+                # NOTE: do NOT reuse the `id=(\d+)` regex below — it would
+                # match the tail of "propid=" and silently capture the PIN as
+                # a detail id.
+                m_doc = re.search(r"docnum=([^&]+)", href, re.I)
+                m_prop = re.search(r"propid=([^&]+)", href, re.I)
+                docnum = m_doc.group(1).strip() if m_doc else None
+                propid = m_prop.group(1).strip() if m_prop else None
+                # Identity for a COMPLETED row is the property (propid), so
+                # two sales on one parcel resolve to one parcel. Fall back to
+                # the document number when the county omits propid.
+                detail_id = propid or docnum
+            else:
+                m = re.search(r"[?&]id=(\d+)", href)
+                detail_id = m.group(1) if m else None
+
+            if not detail_id:
                 continue
-            detail_id = m.group(1)
 
             tr = link.find_parent("tr")
             if tr is None:
                 continue
             cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
-            # cells ~ ["Details", "10/19/2026", "2205 Foxtail Court", "Lino Lakes", "55110"]
-            sched = cells[1] if len(cells) > 1 else None
-            address = cells[2] if len(cells) > 2 else None
-            city = cells[3] if len(cells) > 3 else None
-            zip_code = cells[4] if len(cells) > 4 else None
+
+            if is_completed:
+                # ["Details 8-04-2026", "08/04/2026", "1533 128TH AVE NE",
+                #  "BLAINE", "55449"] — the Details cell carries the sale date
+                # inline, then Recorded Date, Address, City, Zip.
+                # Column count differs from Pending by one; reading fixed
+                # Pending indices here would put Recorded Date in `address`
+                # and Address in `city`.
+                sched = cells[1] if len(cells) > 1 else None
+                address = cells[2] if len(cells) > 2 else None
+                city = cells[3] if len(cells) > 3 else None
+                zip_code = cells[4] if len(cells) > 4 else None
+                if len(cells) >= 6:
+                    # Full 6-column render: Details | Sale | Recorded |
+                    # Address | City | Zip
+                    sched = cells[1]
+                    recorded = cells[2]
+                    address = cells[3]
+                    city = cells[4]
+                    zip_code = cells[5]
+                else:
+                    recorded = None
+            else:
+                # ["Details", "10/19/2026", "2205 Foxtail Court",
+                #  "Lino Lakes", "55110"]
+                sched = cells[1] if len(cells) > 1 else None
+                address = cells[2] if len(cells) > 2 else None
+                city = cells[3] if len(cells) > 3 else None
+                zip_code = cells[4] if len(cells) > 4 else None
+                recorded = None
 
             rows.append({
                 "detail_id": detail_id,
                 "mode": mode,
                 "scheduled_date": sched,
+                "recorded_date": recorded,
                 "address": address,
                 "city": city,
                 "zip": zip_code,
+                # Completed-only. Absent (None) on pending rows.
+                "propid": propid,
+                "docnum": docnum,
+                # Drives detail-page enrichment: only ForeclosureNotice pages
+                # are fetchable by `id`, so completed rows must be skipped.
+                "detail_kind": "detail" if is_completed else "notice",
             })
         return rows
 
@@ -1051,10 +1155,18 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 raw_data={
                     "list": {
                         "scheduled_date": r.get("scheduled_date"),
+                        "recorded_date": r.get("recorded_date"),
                         "address": address,
                         "city": city,
                         "zip": r.get("zip"),
                         "mode": r.get("mode"),
+                        # Completed Sales only. `propid` is a REAL Anoka
+                        # parcel ID published in the Details href — the
+                        # pending list exposes nothing equivalent. Captured
+                        # so the synthetic ANOKA-FC-* ids can later be
+                        # resolved to core.parcels rows.
+                        "propid": r.get("propid"),
+                        "docnum": r.get("docnum"),
                     },
                     "detail": {
                         "owner_name": r.get("owner_name"),
