@@ -105,6 +105,11 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     "ramsey_tfl": "Ramsey",
     "postbulletin_legal": "Olmsted",
     "fillmore_legal": "Fillmore",
+    # ADDED 2026-08-07. Its absence made /stats report Fillmore as 3 signals
+    # when it has 51 (3 legal + 48 probate), AND made data_sources read 14
+    # when 15 sources have data — the probe set is built from this map's
+    # keys, so a missing source is invisible twice over.
+    "fillmore_probate": "Fillmore",
     "olmsted_delq_list": "Olmsted",
     "mn_dor_red_book": "Statewide",
 }
@@ -128,6 +133,11 @@ _SLUG_TO_COUNTY_NAME: dict[str, str] = {
     "stearns": "Stearns",
     "washington": "Washington",
     "wright": "Wright",
+}
+
+# Reverse of the above. Derived, not hand-written, so the two cannot drift.
+_COUNTY_NAME_TO_SLUG: dict[str, str] = {
+    name: slug for slug, name in _SLUG_TO_COUNTY_NAME.items()
 }
 
 # Sources whose county is NOT one-to-one with the source name (statewide
@@ -2239,6 +2249,35 @@ async def stats_endpoint() -> dict[str, Any]:
     except Exception:
         last_updated = None
 
+    # Per-county parcel counts, read ONCE from core.parcels_per_county.
+    # ADDED 2026-08-07 (migration: parcels_per_county.sql).
+    #
+    # PostgREST cannot GROUP BY, so a per-county count previously meant one
+    # query per county. The view does the aggregation server-side and this
+    # reads all of it in a single call.
+    parcels_by_slug: dict[str, int] = {}
+    counties_with_parcels = 0
+    try:
+        ppc = core_table("parcels_per_county").select("*").execute()
+        for row in (ppc.data or []):
+            slug = row.get("county_code")
+            n = row.get("parcels") or 0
+            if slug:
+                parcels_by_slug[slug] = n
+        # Counties holding a REAL spine. Thresholded at >100 deliberately:
+        # about ten counties exist in core.parcels holding a single synthetic
+        # COUNTY-FC- stub minted by foreclosure_promotion to satisfy an FK for
+        # one notice. Those are not lookupable coverage and counting them
+        # overstates the platform. Measured 2026-08-07: 69 present, 59 real.
+        counties_with_parcels = sum(
+            1 for n in parcels_by_slug.values() if n > 100
+        )
+    except Exception as e:
+        logger.warning(
+            "stats: parcels_per_county read failed",
+            error_type=type(e).__name__,
+        )
+
     counties_breakdown: list[dict[str, Any]] = []
     for county in sorted(distinct_counties):
         county_sources = _sources_for_county(county)
@@ -2253,10 +2292,16 @@ async def stats_endpoint() -> dict[str, Any]:
             ccount = cresult.count or 0
         except Exception:
             ccount = 0
+        # FIXED 2026-08-07. Was `parcels_count if county == "Hennepin"` —
+        # the ENTIRE STATEWIDE total assigned to Hennepin. True when Hennepin
+        # was the only county with a spine; badly wrong after the MnGeo load
+        # put 51 counties in core.parcels. The homepage showed Hennepin with
+        # 2,663,673 parcels against its real 448,688.
+        cslug = _COUNTY_NAME_TO_SLUG.get(county)
         counties_breakdown.append({
             "name": county,
             "signals": ccount,
-            "parcels": parcels_count if county == "Hennepin" else None,
+            "parcels": parcels_by_slug.get(cslug) if cslug else None,
         })
 
     return success_envelope({
@@ -2264,7 +2309,12 @@ async def stats_endpoint() -> dict[str, Any]:
         "summary": {
             "total_signals": total_signals,
             "parcels_indexed": parcels_count,
+            # counties_covered = counties with a DEDICATED distress source
+            # that has data. It says nothing about parcel coverage, which is
+            # now far wider — hence counties_with_parcels. Showing only one
+            # of these misleads in whichever direction it is read.
             "counties_covered": len(distinct_counties),
+            "counties_with_parcels": counties_with_parcels,
             "data_sources": len(distinct_sources),
             "last_updated": last_updated,
         },
