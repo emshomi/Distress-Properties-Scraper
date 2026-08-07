@@ -39,6 +39,7 @@ from src.services.event_writer import (
 )
 from src.services.parcel_resolver import resolve_parcel
 from src.utils.errors import ParseError
+from src.utils.logger import logger
 from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
 
 
@@ -227,8 +228,29 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                     last_observed_at=datetime.now(timezone.utc),
                 )
 
+        # resolve_parcel returns None on failure. Its result MUST be counted
+        # and folded into the run's failure total.
+        #
+        # FIXED 2026-08-07. This loop previously discarded the return value, and
+        # this method logged NOTHING — so a fully-failing parcel leg was
+        # invisible in both the run counters and the logs. Measured live: the
+        # 15:47 run on 2026-08-07 reported records_failed=0 and status=success
+        # while every one of its 384 parcel upserts was failing with 42P10
+        # (parcel_resolver.py carried a stale single-column on_conflict after
+        # core.parcels moved to PRIMARY KEY (county_code, parcel_id)). The
+        # failure was only found by querying core.parcels.last_observed_at,
+        # which had not moved since 13:34.
+        #
+        # dakota_sheriff.py has always done this correctly and was therefore
+        # the only affected scraper whose logs showed the failure directly.
+        # Match that pattern; never discard this return value.
+        parcels_ok = 0
+        parcels_failed = 0
         for parcel_payload in unique_parcels.values():
-            resolve_parcel(parcel_payload)
+            if resolve_parcel(parcel_payload) is not None:
+                parcels_ok += 1
+            else:
+                parcels_failed += 1
 
         # --- Step 2: Write typed signals.vacant_registrations rows ---
         # Strip in-memory-only fields that don't exist as columns in
@@ -279,10 +301,20 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         events = [sig.to_event() for sig in signals]
         new_events, failed_events = write_events_dedup(events)
 
+        logger.info(
+            "Saint Paul vacant write complete",
+            source=self.source_name,
+            parcels_ok=parcels_ok,
+            parcels_failed=parcels_failed,
+            typed_new=new_typed,
+            events_new=new_events,
+            failed=failed_typed + failed_events + parcels_failed,
+        )
+
         return (
             new_typed,
             0,
-            failed_typed + failed_events,
+            failed_typed + failed_events + parcels_failed,
         )
 
 
