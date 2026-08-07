@@ -277,8 +277,29 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                 last_observed_at=datetime.now(timezone.utc),
             )
 
+        # resolve_parcel returns None on failure. Its result MUST be counted
+        # and folded into the run's failure total.
+        #
+        # FIXED 2026-08-07. This loop previously discarded the return value and
+        # the log line below reported `parcels=len(unique_parcels)` — the count
+        # ATTEMPTED, not the count written. Measured live: on 2026-08-07 the
+        # 15:45 run logged `parcels=309 failed=0` and reported status=success
+        # while EVERY ONE of those 309 parcel upserts was failing with 42P10
+        # (parcel_resolver.py carried a stale single-column on_conflict after
+        # core.parcels moved to PRIMARY KEY (county_code, parcel_id)). The
+        # scraper asserted success for two hours; the defect was only found by
+        # querying core.parcels.last_observed_at directly.
+        #
+        # dakota_sheriff.py has always done this correctly and was therefore
+        # the only one of the affected scrapers whose logs showed the failure.
+        # Match that pattern; never discard this return value.
+        parcels_ok = 0
+        parcels_failed = 0
         for parcel_payload in unique_parcels.values():
-            resolve_parcel(parcel_payload)
+            if resolve_parcel(parcel_payload) is not None:
+                parcels_ok += 1
+            else:
+                parcels_failed += 1
 
         # --- Step 2: Write typed signals.vacant_registrations rows ---
         _IN_MEMORY_ONLY = {
@@ -327,13 +348,14 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
 
         logger.info(
             "Minneapolis VBR write complete",
-            parcels=len(unique_parcels),
+            parcels_ok=parcels_ok,
+            parcels_failed=parcels_failed,
             typed_new=new_typed,
             events_new=new_events,
-            failed=failed_typed + failed_events,
+            failed=failed_typed + failed_events + parcels_failed,
         )
 
-        return (new_typed, 0, failed_typed + failed_events)
+        return (new_typed, 0, failed_typed + failed_events + parcels_failed)
 
 
 __all__ = ["MplsVacantBuildingScraper"]
