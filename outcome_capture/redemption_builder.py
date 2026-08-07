@@ -32,6 +32,48 @@ Hennepin publishes `redemptionExpirationDate` in every single record and
 nothing was reading it. Same class of defect as Dakota's TAXPIN: the
 authoritative field sat in the feed, unrequested, for months.
 
+=== A SALE THAT HAS NOT HAPPENED STARTS NO CLOCK (fixed 2026-08-07) ===
+Measured live before this fix: 275 tracker rows carried an anchor_date in
+the FUTURE — 234 of them surfacing through outcomes.redemption_current onto
+the public homepage, inflating "IN REDEMPTION NOW" from roughly 535 to 769.
+
+Every one was a property whose sheriff's sale had not yet occurred. Minn.
+Stat. 580.03 requires six weeks of published notice before a sale, so a
+foreclosure notice necessarily announces a FUTURE date. build_rows anchored
+the redemption clock on that announced date and computed an expiry from it.
+The owner of a property whose sale is two months away was recorded — and
+published — as being in redemption today.
+
+By source: mnpublicnotice 187, anoka_sheriff 45 (pre-guard rows),
+postbulletin_legal 2. mnpublicnotice is statewide and publishes NOTHING BUT
+scheduled sales, so as that feed grew this defect grew with it.
+
+signals.sheriff_sales.sale_status was 'scheduled' on every affected row.
+build_rows read redemption_period_months off that same row and never looked
+at the column beside it. The authoritative field was present and unrequested
+— the identical shape to the redemptionExpirationDate defect above.
+
+TWO guards now, because they fail in different places:
+
+  1. sale_status = 'scheduled' — the source's own explicit statement. Exists
+     only where a sheriff_sales row matched, so it cannot stand alone: the
+     45 anoka_sheriff and 2 postbulletin_legal rows had no such row.
+  2. anchor_date in the future — the universal invariant. A redemption
+     window cannot open before the sale that opens it. Needs no per-feed
+     knowledge and covers feeds not yet written.
+
+Both are SELF-HEALING. Nothing is lost permanently: once the sale date
+passes, the guard stops firing and the next run creates the row with a real
+anchor and, where a county publishes one, a real expiry. The signals
+themselves are untouched in signals.distress_events throughout — the
+marketplace, property pages and /connect/lookup still show these
+pre-foreclosure properties. Only the redemption tracker abstains, and it
+abstains because a wrong legal deadline in front of a homeowner is worse
+than no deadline at all.
+
+_is_scheduled_not_sold is KEPT. It catches Anoka rows whose scheduled date
+has already passed without a sale, which the future-anchor guard cannot see.
+
 === SOURCE PRECEDENCE ===
 Highest-confidence source wins. Never compute when the source states it.
 
@@ -75,6 +117,13 @@ The upsert also recomputes next_check_date on UPDATE, not only on INSERT
 (fixed 2026-08-02). See the comment in UPSERT_SQL: a corrected expiry that
 left a stale check date caused outcome_checker to run before the window had
 closed and record an outcome for a redemption that was still open.
+
+NOTE on skipping: a skip prevents a row being WRITTEN or UPDATED; it does
+not remove one already present. Rows that predate a new guard must be
+deleted separately. The 275 future-anchored rows found on 2026-08-07 were
+cleared by hand after this fix shipped; none had dependent
+outcomes.owner_checks rows, an advanced check_stage or a recorded outcome,
+so the error never reached the checker pipeline or distressed_exit_sales.
 
 === COUNTY CODE IS CARRIED, NOT LOOKED UP (fixed 2026-08-07) ===
 This file died on every run for roughly 24 hours with:
@@ -134,6 +183,18 @@ NO_PERIOD_SOURCES = {
     "dakota_sheriff",
     "anoka_sheriff",
     "washington_sheriff",
+}
+
+# signals.sheriff_sales.sale_status values meaning the sale has NOT been
+# held. A redemption clock must not start from any of these. Measured
+# 2026-08-07: every one of the 275 future-anchored tracker rows that had a
+# matching sheriff_sales row carried 'scheduled'.
+UNHELD_SALE_STATUSES = {
+    "scheduled",
+    "pending",
+    "postponed",
+    "cancelled",
+    "canceled",
 }
 
 
@@ -206,6 +267,10 @@ def _is_scheduled_not_sold(source: str, raw: dict[str, Any]) -> bool:
     distinguishes them with `list.mode`. Creating a redemption window for a
     sale that has not occurred would put a fabricated deadline in front of
     an owner whose sale might still be postponed or cancelled.
+
+    This is the SOURCE-SPECIFIC guard and it remains necessary: it catches
+    Anoka rows whose scheduled date has already PASSED without a sale, which
+    the future-anchor guard in build_rows cannot see.
     """
     if source == "anoka_sheriff":
         mode = ((raw.get("list") or {}).get("mode") or "").strip().lower()
@@ -213,18 +278,38 @@ def _is_scheduled_not_sold(source: str, raw: dict[str, Any]) -> bool:
     return False
 
 
+def _is_unheld_sale(sale_status: Any) -> bool:
+    """True when signals.sheriff_sales states the sale has not been held.
+
+    The source's own explicit signal, and the strongest available. Only
+    usable where a sheriff_sales row matched — see the future-anchor guard
+    in build_rows for the cases this cannot reach.
+    """
+    if sale_status is None:
+        return False
+    return str(sale_status).strip().lower() in UNHELD_SALE_STATUSES
+
+
 def build_rows(conn) -> list[dict[str, Any]]:
     """Read distress signals and derive one tracker row per property."""
     rows: list[dict[str, Any]] = []
     skipped_scheduled = 0
+    skipped_unheld_status = 0
+    skipped_future_anchor = 0
     skipped_no_redemption = 0
     skipped_no_date = 0
+    today = date.today()
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         # --- 1. sheriff-sale signals -------------------------------------
         # de.county_code is SELECTED and carried into the row dict: it is the
         # value UPSERT_SQL used to reach for via core.parcels. See the
         # module docstring for why that join is gone.
+        #
+        # ss.sale_status is SELECTED because it is the source's own statement
+        # that a sale has or has not been held. It sat one column away from
+        # redemption_period_months, which this query has always read, while
+        # 275 rows were anchored on sales that had not happened.
         #
         # The sheriff_sales join is composite. Measured 2026-08-07 it returns
         # 266 rows with or without county_code, so nothing changes today —
@@ -242,7 +327,8 @@ def build_rows(conn) -> list[dict[str, Any]]:
             """
             SELECT de.id, de.source, de.parcel_id, de.county_code,
                    de.event_date, de.raw_data,
-                   ss.redemption_period_months AS notice_months
+                   ss.redemption_period_months AS notice_months,
+                   ss.sale_status              AS sale_status
             FROM signals.distress_events de
             LEFT JOIN signals.sheriff_sales ss
                    ON ss.parcel_id   = de.parcel_id
@@ -256,6 +342,11 @@ def build_rows(conn) -> list[dict[str, Any]]:
 
             if _is_scheduled_not_sold(source, raw):
                 skipped_scheduled += 1
+                continue
+
+            # GUARD 1 — the source says the sale has not been held.
+            if _is_unheld_sale(r["sale_status"]):
+                skipped_unheld_status += 1
                 continue
 
             # 'No right of redemption' — there is no window to track.
@@ -272,6 +363,14 @@ def build_rows(conn) -> list[dict[str, Any]]:
             )
             if not anchor:
                 skipped_no_date += 1
+                continue
+
+            # GUARD 2 — a redemption window cannot open before the sale that
+            # opens it. Universal: needs no per-feed knowledge and covers
+            # feeds not yet written. Self-healing: once the date passes, the
+            # next run creates this row with a real anchor.
+            if anchor > today:
+                skipped_future_anchor += 1
                 continue
 
             # --- precedence ---
@@ -298,7 +397,9 @@ def build_rows(conn) -> list[dict[str, Any]]:
             })
 
     log(f"derived {len(rows)} rows "
-        f"(skipped: {skipped_scheduled} scheduled, "
+        f"(skipped: {skipped_scheduled} anoka-pending, "
+        f"{skipped_unheld_status} sale-not-held, "
+        f"{skipped_future_anchor} future sale date, "
         f"{skipped_no_redemption} no-redemption-right, "
         f"{skipped_no_date} no sale date)")
     return rows
@@ -420,6 +521,12 @@ def main() -> int:
         for r in rows:
             by_source[r["period_source"]] = by_source.get(r["period_source"], 0) + 1
         log(f"period_source breakdown: {by_source}")
+
+        future = sum(1 for r in rows if r["anchor_date"] > date.today())
+        if future:
+            log(f"FATAL: {future} derived rows still carry a future anchor_date "
+                f"— the guard in build_rows did not hold; refusing to write")
+            return 1
 
         no_county = sum(1 for r in rows if not r["county_code"])
         if no_county:
