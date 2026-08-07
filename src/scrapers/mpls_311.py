@@ -1,234 +1,402 @@
 """
-Minneapolis 311 Code Violations scraper.
+Minneapolis Regulatory Services code violations scraper.
 
-Pulls from the Socrata dataset rmpv-bp76 (Minneapolis Open Data).
-On first run: pulls 365 days of history. On subsequent runs: pulls
-the trailing 7 days to catch newly-reported violations.
+Source: the CITY OF MINNEAPOLIS's own ArcGIS org (`afSMGVsC7QlRK1kZ`),
+service `CaseViolations`, layer 0.
+
+    https://services.arcgis.com/afSMGVsC7QlRK1kZ/ArcGIS/rest/services/CaseViolations/FeatureServer/0
+
+=== REBUILT 2026-08-07 — THIS SCRAPER HAD NEVER WRITTEN A ROW ===
+The previous version targeted a Socrata endpoint at
+`opendata.minneapolismn.gov/resource/rmpv-bp76.json`. Minneapolis migrated
+off Socrata to ArcGIS Hub and that host now returns an ArcGIS Hub
+"This site is no longer supported" HTML page **at HTTP 200** — so the
+scraper never errored, it just parsed nothing. Measured 2026-08-07:
+`signals.code_violations` held 0 rows and `signals.distress_events` held 0
+`mpls_311` events, since the scraper was written.
+
+It also targeted four column names that do not exist on
+`signals.code_violations`. Both the model and the table were fixed in
+task 540; see `src/models/signal.py`.
+
+=== THE SERVICE IS INSPECTIONS, NOT VIOLATIONS ===
+Despite the name `CaseViolations`, its `serviceDescription` reads
+"Case Inspections for the City of Minneapolis." It is ONE ROW PER
+INSPECTION. A condemned property generates a new row at every reinspection.
+
+Measured 2026-08-07:
+
+    367,837   total inspection rows (all results, back to ~1989)
+     36,353   rows whose Inspection_Result is a distress code
+     11,501   distinct cases behind those
+      4,732   distress rows with Completed_Date >= 2024-01-01
+      1,391   distinct cases in that window  <-- what this scraper writes
+          0   in-window rows missing an APN
+
+So the whole 2024+ window fetches in a SINGLE page (under the layer's
+`maxRecordCount` of 16,000) and collapses ~3.4:1 into case rows.
+
+=== WHY A 2024 CUTOFF ===
+The service carries NO resolution flag. A condemnation from 2011 with no
+way to tell whether it was resolved is HISTORY, not distress — the building
+has very likely been repaired, sold or demolished in the years since.
+Publishing it as current distress is the same error that put fabricated
+redemption deadlines in front of homeowners on 2026-08-07 (see
+`outcome_capture/redemption_builder.py`). Better absent than wrong.
+
+Cross-check available: `mpls_vbr` now holds the City's CURRENT vacant
+building registry (311 properties). A condemnation here on a property NOT in
+that registry has very likely been resolved.
+
+=== RESULT CODES ===
+Only codes whose meaning is self-evident are treated as distress. The City
+publishes no glossary for this field — the dashboard's "Violation Codes" tab
+documents a DIFFERENT vocabulary (BOT, DOT, DFB, F001...) and its "Glossary"
+tab documents only dashboard field names. **Undocumented codes are excluded
+deliberately**: misclassifying one puts a wrong signal in front of an owner.
+Do not add TNC, LINT, LINTCIT, CGI, NVT, ENVGrant, Auth, Continue, FinalMit
+or the Conduct*/Admin* families without written confirmation from Regulatory
+Services.
+
+=== FIELDS ===
+    APN                            13-digit Hennepin PID (verified populated
+                                   on 100% of in-window rows)
+    Display                        property street address
+    Violation_Case_Number          stable per case -> source_id
+    Case_Type                      HIS / FIS / VBR / Nuisance / Hazmat
+    Inspection_Result              the code (see _DISTRESS_RESULTS)
+    Completed_Date                 EPOCH MILLISECONDS, not a string
+    Scheduled_Date                 epoch ms
+    Violation_Case_ID              internal id
+    Violation_Case_Inspection_ID   unique per inspection row
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any, ClassVar
 
-import httpx
-
-from src.config import settings
+from src.models.parcel import ParcelUpsert
 from src.models.signal import CodeViolationInsert
-from src.scrapers.base_scraper import BaseScraper
-from src.services.audit_logger import log_error
+from src.scrapers.base_arcgis_scraper import (
+    BaseArcGISScraper,
+    arcgis_date_to_date_only,
+)
 from src.services.event_writer import (
     write_events_dedup,
     write_typed_signals_dedup,
 )
 from src.services.parcel_resolver import resolve_parcel
-from src.models.parcel import ParcelUpsert
-from src.utils.errors import ParseError, SourceUnavailableError
-from src.utils.logger import logger
 from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
-from src.utils.retry import retry_on_transient
+from src.utils.logger import logger
 
 
-# Socrata dataset for Minneapolis 311 code violations
-_DATASET_ID = "rmpv-bp76"
-_BASE_URL = f"https://opendata.minneapolismn.gov/resource/{_DATASET_ID}.json"
+_FEATURE_SERVICE_URL = (
+    "https://services.arcgis.com/afSMGVsC7QlRK1kZ"
+    "/ArcGIS/rest/services/CaseViolations/FeatureServer/0"
+)
 
-# Lookback windows
-_FIRST_RUN_DAYS = 365
-_SUBSEQUENT_RUN_DAYS = 7
+# Earliest Completed_Date we accept. See "WHY A 2024 CUTOFF" above.
+_WINDOW_START = "2024-01-01"
 
-# Page size for Socrata pagination
-_PAGE_SIZE = 1000
-_MAX_PAGES = 50  # Safety cap
+# Result codes treated as distress, mapped to severity.
+#
+# CRITICAL — the property is legally uninhabitable or the City is in court:
+#   VACATE   occupants ordered out
+#   CON      condemned
+#   CONCIT   condemned with citation
+#   Summons  criminal citation, city took the owner to court
+#
+# MEDIUM — vacancy and enforcement escalation:
+#   UNOC/UNOCCIT  unoccupied (with citation)
+#   VB/VO/VS      vacant building / open / secured
+#   VBRRefer      referred into the VBR programme ($7,228/yr clock starts)
+#   NOSH          notice of substandard housing
+#   Abate         city did the work and billed the owner -> becomes a
+#                 special assessment on the tax bill
+_DISTRESS_RESULTS: dict[str, str] = {
+    "VACATE": "critical",
+    "CON": "critical",
+    "CONCIT": "critical",
+    "Summons": "critical",
+    "UNOC": "medium",
+    "UNOCCIT": "medium",
+    "VB": "medium",
+    "VO": "medium",
+    "VS": "medium",
+    "VBRRefer": "medium",
+    "NOSH": "medium",
+    "Abate": "medium",
+}
+
+# Tiebreak when one case has several inspections on the SAME date. Measured:
+# case CE1010509 carries CON and CONCIT both on 2025-04-03, because a
+# condemnation and its citation are recorded together. Without a
+# deterministic rule the surviving row depends on arbitrary result ordering
+# and the same case can flip between runs, churning `status` in the database.
+# Higher rank wins.
+_RESULT_RANK: dict[str, int] = {
+    "VACATE": 100,
+    "CONCIT": 90,
+    "CON": 80,
+    "Summons": 70,
+    "NOSH": 60,
+    "Abate": 50,
+    "UNOCCIT": 40,
+    "UNOC": 30,
+    "VBRRefer": 25,
+    "VO": 20,
+    "VS": 15,
+    "VB": 10,
+}
+
+_SQL_RESULT_LIST = ",".join(f"'{c}'" for c in _DISTRESS_RESULTS)
 
 
-class MplsThreeOneOneScraper(BaseScraper[dict[str, Any], CodeViolationInsert]):
-    """Minneapolis 311 code violations."""
+class MplsThreeOneOneScraper(BaseArcGISScraper[CodeViolationInsert]):
+    """Minneapolis Regulatory Services case violations — City ArcGIS source."""
 
     source_name: ClassVar[str] = "mpls_311"
     signal_type: ClassVar[str] = "code_violation"
+    county_code: ClassVar[str] = "hennepin"
+    feature_service_url: ClassVar[str] = _FEATURE_SERVICE_URL
 
-    @retry_on_transient(source="mpls_311")
-    async def _fetch_page(
+    # Filter server-side. The unfiltered layer is 367,837 rows; this brings
+    # it to 4,732 — a single page. NEVER remove the Inspection_Result filter:
+    # the excluded codes (Complete, Final, Cancel, NotNeeded, NA, ApptSet,
+    # Advisory, Monitor, Virtual...) are routine inspection administration,
+    # not distress, and would drown the signal 10:1.
+    where_clause: ClassVar[str] = (
+        f"Inspection_Result IN ({_SQL_RESULT_LIST}) "
+        f"AND Completed_Date >= DATE '{_WINDOW_START}'"
+    )
+
+    # Point geometry is available but the parcel layer is the authority for
+    # coordinates; APN is populated on 100% of in-window rows.
+    return_geometry: ClassVar[bool] = False
+
+    # ---- Feature parsing ----
+
+    async def parse_feature(
         self,
-        client: httpx.AsyncClient,
-        offset: int,
-        since_date: date,
-    ) -> list[dict[str, Any]]:
-        """Fetch one page of records from Socrata."""
-        params: dict[str, Any] = {
-            "$limit": _PAGE_SIZE,
-            "$offset": offset,
-            "$order": "open_date DESC",
-            "$where": f"open_date >= '{since_date.isoformat()}T00:00:00.000'",
-        }
+        attributes: dict[str, Any],
+        geometry: dict[str, Any] | None,
+    ) -> CodeViolationInsert | None:
+        """Convert one INSPECTION row into a provisional signal.
 
-        headers: dict[str, str] = {"Accept": "application/json"}
-        if settings.minneapolis_311_app_token is not None:
-            headers["X-App-Token"] = settings.minneapolis_311_app_token.get_secret_value()
+        Collapsing to one row per case happens in parse() — this method
+        cannot do it, because it only ever sees a single feature.
+        """
+        case_number = attributes.get("Violation_Case_Number")
+        if not case_number or not str(case_number).strip():
+            return None
 
-        try:
-            response = await client.get(_BASE_URL, params=params, headers=headers)
-        except httpx.HTTPError as e:
-            raise SourceUnavailableError(
-                f"Socrata request failed: {e}",
+        result = str(attributes.get("Inspection_Result") or "").strip()
+        severity = _DISTRESS_RESULTS.get(result)
+        if severity is None:
+            # The server-side filter should make this unreachable. If it
+            # fires, the City has added a code and the where_clause and
+            # _DISTRESS_RESULTS have drifted apart.
+            logger.warning(
+                "Unexpected Inspection_Result passed the server filter",
                 source=self.source_name,
-            ) from e
-
-        if response.status_code >= 500:
-            raise SourceUnavailableError(
-                f"Socrata returned {response.status_code}",
-                source=self.source_name,
+                inspection_result=result,
+                case_number=str(case_number),
             )
-        if response.status_code != 200:
-            raise SourceUnavailableError(
-                f"Socrata returned unexpected status {response.status_code}",
+            return None
+
+        raw_apn = attributes.get("APN")
+        if not raw_apn or not str(raw_apn).strip():
+            # Measured 0 of 4,732 in-window rows. Skip rather than
+            # synthesise: a code violation with no property is not a lead.
+            return None
+        parcel_id, err = safe_normalize_parcel_id("hennepin", str(raw_apn))
+        if parcel_id is None:
+            logger.warning(
+                "Could not normalize Minneapolis APN",
                 source=self.source_name,
+                apn=str(raw_apn),
+                case_number=str(case_number),
+                error=err,
             )
+            return None
 
-        try:
-            data = response.json()
-        except ValueError as e:
-            raise ParseError(
-                f"Socrata returned non-JSON: {e}",
-                source=self.source_name,
-            ) from e
+        # Completed_Date is EPOCH MILLISECONDS on this service, not a string.
+        completed = arcgis_date_to_date_only(attributes.get("Completed_Date"))
+        violation_date: date | None = None
+        if completed:
+            try:
+                violation_date = date.fromisoformat(completed)
+            except ValueError:
+                violation_date = None
 
-        if not isinstance(data, list):
-            raise ParseError(
-                f"Expected JSON array, got {type(data).__name__}",
-                source=self.source_name,
-            )
-
-        return data
-
-    async def fetch(self, trigger: str) -> list[dict[str, Any]]:
-        """Fetch records from Socrata with pagination."""
-        # Determine lookback window
-        # (For simplicity, always use subsequent-run window; first-run logic
-        # would query the audit table for prior successful runs.)
-        days_back = _SUBSEQUENT_RUN_DAYS
-        if trigger == "manual":
-            days_back = _FIRST_RUN_DAYS
-
-        since_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).date()
-
-        logger.info(
-            "Fetching Minneapolis 311",
-            since=since_date.isoformat(),
-            lookback_days=days_back,
+        return CodeViolationInsert(
+            parcel_id=parcel_id,
+            county_code=self.county_code,
+            city="Minneapolis",
+            violation_type=result,
+            violation_date=violation_date,
+            status=str(attributes.get("Case_Type") or "").strip() or None,
+            source_id=str(case_number).strip(),
+            raw_data={
+                "attributes": attributes,
+                "address": str(attributes.get("Display") or "").strip() or None,
+                "case_type": str(attributes.get("Case_Type") or "").strip() or None,
+                "inspection_result": result,
+                "inspection_id": attributes.get("Violation_Case_Inspection_ID"),
+                "_source": self.source_name,
+                "_window_start": _WINDOW_START,
+            },
+            observed_at=datetime.now(timezone.utc),
+            source=self.source_name,
+            violation_description=(
+                f"{result} — {attributes.get('Case_Type') or 'case'}"
+            ),
+            severity=severity,  # type: ignore[arg-type]
         )
 
-        all_records: list[dict[str, Any]] = []
-        async with httpx.AsyncClient(
-            timeout=settings.scraper_request_timeout_seconds
-        ) as client:
-            for page in range(_MAX_PAGES):
-                offset = page * _PAGE_SIZE
-                records = await self._fetch_page(client, offset, since_date)
-                all_records.extend(records)
-                if len(records) < _PAGE_SIZE:
-                    # Last page
-                    break
-
-        return all_records
+    # ---- Collapse inspections to cases ----
 
     async def parse(
         self, raw_records: list[dict[str, Any]]
     ) -> list[CodeViolationInsert]:
-        """Parse raw Socrata records into CodeViolationInsert."""
-        signals: list[CodeViolationInsert] = []
-        now = datetime.now(timezone.utc)
+        """Parse every inspection, then keep ONE row per case.
 
-        for raw in raw_records:
-            try:
-                # Parcel ID — Socrata field is 'apn' or 'pid' depending on dataset version
-                raw_pid = raw.get("apn") or raw.get("pid") or raw.get("parcel_id")
-                if not raw_pid:
+        A property with a Tier 1 inspection, three reinspections and a
+        warning is ONE distress signal, not five. Measured 2026-08-07:
+        4,732 in-window inspections collapse to 1,391 cases.
+
+        Selection rule, in order:
+          1. latest violation_date wins (the current state of the case)
+          2. on a DATE TIE, the higher-ranked result wins — see _RESULT_RANK
+          3. rows with no date lose to any row that has one
+
+        Rule 2 is not cosmetic. Without it the surviving row for a case with
+        CON and CONCIT on the same day is arbitrary, and can differ between
+        runs.
+        """
+        signals = await super().parse(raw_records)
+
+        best: dict[str, CodeViolationInsert] = {}
+        for sig in signals:
+            existing = best.get(sig.source_id)
+            if existing is None:
+                best[sig.source_id] = sig
+                continue
+
+            new_date = sig.violation_date
+            old_date = existing.violation_date
+
+            if new_date is None and old_date is not None:
+                continue
+            if old_date is None and new_date is not None:
+                best[sig.source_id] = sig
+                continue
+
+            if new_date is not None and old_date is not None:
+                if new_date > old_date:
+                    best[sig.source_id] = sig
+                    continue
+                if new_date < old_date:
                     continue
 
-                pid, err = safe_normalize_parcel_id("hennepin", str(raw_pid))
-                if pid is None:
-                    log_error(
-                        run_id=None,
-                        error_type="validation_error",
-                        error_message=f"Bad PID: {err}",
-                        raw_record=raw,
-                    )
-                    continue
+            # Same date (or both None) — rank decides.
+            new_rank = _RESULT_RANK.get(sig.violation_type or "", 0)
+            old_rank = _RESULT_RANK.get(existing.violation_type or "", 0)
+            if new_rank > old_rank:
+                best[sig.source_id] = sig
 
-                case_number = raw.get("case_number") or raw.get("case_id")
-                if not case_number:
-                    continue
+        collapsed = list(best.values())
+        logger.info(
+            "Minneapolis case violations collapsed",
+            source=self.source_name,
+            inspections=len(signals),
+            cases=len(collapsed),
+        )
+        return collapsed
 
-                # Reported date
-                reported_str = raw.get("open_date") or raw.get("reported_date")
-                reported_date: date | None = None
-                if reported_str:
-                    try:
-                        reported_date = datetime.fromisoformat(
-                            reported_str.replace("Z", "+00:00")
-                        ).date()
-                    except (ValueError, AttributeError):
-                        reported_date = None
-
-                signal = CodeViolationInsert(
-                    parcel_id=pid,
-                    case_number=str(case_number),
-                    violation_type=raw.get("violation_type") or raw.get("category"),
-                    violation_description=raw.get("description") or raw.get("violation_description"),
-                    status=raw.get("status") or raw.get("case_status"),
-                    reported_date=reported_date,
-                    source=self.source_name,
-                    raw_data=raw,
-                    observed_at=now,
-                )
-                signals.append(signal)
-            except Exception as e:
-                log_error(
-                    run_id=None,
-                    error_type="parse_error",
-                    error_message=f"{type(e).__name__}: {e}",
-                    raw_record=raw,
-                )
-
-        return signals
+    # ---- Write ----
 
     async def write(
-        self, signals: list[CodeViolationInsert]
+        self,
+        signals: list[CodeViolationInsert],
     ) -> tuple[int, int, int]:
-        """Resolve parcels, write typed signals, and write to unified event feed."""
+        """Persist signals: resolve parcels, write typed rows + unified events."""
         if not signals:
             return 0, 0, 0
 
-        # Resolve unique parcels first
-        unique_pids: dict[str, ParcelUpsert] = {}
+        # --- Step 1: Resolve each unique parcel ---
+        unique_parcels: dict[str, ParcelUpsert] = {}
         for sig in signals:
-            if sig.parcel_id not in unique_pids:
-                unique_pids[sig.parcel_id] = ParcelUpsert(
-                    parcel_id=sig.parcel_id,
-                    county_code="hennepin",
-                    data_sources=[self.source_name],
-                )
+            if sig.parcel_id in unique_parcels:
+                continue
+            address = (sig.raw_data or {}).get("address")
+            unique_parcels[sig.parcel_id] = ParcelUpsert(
+                parcel_id=sig.parcel_id,
+                county_code=self.county_code,
+                state="MN",
+                address=str(address).strip() if address else None,
+                city="Minneapolis",
+                data_sources=[self.source_name],
+                last_observed_at=datetime.now(timezone.utc),
+            )
 
-        for parcel_payload in unique_pids.values():
-            resolve_parcel(parcel_payload)
+        # resolve_parcel returns None on failure. Its result MUST be counted
+        # and folded into the run's failure total — a discarded return value
+        # let three scrapers report `failed=0` on 2026-08-07 while every one
+        # of their parcel upserts was failing with 42P10.
+        parcels_ok = 0
+        parcels_failed = 0
+        for parcel_payload in unique_parcels.values():
+            if resolve_parcel(parcel_payload) is not None:
+                parcels_ok += 1
+            else:
+                parcels_failed += 1
 
-        # Write typed signals
-        signal_rows = [
-            sig.model_dump(mode="json", exclude_none=True) for sig in signals
-        ]
+        # --- Step 2: Write typed signals.code_violations rows ---
+        # These four have no column on signals.code_violations; they live in
+        # raw_data and drive the distress_events projection. Sending them
+        # would raise PGRST204 before on_conflict is evaluated.
+        _IN_MEMORY_ONLY = {
+            "source", "violation_description", "resolved_date", "severity",
+        }
+        signal_rows = []
+        for sig in signals:
+            row = sig.model_dump(mode="json", exclude_none=True)
+            for k in _IN_MEMORY_ONLY:
+                row.pop(k, None)
+            signal_rows.append(row)
+
+        # Conflict target must match signals.code_violations_dedup, created
+        # 2026-08-07 as (county_code, source_id) NULLS NOT DISTINCT while the
+        # table was empty. source_id carries Violation_Case_Number, which is
+        # stable per case. Deliberately NOT keyed on parcel_id — one property
+        # can hold several concurrent cases (measured: 1801 EMERSON AVE N has
+        # CE1010509 and CE1010510) — nor on violation_date, because a
+        # corrected date should UPDATE the row, not create a second one.
         new_typed, failed_typed = write_typed_signals_dedup(
             "code_violations",
             signal_rows,
-            on_conflict="case_number,source",
+            on_conflict="county_code,source_id",
         )
 
-        # Write unified events
+        # --- Step 3: Write unified distress_events ---
         events = [sig.to_event() for sig in signals]
         new_events, failed_events = write_events_dedup(events)
 
-        return new_typed, 0, failed_typed + failed_events
+        critical = sum(1 for s in signals if s.severity == "critical")
+
+        logger.info(
+            "Minneapolis code violations write complete",
+            parcels_ok=parcels_ok,
+            parcels_failed=parcels_failed,
+            typed_new=new_typed,
+            events_new=new_events,
+            critical=critical,
+            failed=failed_typed + failed_events + parcels_failed,
+        )
+
+        return (new_typed, 0, failed_typed + failed_events + parcels_failed)
 
 
 __all__ = ["MplsThreeOneOneScraper"]
