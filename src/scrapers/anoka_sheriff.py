@@ -151,10 +151,35 @@ def _safe_decimal(value: str | None) -> Decimal | None:
 
 
 def _parse_mmddyyyy(value: str | None) -> date | None:
+    """Parse the several date shapes the two Anoka tables use.
+
+    Pending Sales renders `10/19/2026`. Completed Sales renders `8-04-2026`
+    — HYPHENS, and a single-digit month.
+
+    FIXED 2026-08-07. The hyphen formats were absent, so every Completed
+    Sales row failed to parse and was dropped by the `continue` in parse().
+    That was the SECOND silent filter discarding the same 159 rows: the
+    first was _parse_list_table matching only ForeclosureNotice.aspx. Run
+    557 captured all 159 rows and still wrote zero events because of this.
+
+    The date cell can also carry the "Details" link text when the county
+    renders sale date and link in one cell, so leading non-numeric words
+    are stripped before parsing.
+    """
     if not value:
         return None
     v = value.strip()
-    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+
+    # Strip any leading label text ("Details 8-04-2026" → "8-04-2026").
+    m = re.search(r"(\d{1,4}[-/]\d{1,2}[-/]\d{2,4})", v)
+    if m:
+        v = m.group(1)
+
+    for fmt in (
+        "%m/%d/%Y", "%m/%d/%y",
+        "%m-%d-%Y", "%m-%d-%y",   # Completed Sales table
+        "%Y-%m-%d",
+    ):
         try:
             return datetime.strptime(v, fmt).date()
         except ValueError:
@@ -1094,7 +1119,22 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             parcel_id = f"ANOKA-FC-{detail_id}"
             sale_date = _parse_mmddyyyy(r.get("scheduled_date"))
             if sale_date is None:
-                # No usable sale date → skip (can't form a sheriff_sale event).
+                # Completed rows publish a Recorded Date alongside the sale
+                # date. Recording follows the sale by days, so it is a sound
+                # last resort — far better than discarding a real completed
+                # foreclosure because of a date format.
+                sale_date = _parse_mmddyyyy(r.get("recorded_date"))
+            if sale_date is None:
+                # Genuinely unusable. LOG it — a silent `continue` here hid
+                # 159 completed sales through run 557 (see _parse_mmddyyyy).
+                logger.warning(
+                    "Anoka row dropped: no parseable date",
+                    source=self.source_name,
+                    mode=r.get("mode"),
+                    detail_id=detail_id,
+                    scheduled_date=r.get("scheduled_date"),
+                    recorded_date=r.get("recorded_date"),
+                )
                 continue
 
             is_pending = "pending" in (r.get("mode") or "").lower()
