@@ -67,8 +67,13 @@ class DistressEventInsert(BaseModel):
     """
     Payload for inserting a distress_events row.
 
-    Dedup key is (parcel_id, event_type, event_date, source) — the event
-    writer skips inserts that match an existing key.
+    Dedup key is (county_code, parcel_id, event_type, event_date, source) —
+    the event writer skips inserts that match an existing key.
+
+    county_code gained its place in that key on 2026-08-06, when core.parcels
+    moved to a composite (county_code, parcel_id) primary key: Minnesota PINs
+    are not globally unique, and without the county two counties' events for
+    the same PIN collapsed into one.
 
     All field names match Supabase column names exactly. Note that
     monetary amounts use `event_value` (not `amount`) to match the
@@ -76,6 +81,21 @@ class DistressEventInsert(BaseModel):
     """
 
     parcel_id: str = Field(..., min_length=1, max_length=100)
+    # ADDED 2026-08-07. Optional on the MODEL because callers rarely know it,
+    # but the event writer DERIVES it before insert (see
+    # src/utils/county.resolve_county_code) — so rows normally reach the
+    # database with it set.
+    #
+    # Leaving it NULL is not benign. The dedup index is NULLS NOT DISTINCT,
+    # so a NULL-county row never matches the correctly-labelled row for the
+    # same event and every scraper run re-inserts it. Measured: 1,451
+    # duplicate events accumulated in ~24 hours before this was fixed.
+    #
+    # A genuinely unresolvable county still stays NULL rather than being
+    # given a default — the composite FK is simply not enforced then
+    # (MATCH SIMPLE), which is correct for an event whose parcel does not
+    # exist. 12 such rows exist as of 2026-08-07.
+    county_code: str | None = Field(default=None, max_length=100)
     event_type: DistressEventType
     event_subtype: str | None = Field(default=None, max_length=100)
     # Nullable by design: when a source doesn't publish the true event date,
@@ -101,6 +121,7 @@ class DistressEvent(BaseModel):
 
     id: int
     parcel_id: str | None = None
+    county_code: str | None = None
     event_type: DistressEventType
     event_subtype: str | None = None
     event_date: date | None = None
