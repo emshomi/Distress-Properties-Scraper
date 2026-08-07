@@ -6,7 +6,6 @@ foreclosed property, carrying the date its redemption window closes. That
 date is the single most consequential fact Govire publishes to a homeowner:
 it is the day they lose the right to save their home.
 
-
 Run: python outcome_capture/redemption_builder.py
 
 === WHY THIS FILE EXISTS (2026-07-28) ===
