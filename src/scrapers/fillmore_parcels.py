@@ -580,7 +580,22 @@ class FillmoreParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 context={"scraper_name": self.source_name},
             )
 
-        async with self._class_lock:
+        # `with`, not `async with`. FIXED 2026-08-06.
+        #
+        # _class_lock became a threading.Lock on 2026-08-02 (runs dispatched
+        # to worker threads; an asyncio.Lock guards nothing across threads —
+        # see base_scraper.py). BaseScraper.run() was updated to a plain
+        # `with` in that change, but EVERY scraper that OVERRIDES run() was
+        # missed, leaving:
+        #     TypeError: '_thread.lock' object does not support the
+        #     asynchronous context manager protocol
+        #
+        # That is all six county-direct parcel loaders plus mngac_parcels.
+        # It went unnoticed because they are monthly or quarterly and none
+        # had fired since the change. Still outstanding at time of writing:
+        # dakota_parcels, ramsey_parcels, olmsted_parcels, hennepin_parcels,
+        # washington_parcels.
+        with self._class_lock:
             return await self._run_streaming(trigger, metadata, start_time)
 
     async def _run_streaming(
