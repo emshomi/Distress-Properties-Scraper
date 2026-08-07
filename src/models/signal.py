@@ -144,18 +144,56 @@ class DistressEvent(BaseModel):
 
 
 class CodeViolationInsert(BaseModel):
-    """Minneapolis 311 / Saint Paul DSI code violation payload."""
+    """Code violation payload — signals.code_violations.
 
+    === FIELD NAMES CORRECTED 2026-08-07 ===
+    This model dumped FOUR fields that do not exist as columns on
+    signals.code_violations, and omitted four that do. PostgREST rejects
+    unknown keys with PGRST204 before on_conflict is even evaluated, so
+    nothing could ever have been written. The table has been empty since it
+    was created.
+
+    Verified against pg_catalog 2026-08-07, the real columns are:
+        id, parcel_id, violation_type, violation_date, fine_amount,
+        status, city, source_id, raw_data, observed_at, county_code
+
+    Renamed: case_number -> source_id, reported_date -> violation_date.
+    Added:   county_code, city, fine_amount.
+
+    Kept as IN-MEMORY ONLY (no such column; the writer must strip them
+    before upsert, exactly as VbrListingInsert does with `source`):
+        source, violation_description, resolved_date, severity
+    They survive in raw_data and drive the distress_events projection.
+
+    Dedup index is `code_violations_dedup (county_code, source_id)
+    NULLS NOT DISTINCT` — created 2026-08-07 while the table was empty.
+    `source_id` carries the source's own case number
+    (e.g. Minneapolis Violation_Case_Number), which is stable per case.
+    Deliberately NOT keyed on parcel_id (one property has many cases over
+    time) or violation_date (a corrected date should UPDATE the row, not
+    create a second one).
+    """
+
+    # ---- Direct column mappings to signals.code_violations ----
     parcel_id: str = Field(..., min_length=1, max_length=100)
-    case_number: str = Field(..., min_length=1, max_length=100)
+    county_code: str | None = Field(default=None, max_length=100)
+    city: str | None = Field(default=None, max_length=200)
     violation_type: str | None = Field(default=None, max_length=200)
-    violation_description: str | None = Field(default=None, max_length=2000)
+    violation_date: date | None = None
+    fine_amount: Decimal | None = Field(default=None, ge=0)
     status: str | None = Field(default=None, max_length=100)
-    reported_date: date | None = None
-    resolved_date: date | None = None
-    source: str = Field(..., min_length=1, max_length=100)
+    source_id: str = Field(..., min_length=1, max_length=100)
     raw_data: dict[str, Any] | None = None
     observed_at: datetime
+
+    # ---- Not stored in code_violations; used for event projection ----
+    source: str = Field(..., min_length=1, max_length=100)
+    violation_description: str | None = Field(default=None, max_length=2000)
+    resolved_date: date | None = None
+    # Set by the scraper from the source's own result codes. Minneapolis
+    # VACATE / CON / CONCIT are critical; vacancy codes are medium. The model
+    # does not know those codes and must not guess at them.
+    severity: DistressSeverity = "medium"
 
     model_config = ConfigDict(extra="forbid")
 
@@ -165,12 +203,18 @@ class CodeViolationInsert(BaseModel):
             parcel_id=self.parcel_id,
             event_type="code_violation",
             event_subtype=self.violation_type,
-            event_date=self.reported_date or self.observed_at.date(),
-            severity="medium",
+            # THE date rule: use the true date from the source, or NULL.
+            # The old `or self.observed_at.date()` fallback stamped scrape-day,
+            # which makes every daily run a "new" event — the same defect that
+            # inflated Saint Paul VBR counts ~30x before 2026-07-07. An event
+            # with no known date is honestly NULL.
+            event_date=self.violation_date,
+            severity=self.severity,
             source=self.source,
-            source_id=self.case_number,
+            source_id=self.source_id,
             title=f"Code violation: {self.violation_type or 'unspecified'}",
             description=self.violation_description,
+            event_value=self.fine_amount,
             raw_data=self.raw_data,
             observed_at=self.observed_at,
         )
