@@ -1116,7 +1116,34 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             if not detail_id:
                 continue
 
-            parcel_id = f"ANOKA-FC-{detail_id}"
+            # Completed Sales rows publish a REAL Anoka parcel id in the
+            # Details href (`?propid=053123420040`). Use it — a real PIN joins
+            # to the 139,420 Anoka parcels in core.parcels and the property
+            # gains an assessed value, an owner and an address. A synthetic
+            # id joins to nothing.
+            #
+            # ADDED 2026-08-07 (task 534). Before this, every Anoka event got
+            # ANOKA-FC-{detail_id} and 292 synthetic parcels had accumulated.
+            # Measured: 155 of 156 completed-sale propids matched core.parcels
+            # EXACTLY — same 12-character format, no normalisation needed —
+            # and all 151 distinct target parcels carried EMV and owner data,
+            # 147 an address. The 136 events with no dedup collision were
+            # re-keyed by hand; this stops the scraper recreating them.
+            #
+            # Pending Sales rows expose NO propid, so they keep the synthetic
+            # id. That is a real limitation of the source list page, not an
+            # extraction failure — the PIN only appears once a sale completes.
+            #
+            # Deliberately NOT normalised through safe_normalize_parcel_id:
+            # the county's propid is already the assessor's own format and
+            # matched 155/156 verbatim. Normalising would risk reshaping a
+            # value that is already correct.
+            propid = r.get("propid")
+            if propid and str(propid).strip():
+                parcel_id = str(propid).strip()
+            else:
+                parcel_id = f"ANOKA-FC-{detail_id}"
+
             sale_date = _parse_mmddyyyy(r.get("scheduled_date"))
             if sale_date is None:
                 # Completed rows publish a Recorded Date alongside the sale
