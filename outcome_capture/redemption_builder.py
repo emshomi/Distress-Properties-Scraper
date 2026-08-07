@@ -106,9 +106,10 @@ default computed from a scheduled date is doubly assumed. Those rows are
 skipped — see _is_scheduled_not_sold.
 
 === IDEMPOTENCE ===
-Upserts on (source_table, source_id). Re-running is safe and will CORRECT
-rows whose source has since published a better date — which is the whole
-point: run it after every sheriff scrape.
+Upserts on (county_code, parcel_id, anchor_date) — the FACT, not the record
+that reported it. Re-running is safe and will CORRECT rows whose source has
+since published a better date — which is the whole point: run it after every
+sheriff scrape. Two sources reporting the same sale land on ONE row.
 
 Never downgrades. A row already on a county-published date is not
 overwritten by a computed default.
@@ -441,19 +442,42 @@ SELECT COALESCE(%(county_code)s::text, 'unknown'),
            THEN %(redemption_expiry_date)s::date + 180
          ELSE CURRENT_DATE
        END
-ON CONFLICT (source_table, source_id) DO UPDATE
+-- CONFLICT TARGET CHANGED 2026-08-07 (task 542).
+--
+-- Was `ON CONFLICT (source_table, source_id)` — the identity of a redemption
+-- window was the SCRAPER RECORD that reported it, not the window itself. So
+-- one sheriff sale reported twice produced TWO clocks for one property.
+-- Measured before the fix: 1,323 tracker rows describing only 1,261 real
+-- windows. 62 duplicates, and NOT only Anoka pending-vs-completed pairs —
+-- `RICE-FC-66-CV-25-1045` was an mnpublicnotice row duplicated against
+-- itself, so the defect was already cross-source.
+--
+-- A redemption window is a fact about a PROPERTY AND A SALE: this parcel
+-- had a sheriff sale on this date, so the owner has until this date to
+-- redeem. It is not a fact about a feed. `outcomes.redemption_tracker` now
+-- carries a unique index `redemption_tracker_fact_key` on
+-- (county_code, parcel_id, anchor_date), and this target must match it —
+-- ON CONFLICT on a DIFFERENT index does not catch a violation of that one,
+-- so a mismatch here raises a unique violation and main() rolls back the
+-- entire run.
+--
+-- Two sources reporting the same sale is now CONFIRMATION, not duplication:
+-- the second one updates the existing row.
+--
+-- NOT YET SOLVED: a POSTPONED sale moves anchor_date, which is part of the
+-- key, so the postponed sale inserts a NEW row and the old window survives
+-- alongside it. Retiring windows whose sale date has moved is separate work.
+ON CONFLICT (county_code, parcel_id, anchor_date) DO UPDATE
 SET redemption_expiry_date   = EXCLUDED.redemption_expiry_date,
     redemption_period_months = EXCLUDED.redemption_period_months,
     period_source            = EXCLUDED.period_source,
-    anchor_date              = EXCLUDED.anchor_date,
-    -- county_code is refreshed on UPDATE too. Rows written before
-    -- 2026-08-07 resolved it through core.parcels while that table was
-    -- keyed on parcel_id ALONE, so a shared PIN could have stamped the
-    -- WRONG county onto a tracker row. Re-running this builder now
-    -- corrects those in place. COALESCE keeps an existing real value
-    -- rather than letting an orphan overwrite it with 'unknown'.
-    county_code              = COALESCE(EXCLUDED.county_code,
-                                        outcomes.redemption_tracker.county_code),
+    -- Provenance follows the winning row. When a completed sale supersedes
+    -- the pending record of the same sale, the tracker should say it came
+    -- from the completed event. anchor_date and county_code are NOT set
+    -- here: both are part of the conflict key, so EXCLUDED already equals
+    -- the stored value and assigning them would be misleading.
+    source_table             = EXCLUDED.source_table,
+    source_id                = EXCLUDED.source_id,
     -- next_check_date MUST be recomputed here too, not only on INSERT.
     -- ADDED 2026-08-02. Until today this clause moved the expiry date and
     -- left next_check_date on the ladder derived from the OLD expiry. Any
