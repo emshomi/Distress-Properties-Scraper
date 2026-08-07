@@ -10,6 +10,39 @@ Implements per-field merge semantics when upserting parcels:
 
 This produces a parcel record that gets richer over time as more
 scrapers contribute information.
+
+=== core.parcels IS KEYED ON (county_code, parcel_id) — fixed 2026-08-07 ===
+Minnesota county PINs are NOT globally unique: 51,662 nine-character PINs
+are shared across counties (measured; 14 counties use 9-char PINs). Phase 5
+of the composite-key migration moved core.parcels to
+PRIMARY KEY (county_code, parcel_id). This file was missed — the migration
+repaired seven parcel loaders and event_writer.py, but not the shared
+resolver that EVERY scraper calls.
+
+TWO defects, both fixed here. They are different in kind:
+
+1. `on_conflict="parcel_id"` matched no unique index, so PostgREST raised
+   42P10 and the upsert failed. LOUD. Measured 2026-08-07: hennepin_sheriff
+   run 545 logged this 514 times and wrote nothing; anoka_sheriff failed 86
+   of 172 and dakota_sheriff 170 of 340 — exactly half each, because the
+   parcel leg failed while the distress_events leg succeeded.
+
+2. The existing-row SELECT filtered on `parcel_id` alone with `.limit(1)`.
+   SILENT, and far worse. A shared PIN matches rows in several counties;
+   limit(1) returns an arbitrary one; _merge_parcel_payload then merges
+   ANOTHER COUNTY'S address, market value and coordinates into this parcel.
+   _IMMUTABLE_FIELDS keeps county_code correct, so the row would look
+   properly labelled while carrying the wrong property's data — undetectable
+   without comparing against the source. This is the mirror image of the
+   original key defect that silently destroyed ~191,600 parcels across
+   twenty counties.
+
+Defect 1 was masking defect 2: nothing committed, so nothing was corrupted.
+Fixing the conflict target ALONE would have unblocked the corruption.
+
+NEVER query core.parcels on parcel_id alone. The correct filter is always
+`.eq("parcel_id", ...).eq("county_code", ...)`, and the correct conflict
+target is always "county_code,parcel_id".
 """
 
 from __future__ import annotations
@@ -90,14 +123,28 @@ def resolve_parcel(payload: ParcelUpsert) -> Parcel | None:
     Returns the resolved Parcel, or None if the operation failed.
     """
     parcel_id = payload.parcel_id
+    county_code = payload.county_code
 
-    # Fetch existing row (if any)
+    # A parcel is identified by (county_code, parcel_id). Without a county we
+    # cannot look one up unambiguously and MUST NOT guess: merging against an
+    # arbitrary county's row would copy that property's address and market
+    # value onto this one. Refuse instead.
+    if not county_code:
+        logger.error(
+            "Cannot resolve parcel without county_code",
+            parcel_id=parcel_id,
+            hint="core.parcels is keyed on (county_code, parcel_id)",
+        )
+        return None
+
+    # Fetch existing row (if any). BOTH key columns — see module docstring.
     existing: dict[str, Any] | None = None
     try:
         result = (
             core_table("parcels")
             .select("*")
             .eq("parcel_id", parcel_id)
+            .eq("county_code", county_code)
             .limit(1)
             .execute()
         )
@@ -107,16 +154,18 @@ def resolve_parcel(payload: ParcelUpsert) -> Parcel | None:
         logger.warning(
             "Failed to fetch existing parcel for merge",
             parcel_id=parcel_id,
+            county_code=county_code,
             error=str(e),
         )
 
     merged = _merge_parcel_payload(existing, payload)
 
-    # Upsert the merged record
+    # Upsert the merged record. Conflict target must match the composite
+    # PRIMARY KEY on core.parcels, in key order.
     try:
         result = (
             core_table("parcels")
-            .upsert(merged, on_conflict="parcel_id")
+            .upsert(merged, on_conflict="county_code,parcel_id")
             .execute()
         )
         if result.data and len(result.data) > 0:
@@ -125,6 +174,7 @@ def resolve_parcel(payload: ParcelUpsert) -> Parcel | None:
         logger.error(
             "Failed to upsert parcel",
             parcel_id=parcel_id,
+            county_code=county_code,
             error=str(e),
         )
 
