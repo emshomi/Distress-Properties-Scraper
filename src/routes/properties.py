@@ -61,6 +61,19 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         # the Chatfield-corridor expansion's first signal source
         # (2026-07-23).
         {"source": "fillmore_legal"},
+        # ADDED 2026-08-07. mnpublicnotice is the ONLY STATEWIDE foreclosure
+        # feed — 261 sheriff-sale notices reaching 38 counties, scraped daily.
+        # Its absence made /stats report 1,695 foreclosures against 1,956
+        # sheriff_sale rows: the homepage was omitting every foreclosure
+        # outside the seven counties with a dedicated sheriff scraper, which
+        # is precisely the coverage the statewide spine exists to serve.
+        #
+        # Cause: derive_source() was fixed on 2026-08-02 to relabel these rows
+        # from startribune_legal (which IS listed above) to their true feed.
+        # Correcting the attribution silently dropped them out of this
+        # category — the same blast radius that hit three gates in this file
+        # and was repaired on 2026-08-05.
+        {"source": "mnpublicnotice"},
     ],
     "tax_forfeit": [
         {"source": "hennepin_tax_roll", "event_type": "tax_forfeit"},
