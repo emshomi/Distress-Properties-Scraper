@@ -2,7 +2,8 @@
 Event writer service.
 
 Writes DistressEventInsert rows to signals.distress_events with
-deduplication. The dedup key is (parcel_id, event_type, event_date, source).
+deduplication. The dedup key is
+(county_code, parcel_id, event_type, event_date, source).
 
 Writes happen in batches of 500 to balance throughput vs. timeout risk.
 """
@@ -29,10 +30,19 @@ def write_events_dedup(events: Iterable[DistressEventInsert]) -> tuple[int, int]
     """
     Insert events into signals.distress_events, skipping duplicates.
 
-    Dedup uses the unique constraint on
-        (parcel_id, event_type, event_date, source)
+    Dedup uses the unique index
+        (county_code, parcel_id, event_type, event_date, source)
     in the underlying table. Postgres' ON CONFLICT DO NOTHING returns 0
     rows for the conflicting ones, which we count as duplicates.
+
+    OUTSTANDING (2026-08-06): callers do not yet populate county_code on
+    DistressEventInsert, so new rows land with it NULL. That is SAFE — the
+    index is NULLS NOT DISTINCT so NULL-county rows still dedup against each
+    other, and the composite FK is not enforced when a key column is NULL
+    (MATCH SIMPLE). But it means a Hennepin event and a Ramsey event for the
+    same PIN can no longer be told apart by this key, which is exactly the
+    collapse the county-aware index was meant to prevent. Add county_code to
+    DistressEventInsert and set it in each scraper to close this properly.
 
     Args:
         events: Iterable of DistressEventInsert.
@@ -58,7 +68,21 @@ def write_events_dedup(events: Iterable[DistressEventInsert]) -> tuple[int, int]
                 signals_table("distress_events")
                 .upsert(
                     payload,
-                    on_conflict="parcel_id,event_type,event_date,source",
+                    # county_code added 2026-08-06 to match the rebuilt
+                    # distress_events_dedup_key. The index gained county_code
+                    # when core.parcels moved to a composite PK, because two
+                    # counties' events for the same PIN were collapsing into
+                    # one — 51,662 nine-char PINs are shared across MN
+                    # counties. A stale conflict target matches no unique
+                    # index, so PostgREST rejects the whole batch; the except
+                    # below swallows it into a warning and the run still
+                    # reports counts, which is how this would have gone
+                    # unnoticed on the DAILY sheriff feeds.
+                    #
+                    # The index is NULLS NOT DISTINCT, so rows that do not yet
+                    # carry county_code still dedup correctly among themselves.
+                    # See the docstring for why they should carry it.
+                    on_conflict="county_code,parcel_id,event_type,event_date,source",
                     ignore_duplicates=True,
                 )
                 .execute()
