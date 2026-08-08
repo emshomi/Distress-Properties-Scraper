@@ -517,33 +517,45 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
                         continue
 
                     # ---- ONE-SHOT DIAGNOSTIC ----
-                    # The 2026-08-08 pilot queried all 500 names in 1,770s and
+                    # The 2026-08-08 pilot queried 500 names in 1,770s and
                     # returned ZERO cases — including ANDERSON/ERIC, which is
-                    # known to return two. The parser was later proved correct
-                    # against a saved real response, so the scraper must have
-                    # been receiving something other than results HTML: a
-                    # terms interstitial, an antiforgery rejection, a redirect
-                    # or a block page.
+                    # KNOWN to return two cases in Crow Wing. The parser was
+                    # then proved correct against a saved real response, so
+                    # the scraper is receiving something other than results
+                    # HTML.
                     #
-                    # This logs the shape of the FIRST response so a zero run
-                    # is diagnosable without another blind 30-minute cycle.
-                    # Body is truncated and only logged once per run.
+                    # A previous attempt logged this via logger.info() with
+                    # keyword fields. THAT WAS INVISIBLE: Railway's log export
+                    # renders those lines with an EMPTY message body — the
+                    # timestamps appear, the content does not. Every
+                    # structured-field diagnostic written this session was
+                    # lost the same way.
+                    #
+                    # So the sample goes into the EXCEPTION MESSAGE, which
+                    # run() records in audit.scraper_runs.error_message — a
+                    # plain text column that reads back reliably.
+                    #
+                    # Failing here is correct, not defensive: if the first
+                    # response has no result badge, the run cannot produce
+                    # anything and reporting `success` would be a lie.
+                    #
+                    # DELETE THIS BLOCK once the request is proven to work.
                     if not logged_sample:
                         logged_sample = True
-                        snippet = re.sub(r"\s+", " ", html[:600])
-                        logger.info(
-                            "MCRO first response sample",
-                            source=self.source_name,
-                            last_name=entry["last_name"],
-                            first_name=entry["first_name"],
-                            body_length=len(html),
-                            has_results_marker=(
-                                "CaseSearchResultsTitleSection" in html
-                            ),
-                            has_result_badge=("badge-result-number" in html),
-                            has_no_results_text=(_NO_RESULTS in html.lower()),
-                            body_head=snippet,
-                        )
+                        if "badge-result-number" not in html:
+                            head = re.sub(r"\s+", " ", html[:400])
+                            raise ParseError(
+                                "MCRO DIAGNOSTIC | "
+                                f"name={entry['last_name']}/{entry['first_name']} "
+                                f"len={len(html)} "
+                                f"results_section="
+                                f"{'CaseSearchResultsTitleSection' in html} "
+                                f"result_badge=False "
+                                f"no_results_text={_NO_RESULTS in html.lower()} "
+                                f"status_hint={html[:80]!r} "
+                                f"| HEAD: {head}",
+                                source=self.source_name,
+                            )
 
                     cases = self._parse_results(html)
                     if cases:
