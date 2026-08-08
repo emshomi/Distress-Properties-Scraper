@@ -197,8 +197,59 @@ _TOKEN_RE = re.compile(
 )
 
 _NO_RESULTS = "no cases match your search"
-_CAPTCHA_MARKERS = ("captcha", "unusual traffic", "are you a human",
-                    "access denied", "request blocked")
+# Headers sent on EVERY request. Captured from the browser session that
+# produced a working search on 2026-08-08.
+#
+# === WHY THIS EXISTS ===
+# MCRO sits behind an F5 BIG-IP web application firewall (visible as
+# `Server: volt-adc` and `X-Volterra-Location` on every response). Without a
+# realistic User-Agent, httpx sends `python-httpx/0.x` and the WAF rejects
+# the request outright with a 268-byte page reading:
+#
+#   "The requested URL was rejected. Please proceed to the next page via
+#    this link to submit a support request..."
+#
+# That is NOT rate limiting — it fired on the FIRST search of every run.
+# Four consecutive pilot runs (500, 500, 25, 25 names) returned zero cases
+# for this reason, including for ANDERSON/ERIC, which is known to return two.
+# The parser and the queue were fine the whole time; the request was being
+# refused before it ever reached the search.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Ch-Ua": '"Chromium";v="151", "Not?A_Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Text that means we have been blocked. The run STOPS on any of these — it
+# does not retry.
+#
+# `requested url was rejected` is F5's own wording and is the one that
+# actually fires. The earlier list ("captcha", "unusual traffic", "access
+# denied", "request blocked") matched none of it, so four runs reported
+# `success` while every single request was being refused. If a block is ever
+# silent again, the missing string belongs here.
+_CAPTCHA_MARKERS = (
+    "requested url was rejected",
+    "support request",
+    "captcha",
+    "unusual traffic",
+    "are you a human",
+    "access denied",
+    "request blocked",
+)
 
 
 def _norm(s: str | None) -> str:
@@ -410,9 +461,16 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
             data=payload,
             timeout=45.0,
             headers={
+                # Client-level _BROWSER_HEADERS still apply; these are the
+                # POST-specific ones the browser adds for an XHR form submit.
                 "Origin": _BASE_URL,
                 "Referer": _SEARCH_PAGE,
                 "X-Requested-With": "XMLHttpRequest",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "*/*",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
             },
         )
         if resp.status_code != 200:
@@ -493,7 +551,11 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
             nonlocal names_with_any_result
             out: list[dict[str, Any]] = []
             logged_sample = False
-            with httpx.Client(follow_redirects=True) as client:
+            with httpx.Client(
+                follow_redirects=True,
+                headers=_BROWSER_HEADERS,
+                http2=False,
+            ) as client:
                 token = self._bootstrap(client)
                 for i, entry in enumerate(queue, start=1):
                     try:
