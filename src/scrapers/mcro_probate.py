@@ -98,8 +98,29 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, ClassVar
 
-import httpx
-from bs4 import BeautifulSoup
+# === TLS IMPERSONATION IS REQUIRED — DO NOT SWAP THIS FOR httpx ===
+# MCRO sits behind an F5 BIG-IP WAF (`Server: volt-adc`,
+# `X-Volterra-Location` on every response). It rejects the connection at the
+# TLS layer, BEFORE any HTTP bytes are read, by fingerprinting the
+# ClientHello — cipher order, extensions, curves. Python's `ssl` module
+# produces a signature no browser matches.
+#
+# Measured 2026-08-08: httpx with a full set of real browser headers
+# (User-Agent, Accept, Sec-Fetch-*, Sec-Ch-Ua, Origin, Referer) was STILL
+# rejected on the first request of every run with:
+#
+#   "The requested URL was rejected. Please proceed to the next page via
+#    this link to submit a support request..."
+#
+# Headers cannot fix a TLS-layer block. curl_cffi impersonates Chrome's
+# actual ClientHello, which is the only thing that changes at that layer.
+#
+# If curl_cffi is ALSO rejected, the block is not fingerprint-based — it is
+# most likely the datacenter IP. Railway's ranges are well known and
+# mnpublicnotice already runs locally from a residential IP for exactly this
+# reason. In that case this scraper belongs on the same local box, and no
+# library change will help.
+from curl_cffi import requests as cffi_requests
 
 from src.models.signal import ProbateFilingInsert
 from src.scrapers.base_scraper import BaseScraper
@@ -110,6 +131,8 @@ from src.services.event_writer import (
 from src.db.supabase_client import signals_table
 from src.utils.errors import ParseError, SourceUnavailableError
 from src.utils.logger import logger
+
+from bs4 import BeautifulSoup
 
 
 _BASE_URL = "https://publicaccess.courts.state.mn.us"
@@ -394,7 +417,7 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
 
     # ---- session ----
 
-    def _bootstrap(self, client: httpx.Client) -> str:
+    def _bootstrap(self, client: Any) -> str:
         """GET the search page for the antiforgery token and terms cookies.
 
         The POST needs `__RequestVerificationToken` AND the paired
@@ -421,7 +444,7 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
 
     def _search(
         self,
-        client: httpx.Client,
+        client: Any,
         token: str,
         last_name: str,
         first_name: str,
@@ -551,10 +574,12 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
             nonlocal names_with_any_result
             out: list[dict[str, Any]] = []
             logged_sample = False
-            with httpx.Client(
-                follow_redirects=True,
+            # impersonate= is the whole point: it makes curl emit Chrome's
+            # TLS ClientHello. Without it the F5 WAF rejects the connection
+            # before any HTTP request is processed.
+            with cffi_requests.Session(
+                impersonate="chrome124",
                 headers=_BROWSER_HEADERS,
-                http2=False,
             ) as client:
                 token = self._bootstrap(client)
                 for i, entry in enumerate(queue, start=1):
