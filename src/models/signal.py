@@ -359,39 +359,78 @@ class VbrListingInsert(BaseModel):
 
 
 class ProbateFilingInsert(BaseModel):
-    """MN Court Records Online probate filing payload."""
+    """Probate case payload — signals.probate_cases.
 
+    === FIELD NAMES CORRECTED 2026-08-07 ===
+    Verified against pg_catalog. The real columns are:
+        id, parcel_id, case_number, filing_date, decedent_name,
+        date_of_death, personal_representative_name, county_code,
+        case_type, case_status, has_will, raw_data, observed_at
+
+    Renamed: county -> county_code, filing_type -> case_type.
+    Added:   date_of_death, personal_representative_name, case_status,
+             has_will — all four are visible on the MCRO Case Details page
+             and were simply never captured.
+
+    Kept as IN-MEMORY ONLY (no such column; the scraper MUST strip these
+    before upsert, as mpls_311 does):
+        source, severity
+
+    Dedup index is `probate_cases_dedup (county_code, case_number)
+    NULLS NOT DISTINCT`, created 2026-08-07 while the table was empty.
+    Keyed on the CASE, not the property — one estate can hold several
+    parcels, and MCRO case numbers are not uniformly formatted
+    (`03-PR-26-1092` but also `82-26-323`), so county_code guards against a
+    county-local numbering scheme colliding.
+    """
+
+    # ---- Direct column mappings to signals.probate_cases ----
     parcel_id: str | None = Field(default=None, max_length=100)
     case_number: str = Field(..., min_length=1, max_length=100)
-    decedent_name: str | None = Field(default=None, max_length=500)
+    county_code: str = Field(..., min_length=1, max_length=100)
     filing_date: date | None = None
-    county: str = Field(..., min_length=1, max_length=50)
-    filing_type: str | None = Field(default=None, max_length=200)
-    source: str = Field(default="mcro_probate", min_length=1, max_length=100)
+    decedent_name: str | None = Field(default=None, max_length=500)
+    date_of_death: date | None = None
+    personal_representative_name: str | None = Field(default=None, max_length=500)
+    case_type: str | None = Field(default=None, max_length=200)
+    case_status: str | None = Field(default=None, max_length=100)
+    has_will: bool | None = None
     raw_data: dict[str, Any] | None = None
     observed_at: datetime
+
+    # ---- Not stored in probate_cases; used for event projection ----
+    source: str = Field(default="mcro_probate", min_length=1, max_length=100)
+    severity: DistressSeverity = "medium"
 
     model_config = ConfigDict(extra="forbid")
 
     def to_event(self) -> DistressEventInsert | None:
-        """
-        Probate signals only emit events when linked to a parcel.
+        """Project into distress_events — ONLY when linked to a parcel.
 
-        Many probate filings don't have property records; we still track
-        the filing but don't create a parcel-level event.
+        Many probate filings have no property record. We still store the
+        case, but a probate signal with no parcel is not actionable and
+        must not reach the unified feed.
         """
         if not self.parcel_id:
             return None
         return DistressEventInsert(
             parcel_id=self.parcel_id,
             event_type="probate_filing",
-            event_subtype=self.filing_type,
-            event_date=self.filing_date or self.observed_at.date(),
-            severity="medium",
+            event_subtype=self.case_type,
+            # THE date rule: the true date or NULL — never a scrape-day
+            # fallback. `or self.observed_at.date()` made every daily run a
+            # "new" event and inflated Saint Paul VBR counts ~30x before
+            # 2026-07-07.
+            event_date=self.filing_date,
+            severity=self.severity,
             source=self.source,
             source_id=self.case_number,
-            title=f"Probate filing: {self.decedent_name or 'unknown'}",
-            description=f"Filing type: {self.filing_type or 'unspecified'}",
+            title=f"Probate: estate of {self.decedent_name or 'unknown'}",
+            description=(
+                f"{self.case_type or 'Probate case'}"
+                + (f", died {self.date_of_death.isoformat()}"
+                   if self.date_of_death else "")
+            ),
             raw_data=self.raw_data,
             observed_at=self.observed_at,
         )
