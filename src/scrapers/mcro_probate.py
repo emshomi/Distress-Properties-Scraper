@@ -166,12 +166,29 @@ _ESTATE_TITLE_RE = re.compile(
 )
 
 # Label-based field extraction — see "PARSING BY LABEL" above.
+#
+# FIXED 2026-08-08. The first version terminated each value at a run of two
+# or more spaces. That is wrong: BeautifulSoup's get_text("  ") separator IS
+# two spaces, so every value was cut at its first internal gap. Verified
+# against a real response — `Case Title:` truncated to "In re the Estate of",
+# losing the decedent's name entirely, which would have made _match_decedent
+# reject 100% of genuine estates.
+#
+# Each pattern now runs to the NEXT LABEL via lookahead, never to whitespace.
 _LABEL_RES = {
     "case_number": re.compile(r"Case Number:\s*(\S+)"),
-    "case_title": re.compile(r"Case Title:\s*(.+?)(?:\s{2,}|Case Type:|$)"),
-    "case_type": re.compile(r"Case Type:\s*(.+?)(?:\s{2,}|Case Location:|$)"),
-    "case_location": re.compile(r"Case Location:\s*(.+?)(?:\s{2,}|Case Status:|$)"),
-    "case_status": re.compile(r"Case Status:\s*(.+?)(?:\s{2,}|Result|$)"),
+    "case_title": re.compile(
+        r"Case Title:\s*(.+?)\s*(?=Case Type:|Case Number:|Result\s+\d+|$)", re.S
+    ),
+    "case_type": re.compile(
+        r"Case Type:\s*(.+?)\s*(?=Case Location:|$)", re.S
+    ),
+    "case_location": re.compile(
+        r"Case Location:\s*(.+?)\s*(?=Case Status:|$)", re.S
+    ),
+    "case_status": re.compile(
+        r"Case Status:\s*(.+?)\s*(?=View Case Details|Result\s+\d+|$)", re.S
+    ),
     "date_filed": re.compile(r"Date Filed:\s*(\d{1,2}/\d{1,2}/\d{4})"),
 }
 
@@ -187,6 +204,25 @@ _CAPTCHA_MARKERS = ("captcha", "unusual traffic", "are you a human",
 def _norm(s: str | None) -> str:
     """Collapse whitespace and lowercase, for comparisons."""
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _dedupe_sr(value: str | None) -> str | None:
+    """Collapse MCRO's duplicated accessibility text.
+
+    Every value is rendered twice — once `aria-hidden="true"` for sighted
+    users and once in an `sr-only` span for screen readers — so flat text
+    extraction yields "Crow Wing County  Crow Wing County". Harmless for
+    token matching, but it should not be stored that way.
+    """
+    if not value:
+        return value
+    v = re.sub(r"\s{2,}", " ", value).strip()
+    n = len(v)
+    if n % 2 == 1 and v[n // 2] == " ":
+        left, right = v[: n // 2], v[n // 2 + 1:]
+        if left == right:
+            return left
+    return v
 
 
 def _parse_mdy(value: str | None) -> date | None:
@@ -245,9 +281,18 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
     # numeric Locations id is known.
     county_code: ClassVar[str] = "crow_wing"
 
-    # Names per run. 500 at 3.5s is ~30 minutes, enough to read a hit rate
-    # without committing to the full 13,554-name county.
-    batch_size: ClassVar[int] = 500
+    # Names per run.
+    #
+    # SET TO 25 FOR DIAGNOSIS (2026-08-08). The queue is ordered by EMV
+    # descending and ANDERSON / ERIC sits 9th at $3,285,300 — a name KNOWN to
+    # return two cases in Crow Wing. So a batch of 25 takes ~90 seconds and
+    # still exercises a guaranteed-positive lookup end to end.
+    #
+    # RAISE BACK TO 500 once the first-response diagnostic in fetch() confirms
+    # the scraper is receiving real results HTML. 500 at 3.5s is ~30 minutes,
+    # which is the right size for measuring a hit rate but far too slow to
+    # debug against.
+    batch_size: ClassVar[int] = 25
 
     _rate_lock: ClassVar[threading.Lock] = threading.Lock()
     _last_request_at: ClassVar[float] = 0.0
@@ -394,7 +439,7 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
             row: dict[str, Any] = {}
             for key, pattern in _LABEL_RES.items():
                 m = pattern.search(chunk)
-                row[key] = m.group(1).strip() if m else None
+                row[key] = _dedupe_sr(m.group(1).strip()) if m else None
             if row.get("case_number"):
                 rows.append(row)
 
@@ -447,6 +492,7 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
         def _work() -> list[dict[str, Any]]:
             nonlocal names_with_any_result
             out: list[dict[str, Any]] = []
+            logged_sample = False
             with httpx.Client(follow_redirects=True) as client:
                 token = self._bootstrap(client)
                 for i, entry in enumerate(queue, start=1):
@@ -469,6 +515,35 @@ class McroProbateScraper(BaseScraper[dict[str, Any], ProbateFilingInsert]):
                             error=str(e),
                         )
                         continue
+
+                    # ---- ONE-SHOT DIAGNOSTIC ----
+                    # The 2026-08-08 pilot queried all 500 names in 1,770s and
+                    # returned ZERO cases — including ANDERSON/ERIC, which is
+                    # known to return two. The parser was later proved correct
+                    # against a saved real response, so the scraper must have
+                    # been receiving something other than results HTML: a
+                    # terms interstitial, an antiforgery rejection, a redirect
+                    # or a block page.
+                    #
+                    # This logs the shape of the FIRST response so a zero run
+                    # is diagnosable without another blind 30-minute cycle.
+                    # Body is truncated and only logged once per run.
+                    if not logged_sample:
+                        logged_sample = True
+                        snippet = re.sub(r"\s+", " ", html[:600])
+                        logger.info(
+                            "MCRO first response sample",
+                            source=self.source_name,
+                            last_name=entry["last_name"],
+                            first_name=entry["first_name"],
+                            body_length=len(html),
+                            has_results_marker=(
+                                "CaseSearchResultsTitleSection" in html
+                            ),
+                            has_result_badge=("badge-result-number" in html),
+                            has_no_results_text=(_NO_RESULTS in html.lower()),
+                            body_head=snippet,
+                        )
 
                     cases = self._parse_results(html)
                     if cases:
