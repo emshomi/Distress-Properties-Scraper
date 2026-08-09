@@ -170,10 +170,20 @@ WHERE r.promoted_at IS NULL
   -- row is USABLE, not a judgement about whether it is correct.
   AND r.parcel_id IS NOT NULL          -- resolved against core.parcels
   AND r.redemption_expiry IS NOT NULL  -- the deadline being published
-  AND r.redemption_amount IS NOT NULL
-  AND r.bid_in_date IS NOT NULL
-  AND r.delinquent_tax_year IS NOT NULL
+  AND r.redemption_amount IS NOT NULL  -- what must be paid
   AND r.confidence >= %(floor)s
+  -- bid_in_date and delinquent_tax_year are deliberately NOT required.
+  --
+  -- They are CONTEXT, not the signal. The three fields above are what the
+  -- platform needs: a parcel to attach to, a deadline, and an amount.
+  --
+  -- Measured 2026-08-09: all 7 Pope rows carry a resolved parcel_id, a
+  -- 2026-05-11 expiry, an amount and confidence 0.80-0.85, but NULL
+  -- bid_in_date and NULL delinquent_tax_year -- Pope's auditor publishes a
+  -- terser notice. Requiring them discarded $35,968 of real distress with a
+  -- live deadline because of a county's formatting choice. The extractor
+  -- returned null correctly rather than inventing the values; the gate was
+  -- wrong to treat their absence as incompleteness.
 ORDER BY r.id;
 """
 
@@ -181,12 +191,21 @@ ORDER BY r.id;
 # promoted -- a row nobody looks at is a row nobody decided about, so the
 # number is logged every run rather than left to be discovered.
 SELECT_HELD = """
+-- Every bucket below is conditioned on the rows BEFORE it passing, so the
+-- numbers sum to `held` and no reason is invisible. The first version
+-- reported four independent counts that did not add up, which is how 7
+-- resolved Pope rows appeared in no bucket at all while failing the gate.
 SELECT count(*)                                                AS held,
        count(*) FILTER (WHERE parcel_id IS NULL)               AS unresolved_parcel,
-       count(*) FILTER (WHERE confidence < %(floor)s
-                        AND parcel_id IS NOT NULL)             AS low_confidence,
-       count(*) FILTER (WHERE redemption_expiry IS NULL)       AS no_expiry,
-       count(*) FILTER (WHERE redemption_amount IS NULL)       AS no_amount
+       count(*) FILTER (WHERE parcel_id IS NOT NULL
+                        AND redemption_expiry IS NULL)         AS no_expiry,
+       count(*) FILTER (WHERE parcel_id IS NOT NULL
+                        AND redemption_expiry IS NOT NULL
+                        AND redemption_amount IS NULL)         AS no_amount,
+       count(*) FILTER (WHERE parcel_id IS NOT NULL
+                        AND redemption_expiry IS NOT NULL
+                        AND redemption_amount IS NOT NULL
+                        AND confidence < %(floor)s)            AS low_confidence
 FROM ai.extracted_redemptions
 WHERE promoted_at IS NULL
   AND review_status <> 'rejected';
@@ -253,13 +272,28 @@ def build_event(row: dict[str, Any]) -> dict[str, Any]:
 
     title = f"Redemption expires {expiry} - {amount} to redeem"
 
+    # The opening sentence is only written when the notice actually stated
+    # the bid-in date and delinquent year. Pope's notices state neither, and
+    # a sentence reading "bid in on a date stated in the notice at the tax
+    # judgment sale for delinquent taxes of year None" is worse than no
+    # sentence at all.
+    if row.get("bid_in_date") and row.get("delinquent_tax_year"):
+        opening = (
+            f"Parcel was bid in for the State of Minnesota on {bid_in} at "
+            f"the tax judgment sale for delinquent taxes of year "
+            f"{row['delinquent_tax_year']}. "
+        )
+    else:
+        opening = (
+            "Parcel was bid in for the State of Minnesota at a tax judgment "
+            "sale for delinquent taxes. "
+        )
+
     description = (
-        f"Parcel was bid in for the State of Minnesota on {bid_in} at the tax "
-        f"judgment sale for delinquent taxes of year "
-        f"{row['delinquent_tax_year']}. Per the county auditor's Notice of "
-        f"Expiration of Redemption (Minn. Stat. ch. 281), {amount} must be "
-        f"paid on or before {expiry} or the land forfeits to the State. The "
-        f"redemption expiry date is STATED BY THE COUNTY, not computed."
+        f"{opening}Per the county auditor's Notice of Expiration of "
+        f"Redemption (Minn. Stat. ch. 281), {amount} must be paid on or "
+        f"before {expiry} or the land forfeits to the State. The redemption "
+        f"expiry date is STATED BY THE COUNTY, not computed."
     )
 
     raw = {
