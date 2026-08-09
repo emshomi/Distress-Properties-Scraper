@@ -252,7 +252,25 @@ def main() -> int:
         return 1
     dry_run = os.environ.get("DRY_RUN") == "1"
 
-    floor = float(os.environ.get("CONFIDENCE_FLOOR", CONFIDENCE_FLOOR))
+    # An UNSET env var and an EMPTY one are different things, and the
+    # workflow always sets this one: leaving the optional
+    # `confidence_floor` dispatch input blank sends CONFIDENCE_FLOOR=''.
+    # os.environ.get returns '' (present but empty), the default never
+    # applies, and float('') raised ValueError on the very first run.
+    #
+    # Blank means "use the default". A malformed value warns and falls back
+    # rather than killing the job -- a typo in a dispatch box should not
+    # stop promotion.
+    raw_floor = (os.environ.get("CONFIDENCE_FLOOR") or "").strip()
+    if raw_floor:
+        try:
+            floor = float(raw_floor)
+        except ValueError:
+            log(f"WARNING: CONFIDENCE_FLOOR={raw_floor!r} is not a number; "
+                f"using the default {CONFIDENCE_FLOOR}")
+            floor = CONFIDENCE_FLOOR
+    else:
+        floor = CONFIDENCE_FLOOR
     log(f"confidence floor: {floor}")
 
     conn = psycopg2.connect(dsn)
