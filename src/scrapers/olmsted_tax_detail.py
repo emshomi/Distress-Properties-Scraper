@@ -547,17 +547,24 @@ class TylerTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                 "PIN override in effect (test mode)",
                 source=self.source_name, pins=len(pins),
             )
-            return sorted(set(pins))
-        # Filtered on `source` alone, DELIBERATELY. `source` is already
-        # per-county ('olmsted_delq_list'), so this cannot cross a county
-        # boundary. Adding a county_slug filter would return ZERO rows —
-        # county_slug is NULL on every olmsted_delq_list row (known open
-        # defect). A wrong list_source yields no pins and raises below; it
-        # cannot yield another county's pins.
+            return self._validate_pins(sorted(set(pins)))
+        # Filtered on BOTH source and county_code.
+        #
+        # `source` is per-county ('olmsted_delq_list'), so it alone cannot
+        # cross a county boundary — but the county filter is the invariant
+        # that needs no per-feed knowledge, and signals.distress_events
+        # carries county_code (text, same vocabulary as core.parcels).
+        #
+        # CORRECTION 2026-08-08: an earlier revision of this comment claimed
+        # a county filter would return zero rows because "county_slug is NULL
+        # on every olmsted_delq_list row". distress_events has NO county_slug
+        # column at all — that defect lives in a VIEW. Measured on the base
+        # table: 502 events, 0 null county_code, 0 null parcel_id.
         result = (
             signals_table("distress_events")
             .select("parcel_id")
             .eq("source", self.list_source)
+            .eq("county_code", self.county_code)
             .execute()
         )
         pins = sorted(
@@ -569,11 +576,102 @@ class TylerTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
         )
         if not pins:
             raise SourceUnavailableError(
-                f"No parcels found for source='{self.list_source}' — nothing to "
-                "scrape (was the annual list loaded?)",
+                f"No parcels found for source='{self.list_source}' "
+                f"county_code='{self.county_code}' — nothing to scrape "
+                "(was the annual list loaded?)",
                 source=self.source_name,
             )
-        return pins
+        return self._validate_pins(pins)
+
+    def _validate_pins(self, pins: list[str]) -> list[str]:
+        """Keep only PINs that exist in core.parcels for THIS county.
+
+        THIS IS AN ANTI-FABRICATION GUARD, not an optimisation.
+
+        Tyler installs do not reliably report an unknown PIN. Verified live
+        on Carver 2026-08-08: pin=999999999 returned a fully populated real
+        parcel — Class 400 CNTYWIDE TRANSMISSION/DISTRIBUTION owned by
+        NORTHERN STATES POWER CO, complete with mailing address — and the
+        `owner` datalet returned the same owner record. Not blank, not an
+        error: a clean, plausible, WRONG parcel.
+
+        _scrape_parcel's identity check cannot catch that on such an
+        install. It verifies `f"PARID: {pin}"`, which Olmsted renders in its
+        datalet header band; Carver's header errors ("Problem encountered
+        rendering the Datalet Header. No Data."), so the check falls through
+        to `pin not in overview_html` — and the PIN IS in the HTML, because
+        the page echoes the parameter we sent back in hdPin, hdXPin, gPin
+        and every sidemenu href. The scraper would report found=True and
+        write another parcel's status and owner rows under the phantom PIN.
+
+        There is no content-based discriminator: a candidate check against
+        the owner datalet was tried and it returns a full valid record for
+        the phantom too. So identity is established on OUR side, before the
+        request, against the parcel spine — and the portal is never asked
+        about a parcel we cannot independently confirm exists.
+
+        Composite key throughout: core.parcels is keyed
+        (county_code, parcel_id) and Minnesota PINs are not unique across
+        counties, so a bare parcel_id lookup would validate against the
+        wrong county's row.
+
+        Measured on Olmsted 2026-08-08: 502 of 502 PINs present, so this
+        drops nothing today. It is here for the counties where it will.
+        """
+        if not pins:
+            return pins
+
+        known: set[str] = set()
+        chunk_size = 200  # keep the PostgREST query string bounded
+        for start in range(0, len(pins), chunk_size):
+            chunk = pins[start:start + chunk_size]
+            result = (
+                core_table("parcels")
+                .select("parcel_id")
+                .eq("county_code", self.county_code)
+                .in_("parcel_id", chunk)
+                .execute()
+            )
+            known.update(
+                r["parcel_id"]
+                for r in (result.data or [])
+                if r.get("parcel_id")
+            )
+
+        valid = [p for p in pins if p in known]
+        dropped = [p for p in pins if p not in known]
+
+        if dropped:
+            # Loud, with examples, and never a silent continue.
+            logger.warning(
+                "PINs dropped: not in core.parcels for this county — "
+                "refusing to request them (the portal may answer with "
+                "another parcel)",
+                source=self.source_name,
+                county_code=self.county_code,
+                dropped=len(dropped),
+                kept=len(valid),
+                examples=dropped[:10],
+            )
+
+        if not valid:
+            raise SourceUnavailableError(
+                f"None of the {len(pins)} candidate PINs for "
+                f"county_code='{self.county_code}' exist in core.parcels — "
+                "refusing to scrape unverifiable parcels (has the parcel "
+                "spine been loaded for this county?)",
+                source=self.source_name,
+            )
+
+        logger.info(
+            "PIN universe validated against core.parcels",
+            source=self.source_name,
+            county_code=self.county_code,
+            candidates=len(pins),
+            validated=len(valid),
+            dropped=len(dropped),
+        )
+        return valid
 
     # ---- HTTP plumbing (v2: direct deep links, no browser) ----
 
