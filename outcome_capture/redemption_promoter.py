@@ -100,6 +100,54 @@ def log(msg: str) -> None:
     print(f"[redemption-promoter] {msg}", flush=True)
 
 
+RESOLVE_PARCELS = """
+-- Resolve parcel_id_raw -> core.parcels.parcel_id, county by county.
+--
+-- DIGITS ONLY. Five distinct formats have been seen in four counties and
+-- the ONLY rule that handles all of them is to discard every non-digit:
+--
+--   Crow Wing  RP 41250822     prefix + flat
+--   Le Sueur   RP 21.457.1102  prefix + dotted
+--   Crow Wing  SM 95471202     different prefix (severed mineral)
+--   Pine       08.0208.000     no prefix, dotted
+--   Pope       10-0229-102     no prefix, HYPHENATED
+--
+-- An earlier version stripped only a leading letter prefix
+-- (a leading-letter-prefix regex) and resolved 0 of 7 Pope rows.
+-- Digits-only resolved
+-- 7 of 7 on the same data.
+--
+-- Runs on EVERY invocation, not just for new rows. A county whose parcel
+-- spine is loaded later (Pine and Le Sueur each hold 2 synthetic
+-- foreclosure placeholders and no real spine) will resolve on the next run
+-- with no backfill.
+WITH resolved AS (
+  SELECT r.id, p.parcel_id AS matched
+  FROM ai.extracted_redemptions r
+  JOIN core.parcels p
+    ON p.county_code = r.county_code
+   AND p.parcel_id   = regexp_replace(r.parcel_id_raw, '[^0-9]', '', 'g')
+  WHERE r.parcel_id IS NULL
+    AND r.parcel_id_raw IS NOT NULL
+    AND r.county_code IS NOT NULL
+)
+UPDATE ai.extracted_redemptions r
+   SET parcel_id = resolved.matched
+  FROM resolved
+ WHERE r.id = resolved.id;
+"""
+
+UNRESOLVED_BY_COUNTY = """
+SELECT county_code,
+       count(*) AS unresolved
+FROM ai.extracted_redemptions
+WHERE parcel_id IS NULL
+  AND promoted_at IS NULL
+  AND review_status <> 'rejected'
+GROUP BY county_code
+ORDER BY unresolved DESC;
+"""
+
 SELECT_CANDIDATES = """
 SELECT r.id,
        r.county_code,
@@ -275,7 +323,27 @@ def main() -> int:
 
     conn = psycopg2.connect(dsn)
     try:
+        # Resolve parcels FIRST. Without this a county whose rows were
+        # staged before its spine existed would never promote, and the
+        # resolution would be a manual SQL step somebody has to remember.
+        if not dry_run:
+            with conn.cursor() as cur:
+                cur.execute(RESOLVE_PARCELS)
+                newly = cur.rowcount
+            conn.commit()
+            if newly:
+                log(f"resolved {newly} parcel_id(s) against core.parcels")
+
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(UNRESOLVED_BY_COUNTY)
+            for row in cur.fetchall():
+                # A county with many unresolved rows usually means its
+                # parcel spine has not been loaded, NOT that the ids are
+                # malformed. Pine and Le Sueur each hold 2 synthetic
+                # foreclosure placeholders in core.parcels and no spine.
+                log(f"  unresolved: {row['county_code']} x{row['unresolved']} "
+                    "(check whether this county's parcel spine is loaded)")
+
             cur.execute(SELECT_CANDIDATES, {"floor": floor})
             candidates = cur.fetchall()
 
