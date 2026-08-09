@@ -84,6 +84,7 @@ from __future__ import annotations
 import asyncio
 import calendar
 import re
+import time
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
@@ -91,17 +92,27 @@ from typing import Any, ClassVar
 import httpx
 from bs4 import BeautifulSoup
 
-from src.db.supabase_client import signals_table
-from src.scrapers.base_scraper import BaseScraper
+from src.config import settings
+from src.db.supabase_client import core_table, signals_table
+from src.scrapers.base_scraper import BaseScraper, RunResult
 from src.services.event_writer import write_typed_signals_dedup
-from src.utils.errors import SourceUnavailableError
+from src.utils.errors import (
+    ScraperAlreadyRunningError,
+    ScraperDisabledError,
+    SourceUnavailableError,
+)
 from src.utils.logger import logger
 
+# Olmsted's values remain the class defaults so the hand-written subclass
+# behaves byte-identically to the pre-registry scraper. Every one of them is
+# overridable per instance from core.vendor_portals — see from_portal_row().
 _BASE_URL = "https://publicaccess.co.olmsted.mn.us"
-_DATALET_URL = f"{_BASE_URL}/datalets/datalet.aspx"
+_DATALET_PATH = "/datalets/datalet.aspx"
 _JUR = "055"  # Olmsted County jurisdiction code (from the portal's own links)
+_LMPARENT = "20"
 _COUNTY_SLUG = "olmsted"
 _LIST_SOURCE = "olmsted_delq_list"
+_TAXYR_OFFSET = 1
 
 _REQUEST_TIMEOUT = 30.0
 _PER_PARCEL_ATTEMPTS = 4
@@ -141,12 +152,23 @@ _STATUS_LABELS = {
 _RE_YEAR = re.compile(r"^(19|20)\d{2}$")
 
 
-def assessment_year(today: date | None = None) -> int:
+def assessment_year(
+    today: date | None = None, offset: int = _TAXYR_OFFSET
+) -> int:
     """taxyr for datalet URLs. The portal's taxyr is the ASSESSMENT year
     and lags the pay year by one (verified live: taxyr=2025 -> Pay Year
-    2026 with real amounts; taxyr=2026 -> Pay Year 2027 all $.00)."""
+    2026 with real amounts; taxyr=2026 -> Pay Year 2027 all $.00).
+
+    `offset` is per-portal (core.vendor_portals.taxyr_offset) because the
+    lag is an install setting, not a Tyler-wide constant. It defaults to
+    Olmsted's verified value of 1, so calling this with no arguments is
+    unchanged from the pre-registry behaviour.
+
+    A wrong offset yields an empty or stale page for the RIGHT parcel on
+    the RIGHT host — it cannot return another county's data, which is why
+    it is a plain integer and not treated as an identifier."""
     d = today or date.today()
-    return d.year - 1
+    return d.year - offset
 
 
 # ============================================================
@@ -356,17 +378,165 @@ def _date_s(d: date | None) -> str | None:
 # ============================================================
 
 
-class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
-    """iasWorld per-parcel tax detail -> years-behind + status + owners."""
+class TylerTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
+    """Generic Tyler/iasWorld per-parcel tax detail scraper.
+
+    ONE class per VENDOR, not per county. Minnesota counties buy iasWorld
+    from Tyler rather than building their own portal, and every install
+    renders the same datalet HTML — so the parser, the quota handling and
+    the statutory forfeiture computation are shared, and only the HOST and
+    a handful of identifiers differ.
+
+    Those identifiers come from core.vendor_portals, never from a literal
+    here and never derived. A wrong `jur` silently returns ANOTHER
+    COUNTY'S data with no error, which is the same failure class as the
+    single-column parcel_id joins the composite-key migration removed.
+    The table's enabled_requires_verified_id_check constraint makes it
+    structurally impossible to enable a portal whose jur was not read off
+    that county's own URL.
+
+    NOTE on hostnames: `jur` does NOT switch counties on one host. Each
+    county runs a SEPARATE installation (publicaccess.co.olmsted.mn.us,
+    publicaccess.carvercountymn.gov, ...) holding only its own data. The
+    portal row therefore carries base_url AND jur; changing jur alone is
+    meaningless.
+    """
 
     source_name: ClassVar[str] = "olmsted_tax_detail"
     signal_type: ClassVar[str] = "tax_delinquency_detail"
     county_code: ClassVar[str] = _COUNTY_SLUG
 
-    def __init__(self, pins: list[str] | None = None) -> None:
+    # ---- Per-portal configuration (all overridable per instance) ----
+    base_url: ClassVar[str] = _BASE_URL
+    datalet_path: ClassVar[str] = _DATALET_PATH
+    jur: ClassVar[str] = _JUR
+    lmparent: ClassVar[str] = _LMPARENT
+    taxyr_offset: ClassVar[int] = _TAXYR_OFFSET
+    list_source: ClassVar[str] = _LIST_SOURCE
+
+    # Config key consulted by settings.scraper_enabled(). Empty = fall back
+    # to source_name, which is what the hand-written Olmsted subclass does —
+    # it is unaffected by this attribute existing.
+    #
+    # Registry-driven instances set it to 'tyler_tax_detail' so every Tyler
+    # county shares ONE toggle. source_name stays PER-COUNTY because
+    # audit.scraper_runs and audit.source_health key on it: a collapsed
+    # source_name would mark the whole vendor unhealthy when one county
+    # failed. Per-county control lives in core.vendor_portals.enabled — an
+    # UPDATE, not a redeploy.
+    #
+    # Same shape as MNGACParcelsScraper.enable_key, deliberately.
+    enable_key: ClassVar[str] = ""
+
+    def __init__(
+        self,
+        pins: list[str] | None = None,
+        *,
+        county_code: str | None = None,
+        source_name: str | None = None,
+        base_url: str | None = None,
+        datalet_path: str | None = None,
+        jur: str | None = None,
+        lmparent: str | None = None,
+        taxyr_offset: int | None = None,
+        list_source: str | None = None,
+        enable_key: str | None = None,
+    ) -> None:
         """pins: optional explicit PIN list (the 5-PIN test path). When
-        None, the full olmsted_delq_list parcel set is scraped."""
+        None, the full <list_source> parcel set is scraped.
+
+        Everything after `pins` is keyword-only and optional. Called with
+        no configuration — which is how the Olmsted subclass and every
+        existing runner constructs one — this is a pass-through and
+        behaviour is byte-identical to the pre-registry scraper.
+
+        When arguments ARE passed they become INSTANCE attributes, which
+        shadow the ClassVars on every `self.` lookup in this file.
+        """
         self._pins_override = pins
+        if county_code:
+            self.county_code = county_code
+        if source_name:
+            self.source_name = source_name
+        if base_url:
+            self.base_url = base_url
+        if datalet_path:
+            self.datalet_path = datalet_path
+        if jur:
+            self.jur = jur
+        if lmparent:
+            self.lmparent = lmparent
+        if taxyr_offset is not None:
+            self.taxyr_offset = taxyr_offset
+        if list_source:
+            self.list_source = list_source
+        if enable_key is not None:
+            self.enable_key = enable_key
+
+    # ---- Registry ----
+
+    @classmethod
+    def from_portal_row(
+        cls, row: dict[str, Any], pins: list[str] | None = None
+    ) -> "TylerTaxDetailScraper":
+        """Build a scraper for one core.vendor_portals row.
+
+        Raises rather than substituting a default when an identifier is
+        absent: a portal row with no `jur` must not silently fall back to
+        Olmsted's 055 and scrape Olmsted under another county's name.
+        """
+        county = str(row["county_code"])
+        vendor = str(row["vendor"])
+        if vendor != "tyler":
+            raise ValueError(
+                f"vendor_portals row for '{county}' is vendor={vendor!r}, "
+                "not 'tyler' — wrong scraper for this portal"
+            )
+        ids = row.get("vendor_ids") or {}
+        jur = ids.get("jur")
+        if not jur:
+            raise ValueError(
+                f"vendor_portals row for '{county}' has no verified 'jur' "
+                "in vendor_ids — refusing to guess a jurisdiction id"
+            )
+        base_url = str(row["base_url"]).rstrip("/")
+        prefix = str(row.get("app_prefix") or "").rstrip("/")
+        return cls(
+            pins=pins,
+            county_code=county,
+            source_name=f"{county}_tax_detail",
+            base_url=base_url,
+            datalet_path=f"{prefix}{_DATALET_PATH}",
+            jur=str(jur),
+            lmparent=str(ids.get("LMparent") or _LMPARENT),
+            taxyr_offset=int(row.get("taxyr_offset") or _TAXYR_OFFSET),
+            list_source=f"{county}_delq_list",
+            enable_key="tyler_tax_detail",
+        )
+
+    @staticmethod
+    def load_enabled_portals() -> list[dict[str, Any]]:
+        """Enabled Tyler rows from core.vendor_portals.
+
+        `enabled` can only be true when the row carries a verified_url
+        containing both its own host and its own jur — enforced by the
+        table's check constraint, not by this code.
+        """
+        result = (
+            core_table("vendor_portals")
+            .select(
+                "county_code,vendor,base_url,app_prefix,vendor_ids,"
+                "taxyr_offset,enabled"
+            )
+            .eq("vendor", "tyler")
+            .eq("enabled", True)
+            .execute()
+        )
+        return list(result.data or [])
+
+    @property
+    def datalet_url(self) -> str:
+        return f"{self.base_url}{self.datalet_path}"
 
     # ---- PIN universe ----
 
@@ -378,10 +548,16 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                 source=self.source_name, pins=len(pins),
             )
             return sorted(set(pins))
+        # Filtered on `source` alone, DELIBERATELY. `source` is already
+        # per-county ('olmsted_delq_list'), so this cannot cross a county
+        # boundary. Adding a county_slug filter would return ZERO rows —
+        # county_slug is NULL on every olmsted_delq_list row (known open
+        # defect). A wrong list_source yields no pins and raises below; it
+        # cannot yield another county's pins.
         result = (
             signals_table("distress_events")
             .select("parcel_id")
-            .eq("source", _LIST_SOURCE)
+            .eq("source", self.list_source)
             .execute()
         )
         pins = sorted(
@@ -393,7 +569,7 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
         )
         if not pins:
             raise SourceUnavailableError(
-                f"No parcels found for source='{_LIST_SOURCE}' — nothing to "
+                f"No parcels found for source='{self.list_source}' — nothing to "
                 "scrape (was the annual list loaded?)",
                 source=self.source_name,
             )
@@ -401,22 +577,23 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
 
     # ---- HTTP plumbing (v2: direct deep links, no browser) ----
 
-    @staticmethod
-    def _datalet_params(mode: str, pin: str, taxyr: int) -> dict[str, str]:
+    def _datalet_params(
+        self, mode: str, pin: str, taxyr: int
+    ) -> dict[str, str]:
         return {
             "mode": mode,
             "UseSearch": "no",
             "pin": pin,
-            "jur": _JUR,
+            "jur": self.jur,
             "taxyr": str(taxyr),
-            "LMparent": "20",
+            "LMparent": self.lmparent,
         }
 
     async def _get_datalet(
         self, client: httpx.AsyncClient, mode: str, pin: str, taxyr: int
     ) -> str:
         resp = await client.get(
-            _DATALET_URL, params=self._datalet_params(mode, pin, taxyr)
+            self.datalet_url, params=self._datalet_params(mode, pin, taxyr)
         )
         # iasWorld's rolling request quota redirects to OverLimit.aspx
         # (which then 404s). That's a rate limit, not a parcel problem.
@@ -452,11 +629,70 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
             "owner_html": owner_html,
         }
 
+    # ---- Lifecycle: run gate ----
+
+    async def run(
+        self,
+        *,
+        trigger: str = "scheduler",
+        metadata: dict[str, Any] | None = None,
+    ) -> RunResult:
+        """Same lifecycle as BaseScraper.run(), gated on enable_key.
+
+        enable_key, not source_name: registry-driven instances all gate on
+        a single 'tyler_tax_detail' toggle while keeping a per-county
+        source_name for audit/health provenance. Empty enable_key =>
+        source_name, which is exactly what the Olmsted subclass does today.
+
+        `with`, NOT `async with`. _class_lock is a threading.Lock (changed
+        2026-08-02 — runs are dispatched to worker threads, where an
+        asyncio.Lock guards nothing). MNGACParcelsScraper overrode run()
+        and kept the old `async with`, which raised
+
+            TypeError: '_thread.lock' object does not support the
+            asynchronous context manager protocol
+
+        and broke every MNGAC subclass for three days. Overriding run()
+        means owning that detail.
+
+        NOTE: _class_lock is per SUBCLASS. All registry-driven instances
+        are the same class, so counties serialise behind one lock. That is
+        acceptable here — the quota is per-host and a single county's run
+        already rests 300s every 40 parcels — but it is a real property,
+        not an accident.
+        """
+        start_time = time.monotonic()
+        enable_name = self.enable_key or self.source_name
+
+        if not settings.scraper_enabled(enable_name):
+            if trigger == "manual":
+                raise ScraperDisabledError(
+                    f"Scraper '{enable_name}' is disabled in settings",
+                    source=self.source_name,
+                )
+            return RunResult(
+                scraper_name=self.source_name,
+                run_id=None,
+                status="skipped",
+                duration_seconds=0.0,
+                error_message="Scraper disabled in settings",
+            )
+
+        if self._class_lock.locked():
+            raise ScraperAlreadyRunningError(
+                f"Scraper '{self.source_name}' is already running",
+                source=self.source_name,
+                context={"scraper_name": self.source_name},
+            )
+
+        with self._class_lock:
+            return await self._run_locked(trigger, metadata, start_time)
+
     # ---- Lifecycle: fetch / parse / write ----
 
     async def fetch(self, trigger: str) -> list[dict[str, Any]]:
         pins = self._load_pins()
-        taxyr = assessment_year()
+        taxyr = assessment_year(offset=self.taxyr_offset)
         logger.info(
             "Tyler-portal scrape starting",
             source=self.source_name, parcels=len(pins), taxyr=taxyr,
@@ -595,7 +831,7 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                 delq_norm.append(norm)
                 detail.append({
                     "parcel_id": pin,
-                    "county_slug": _COUNTY_SLUG,
+                    "county_slug": self.county_code,
                     "pay_year": norm["pay_year"],
                     "row_kind": "delinquent",
                     "base_taxes": _money_f(norm["base_taxes"]),
@@ -638,7 +874,7 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                     have_current = True
                 detail.append({
                     "parcel_id": pin,
-                    "county_slug": _COUNTY_SLUG,
+                    "county_slug": self.county_code,
                     "pay_year": year,
                     "row_kind": "current",
                     "base_taxes": _money_f(_sum("base_taxes")),
@@ -682,7 +918,7 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
 
             status_row = {
                 "parcel_id": pin,
-                "county_slug": _COUNTY_SLUG,
+                "county_slug": self.county_code,
                 "first_delinquent_year": first_delq_year,
                 "years_delinquent": len(unpaid_years),
                 "total_delinquent_due": _money_f(total_delq_due),
@@ -759,4 +995,30 @@ class OlmstedTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
         return status_new, 0, detail_failed + status_failed + missing
 
 
-__all__ = ["OlmstedTaxDetailScraper"]
+class OlmstedTaxDetailScraper(TylerTaxDetailScraper):
+    """Olmsted County, the hand-written Tyler portal instance.
+
+    Kept as a named subclass so every existing import, runner, workflow
+    and _SCRAPER_REGISTRY entry continues to resolve unchanged. It sets
+    ClassVars only and passes no configuration, so its behaviour is
+    byte-identical to the pre-registry scraper: same host, same jur=055,
+    same taxyr = year - 1, same source_name, and enable_key empty so it
+    still gates on scraper_olmsted_tax_detail_enabled.
+
+    Being a distinct subclass also gives it its OWN _class_lock, so a
+    scheduled Olmsted run and a registry-driven run of another county do
+    not contend.
+    """
+
+    source_name: ClassVar[str] = "olmsted_tax_detail"
+    county_code: ClassVar[str] = _COUNTY_SLUG
+    base_url: ClassVar[str] = _BASE_URL
+    datalet_path: ClassVar[str] = _DATALET_PATH
+    jur: ClassVar[str] = _JUR
+    lmparent: ClassVar[str] = _LMPARENT
+    taxyr_offset: ClassVar[int] = _TAXYR_OFFSET
+    list_source: ClassVar[str] = _LIST_SOURCE
+    enable_key: ClassVar[str] = ""
+
+
+__all__ = ["TylerTaxDetailScraper", "OlmstedTaxDetailScraper"]
