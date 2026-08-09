@@ -216,6 +216,30 @@ class Settings(BaseSettings):
     # because a deploy happened. Set it true deliberately when loading.
     scraper_mngeo_parcels_enabled: bool = Field(default=False)
 
+    # ADDED 2026-08-08 — Tyler/iasWorld portal tax detail, vendor-grouped.
+    #
+    # ONE field for every Tyler county, the same shape as
+    # scraper_mngeo_parcels_enabled above and for the same reason. Counties
+    # buy iasWorld from Tyler rather than building their own portal, so one
+    # scraper class serves all of them; a field per county would re-create
+    # the artefact multiplication core.vendor_portals was built to remove.
+    #
+    # source_name stays PER-COUNTY ('olmsted_tax_detail',
+    # 'carver_tax_detail') because audit.scraper_runs and
+    # audit.source_health key on it — a collapsed source_name would mark
+    # the whole vendor unhealthy when one county failed.
+    #
+    # Per-county control lives in core.vendor_portals.enabled, which cannot
+    # be set true without a verified_url containing that county's own host
+    # and its own jur (check constraint, not code). Turning a county on is
+    # an UPDATE, not a redeploy.
+    #
+    # Defaults FALSE: a portal row landing in the registry should not start
+    # hitting a county's server because a deploy happened. The hand-written
+    # OlmstedTaxDetailScraper is unaffected — its enable_key is empty, so it
+    # still gates on scraper_olmsted_tax_detail_enabled.
+    scraper_tyler_tax_detail_enabled: bool = Field(default=False)
+
     # ----- Scraper behavior -----
 
     scraper_request_timeout_seconds: int = Field(
