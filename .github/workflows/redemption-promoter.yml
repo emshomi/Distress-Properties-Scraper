@@ -1,0 +1,59 @@
+name: Redemption Notice Promoter
+# Promotes ai.extracted_redemptions into signals.distress_events.
+#
+# ADDED 2026-08-09. Foreclosure extractions are promoted ONE AT A TIME by a
+# human through POST /extractions/approve (417 of 434 were). That gate is
+# right for a few notices a day and wrong for this feed: one Crow Wing
+# publication staged 144 parcels, and the 25 remaining zero-signal counties
+# will stage thousands on their first sweep. Nobody clicks approve 3,000
+# times, so the realistic outcomes are that promotion silently never happens
+# — the hennepin_tax_roll failure, a working source disabled for months with
+# nobody deciding to disable it — or that someone bulk-approves without
+# looking, which is worse because it launders unreviewed rows as reviewed.
+#
+# So this promotes on OBJECTIVE COMPLETENESS (resolved parcel_id, county
+# stated expiry, amount, bid-in date, delinquent year, confidence >= 0.80)
+# and leaves everything else in the human queue. The held count and its
+# reasons are logged every run.
+#
+# NO SCHEDULE YET — deliberately. This runs on manual dispatch only until a
+# real run has been watched end to end. The cron is added afterwards, in a
+# separate commit, so a first-run problem surfaces while someone is looking
+# rather than at 07:00 on a Sunday.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Set to 1 to preview counts without writing'
+        required: false
+        default: '0'
+      confidence_floor:
+        description: 'Override the promotion confidence floor (default 0.80)'
+        required: false
+        default: ''
+jobs:
+  promote:
+    name: Promote staged redemption notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      # Same reasoning as redemption-builder.yml: outcome_capture/ scripts
+      # talk to Postgres directly via psycopg2 and do not use the FastAPI
+      # service's dependency set. requirements.txt has no Postgres driver
+      # because the service uses PostgREST.
+      - name: Install Python dependencies
+        run: pip install psycopg2-binary
+      - name: Promote redemption notices
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          CONFIDENCE_FLOOR: ${{ inputs.confidence_floor }}
+        run: |
+          python outcome_capture/redemption_promoter.py
