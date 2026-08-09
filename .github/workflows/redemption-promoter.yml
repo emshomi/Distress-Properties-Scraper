@@ -16,10 +16,12 @@ name: Redemption Notice Promoter
 # and leaves everything else in the human queue. The held count and its
 # reasons are logged every run.
 #
-# NO SCHEDULE YET — deliberately. This runs on manual dispatch only until a
-# real run has been watched end to end. The cron is added afterwards, in a
-# separate commit, so a first-run problem surfaces while someone is looking
-# rather than at 07:00 on a Sunday.
+# Scheduled daily at 12:30 UTC only AFTER a manual dispatch ran green on
+# 2026-08-09 (run #2: floor 0.8, 0 candidates, 6 held, exit 0). Run #1
+# failed on a blank confidence_floor input — an EMPTY env var is present,
+# so os.environ.get returned '' rather than the default and float('')
+# raised. Fixed in redemption_promoter.py; the point of dispatching first
+# was to find exactly that while someone was watching.
 on:
   workflow_dispatch:
     inputs:
@@ -31,6 +33,15 @@ on:
         description: 'Override the promotion confidence floor (default 0.80)'
         required: false
         default: ''
+  schedule:
+    # Daily at 12:30 UTC = 7:30am Central (standard) / 6:30am (DST).
+    #
+    # Sits between the local mnpublicnotice scrape (07:00 Central, on the
+    # residential machine that feed requires because the Railway datacenter
+    # IP is blocked) and redemption-builder.yml at 12:40 UTC. Notices staged
+    # this morning therefore become distress events before the builder runs,
+    # so nothing waits a day in staging.
+    - cron: '30 12 * * *'
 jobs:
   promote:
     name: Promote staged redemption notices
