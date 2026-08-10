@@ -636,6 +636,36 @@ WHERE NOT (outcomes.redemption_tracker.period_source = 'scraped'
 """
 
 
+PRUNE_ORPHANED_TAX_SQL = """
+-- Remove tax-forfeiture tracker rows whose source event no longer exists.
+--
+-- ADDED 2026-08-10. The builder UPSERTS and never deleted anything, so a
+-- tracker row outlived its source event forever, carrying whatever date it
+-- had at the time.
+--
+-- That is not hypothetical. 13 Jackson events were found carrying a
+-- FABRICATED expiry (2026-05-11 / 2026-05-12 — the second Monday in May,
+-- COMPUTED from a statutory condition; the notice actually states "on or
+-- before February 28th, 2026" and the string "May 11, 2026" appears nowhere
+-- in it). The events were deleted and the builder re-run — and 12 tracker
+-- rows survived the rebuild, still publishing the fabricated deadlines.
+--
+-- A wrong forfeiture date that persists because nothing removes it is the
+-- same failure this file already has a history of.
+--
+-- SCOPED TO anchor_type='tax_judgment_sale' ONLY. The sheriff-sale leg has
+-- its own lifecycle (skipped_scheduled, sale-not-held, future sale dates)
+-- and rows there may legitimately outlive a source row in ways not
+-- established here. Do not widen this without establishing that first.
+DELETE FROM outcomes.redemption_tracker t
+WHERE t.anchor_type = 'tax_judgment_sale'
+  AND t.source_table = 'signals.distress_events'
+  AND NOT EXISTS (
+        SELECT 1 FROM signals.distress_events d
+         WHERE d.id = t.source_id);
+"""
+
+
 def main() -> int:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -672,12 +702,22 @@ def main() -> int:
             return 0
 
         written = 0
+        pruned = 0
         with conn.cursor() as cur:
             for r in rows:
                 cur.execute(UPSERT_SQL, r)
                 written += cur.rowcount
+
+            # Prune AFTER the upsert and in the SAME transaction, so a row
+            # re-derived by this run is present before the orphan check and
+            # cannot be deleted and re-created.
+            cur.execute(PRUNE_ORPHANED_TAX_SQL)
+            pruned = cur.rowcount
         conn.commit()
         log(f"upserted {written} tracker rows")
+        if pruned:
+            log(f"pruned {pruned} tax-forfeiture row(s) whose source event "
+                "no longer exists")
         return 0
     except Exception as e:
         conn.rollback()
