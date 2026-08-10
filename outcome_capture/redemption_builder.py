@@ -2,11 +2,34 @@
 Redemption tracker builder.
 
 Populates outcomes.redemption_tracker from distress signals — one row per
-foreclosed property, carrying the date its redemption window closes. That
+property in a redemption window, carrying the date that window closes. That
 date is the single most consequential fact Govire publishes to a homeowner:
 it is the day they lose the right to save their home.
 
 Run: python outcome_capture/redemption_builder.py
+
+=== TWO STATUTORY TRACKS (second added 2026-08-10) ===
+1. MORTGAGE FORECLOSURE (Minn. Stat. 580/582) — event_type='sheriff_sale'.
+   anchor_type='sheriff_sale', anchor is the sale date, and the expiry is
+   derived through the precedence ladder below.
+
+2. TAX FORFEITURE (Minn. Stat. ch. 281) — event_type='tax_forfeiture_
+   redemption', from county auditors' Notices of Expiration of Redemption
+   scraped by mnpublicnotice and promoted by redemption_promoter.py.
+   anchor_type='tax_judgment_sale', period_source='county_stated'.
+
+   NOTHING IS DERIVED for these. The county published the expiry date and it
+   is stored untouched. The ladder does not apply because there is nothing
+   to fall back TO — and this file's own history is the argument for that
+   restraint.
+
+   The anchor is the bid-in date when the county states one and the EXPIRY
+   ITSELF when it does not. Measured 2026-08-10: only 151 of 288 events
+   carry a bid-in date (crow_wing 138, jackson 13); nine counties publish a
+   terser notice. anchor_date is NOT NULL and part of the fact key, so those
+   rows anchor on a real published date rather than a NULL or an invented
+   one, with redemption_period_months left NULL to show no period was ever
+   stated.
 
 === WHY THIS FILE EXISTS (2026-07-28) ===
 The tracker held 1,088 rows and NOTHING IN THE REPO POPULATED IT. Not a
@@ -299,6 +322,8 @@ def build_rows(conn) -> list[dict[str, Any]]:
     skipped_future_anchor = 0
     skipped_no_redemption = 0
     skipped_no_date = 0
+    tax_rows = 0
+    skipped_anchor_after_expiry = 0
     today = date.today()
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -397,8 +422,92 @@ def build_rows(conn) -> list[dict[str, Any]]:
                 "redemption_expiry_date": expiry,
             })
 
+        # --- 2. tax-forfeiture redemption signals ------------------------
+        #
+        # ADDED 2026-08-10. Minn. Stat. ch. 281 Notices of Expiration of
+        # Redemption, scraped from mnpublicnotice and promoted by
+        # outcome_capture/redemption_promoter.py.
+        #
+        # A DIFFERENT STATUTORY TRACK from everything above. These parcels
+        # were bid in for the State at a TAX JUDGMENT SALE (ch. 281), not
+        # sold at a mortgage foreclosure sheriff's sale (ch. 580/582). Hence
+        # anchor_type='tax_judgment_sale' — forcing 'sheriff_sale' onto them
+        # would make every row in this table ambiguous about which law it
+        # describes.
+        #
+        # NOTHING IS COMPUTED HERE. The expiry is the date the county
+        # auditor PUBLISHED, carried on de.event_date, and it goes in
+        # untouched. There is no precedence ladder for these rows because
+        # there is nothing to fall back to: this file's own history is 193
+        # Hennepin rows contradicting a county's published date by up to 375
+        # days, one of them belonging to an owner who redeemed on a day the
+        # tracker said had passed. period_source='county_stated' marks that
+        # distinction — it is stronger than 'scraped', which means a period
+        # was scraped and an expiry derived from it.
+        cur.execute(
+            """
+            SELECT de.id, de.source, de.parcel_id, de.county_code,
+                   de.event_date, de.raw_data
+            FROM signals.distress_events de
+            WHERE de.event_type = 'tax_forfeiture_redemption'
+              AND de.event_date IS NOT NULL
+              AND de.county_code IS NOT NULL
+              AND de.parcel_id IS NOT NULL
+            """
+        )
+        for r in cur.fetchall():
+            raw = r["raw_data"] or {}
+
+            expiry = _as_date(r["event_date"])
+            if not expiry:
+                skipped_no_date += 1
+                continue
+
+            # ANCHOR: the bid-in date when the county publishes one, the
+            # expiry itself when it does not.
+            #
+            # Measured 2026-08-10: only 151 of 288 events carry a bid-in
+            # date — Crow Wing 138 and Jackson 13. The other NINE counties
+            # publish a terser notice that never states it. anchor_date is
+            # NOT NULL and is part of the fact key
+            # (county_code, parcel_id, anchor_date), so those rows need an
+            # anchor that is a REAL PUBLISHED DATE rather than a NULL or a
+            # computed one.
+            #
+            # Falling back to the expiry is honest: the row then says "this
+            # window ends on the date the county published", and
+            # redemption_period_months is left NULL because no period was
+            # ever stated or derived. It is not a claim about when the tax
+            # judgment sale happened.
+            anchor = _as_date(raw.get("bid_in_date")) or expiry
+
+            # A window cannot end before it opens. Mirrors GUARD 2 above.
+            if anchor > expiry:
+                skipped_anchor_after_expiry += 1
+                continue
+
+            rows.append({
+                "county_code": r["county_code"],
+                "parcel_id": r["parcel_id"],
+                "source_table": "signals.distress_events",
+                "source_id": r["id"],
+                "anchor_date": anchor,
+                "anchor_type": "tax_judgment_sale",
+                # NULL, not 0, when the anchor IS the expiry: no period was
+                # stated and none was computed, and 0 would read as a
+                # same-day window.
+                "redemption_period_months": (
+                    _months_between(anchor, expiry) if anchor != expiry
+                    else None),
+                "period_source": "county_stated",
+                "redemption_expiry_date": expiry,
+            })
+            tax_rows += 1
+
     log(f"derived {len(rows)} rows "
-        f"(skipped: {skipped_scheduled} anoka-pending, "
+        f"({tax_rows} tax-forfeiture; skipped: "
+        f"{skipped_anchor_after_expiry} anchor-after-expiry, "
+        f"{skipped_scheduled} anoka-pending, "
         f"{skipped_unheld_status} sale-not-held, "
         f"{skipped_future_anchor} future sale date, "
         f"{skipped_no_redemption} no-redemption-right, "
