@@ -333,7 +333,15 @@ def build_event(row: dict[str, Any]) -> dict[str, Any]:
     )
 
     raw = {
-        "bid_in_date": str(row["bid_in_date"]),
+        # isoformat() only when the value EXISTS. str(None) is the string
+        # "None", and that is exactly what shipped: 137 events across 9
+        # counties stored bid_in_date="None" in raw_data. It made
+        # `raw_data->>'bid_in_date' IS NOT NULL` report 288 anchors when the
+        # real number was 151, and it stores a value that reads like data.
+        # Pope, Lake and seven other counties simply do not publish a bid-in
+        # date; null is the correct answer for them.
+        "bid_in_date": (row["bid_in_date"].isoformat()
+                        if row.get("bid_in_date") else None),
         "delinquent_tax_year": row["delinquent_tax_year"],
         "parcel_id_raw": row["parcel_id_raw"],
         "owner_name": row["owner_name"],
