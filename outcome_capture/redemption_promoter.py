@@ -23,7 +23,42 @@ for the human queue. The gate stays meaningful because it holds exactly the
 rows that need a person, and the queue stays a size a person will actually
 work.
 
-=== WHY THE CONFIDENCE FLOOR IS 0.80 ===
+=== WHY CONFIDENCE IS NOT A GATE (changed 2026-08-09) ===
+It was, at >= 0.80, and the floor was measured rather than guessed. It is
+gone because the score turned out to mean different things in different
+counties, and the completeness checks it sat beside are objective while it
+is not.
+
+The evidence that removed it:
+
+  Lake County, 64 parcels, ALL scored EXACTLY 0.65 -- not a range, one
+  value stamped on every record. Every extraction_note read "No bid-in date
+  or delinquent tax year provided in document". Owner, parcel id, amount and
+  expiry were present and correct on all 64. The score was describing the
+  county's terse notice format, not the extraction, and it does not vary per
+  parcel there at all.
+
+  A prompt fix was tried first, instructing the model not to lower
+  confidence for fields ABSENT FROM THE SOURCE. Re-extraction moved Lake
+  from 0.63 to a flat 0.65. The instruction did not change the behaviour,
+  because the model is not scoring per parcel in that document to begin
+  with.
+
+  Measured at the moment of the change: 47 rows were resolved, complete
+  (parcel + expiry + amount) and held ONLY by the floor.
+
+Compare Crow Wing, where the score DID vary (0.5-0.95) and correlated with
+resolution failures. A gate that works on one county's scoring behaviour and
+is a constant in another is not measuring what it claims to.
+
+confidence is still WRITTEN to every row and still logged, and it remains
+useful for triaging the review queue. It just cannot decide whether a
+complete, resolved, county-stated deadline reaches the platform.
+
+=== WHAT STILL GATES ===
+Three objective, checkable facts: a resolved parcel_id, a redemption_expiry,
+and a redemption_amount. A row missing any of them is not usable, and that
+is verifiable without trusting a model's self-report.
 Measured on the first 144 Crow Wing rows, not chosen for roundness:
 
   confidence >= 0.80 :  95 rows,  95 resolved to core.parcels,  0 failures
@@ -171,7 +206,7 @@ WHERE r.promoted_at IS NULL
   AND r.parcel_id IS NOT NULL          -- resolved against core.parcels
   AND r.redemption_expiry IS NOT NULL  -- the deadline being published
   AND r.redemption_amount IS NOT NULL  -- what must be paid
-  AND r.confidence >= %(floor)s
+  -- CONFIDENCE IS NO LONGER PART OF THE GATE. See the module docstring.
   -- bid_in_date and delinquent_tax_year are deliberately NOT required.
   --
   -- They are CONTEXT, not the signal. The three fields above are what the
@@ -202,10 +237,11 @@ SELECT count(*)                                                AS held,
        count(*) FILTER (WHERE parcel_id IS NOT NULL
                         AND redemption_expiry IS NOT NULL
                         AND redemption_amount IS NULL)         AS no_amount,
+       -- Reported for visibility only; NOT a reason a row is held.
        count(*) FILTER (WHERE parcel_id IS NOT NULL
                         AND redemption_expiry IS NOT NULL
                         AND redemption_amount IS NOT NULL
-                        AND confidence < %(floor)s)            AS low_confidence
+                        AND confidence < %(floor)s)            AS below_floor_promoted_anyway
 FROM ai.extracted_redemptions
 WHERE promoted_at IS NULL
   AND review_status <> 'rejected';
@@ -387,7 +423,7 @@ def main() -> int:
         log(f"{len(candidates)} row(s) meet the promotion gate")
         log(f"review queue: {held.get('held', 0)} held "
             f"(unresolved_parcel={held.get('unresolved_parcel', 0)}, "
-            f"low_confidence={held.get('low_confidence', 0)}, "
+            f"below_floor_but_promoted={held.get('below_floor_promoted_anyway', 0)}, "
             f"no_expiry={held.get('no_expiry', 0)}, "
             f"no_amount={held.get('no_amount', 0)})")
 
