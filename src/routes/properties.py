@@ -2688,6 +2688,45 @@ async def covered_counties() -> dict[str, Any]:
             detail="County coverage registry unavailable",
         )
 
+    # Per-category breakdown, so the UI can tell a user WHICH signal type a
+    # county's data sits under.
+    #
+    # ADDED 2026-08-11, purely ADDITIVE — slug/name/count are unchanged, so
+    # the county dropdown that reads them cannot be affected.
+    #
+    # The problem it solves: the data page opens on Foreclosure sales. A user
+    # selecting Rock saw an empty table, with no way to know Rock holds 23
+    # tax-forfeiture redemptions one tab over. Five tabs meant five guesses.
+    #
+    # NOTE the totals will NOT sum to `count`. Hennepin has 6,488 events but
+    # 5,184 across the five categories — the 1,304 mpls_311 code violations
+    # belong to no category yet. Reporting an uncategorised count here would
+    # send users hunting for a tab that does not exist, so only categorised
+    # events appear in this breakdown.
+    cat_by_slug: dict[str, dict[str, int]] = {}
+    try:
+        cats = (
+            signals_table("county_category_counts")
+            .select("*")
+            .execute()
+        )
+        for row in (cats.data or []):
+            cslug = row.get("county_slug")
+            if not cslug:
+                continue
+            cat_by_slug[cslug] = {
+                k: (row.get(k) or 0)
+                for k in ("foreclosure", "tax_forfeit", "vacant",
+                          "tax_delinquent", "tax_assessment")
+            }
+    except Exception as e:
+        # Degrade quietly: without this the UI simply keeps its old, less
+        # helpful empty-state wording. It is not worth failing the dropdown.
+        logger.warning(
+            "county category counts unavailable",
+            error_type=type(e).__name__,
+        )
+
     counties: list[dict[str, Any]] = []
     for r in rows:
         slug = r.get("county_slug")
@@ -2702,6 +2741,7 @@ async def covered_counties() -> dict[str, Any]:
                 slug, slug.replace("_", " ").title()
             ),
             "count": count,
+            "categories": cat_by_slug.get(slug),
         })
 
     counties.sort(key=lambda c: c["name"])
