@@ -394,6 +394,20 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
 
             signals.append(DistressEventInsert(
                 parcel_id=parcel_id,
+                # ADDED 2026-08-10. This scraper builds DistressEventInsert
+                # DIRECTLY (no to_event() projection), so it must set
+                # county_code itself -- it was set on the ParcelUpsert below
+                # but never on the event.
+                #
+                # A NULL county_code leaves the composite FK
+                # (county_code, parcel_id) -> core.parcels UNENFORCED and
+                # makes distress_events_dedup_key unable to collide, because
+                # NULL is not equal to anything.
+                #
+                # Measured 2026-08-10: 10 Hennepin events carried NULL and
+                # were exact duplicates of rows that already existed with the
+                # county set -- the dedup key should have refused every one.
+                county_code=self.county_code,
                 event_type="sheriff_sale",
                 event_subtype="completed_sale",
                 event_date=sale_date,
