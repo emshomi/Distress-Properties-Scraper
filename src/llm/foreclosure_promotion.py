@@ -179,9 +179,57 @@ def _parse_sale_time(text: Optional[str]) -> Optional[str]:
     return f"{hh:02d}:{mm:02d}:00"
 
 
-def _synthetic_pid(county: Optional[str], source_id: str) -> str:
-    """'SCOTT-FC-24-117341' — mirrors the existing 'HENNEPIN-FC-2506001'
-    synthetic-parcel convention for sheriff rows."""
+def _pid_digits(value: Any) -> Optional[str]:
+    """Digits of a parcel identifier, or None if too few to be one.
+
+    Counties print PIDs in incompatible shapes for the SAME spine value:
+    Wright '155-154-004010', Beltrami '83.00180.00', Dakota
+    '42-42800-01-071'. Digits-only is the form that matches, verified
+    2026-08-10: exact match resolved 47 of 217 notices, digits-only
+    resolved 185.
+
+    The 6-digit floor rejects fragments. Measured example: cass '45-118'
+    yields 5 digits and is not a whole PID -- matching on it could hit an
+    unrelated parcel.
+    """
+    if value is None:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    return digits if len(digits) >= 6 else None
+
+
+def _synthetic_pid(
+    county: Optional[str],
+    source_id: str,
+    real_pid: Optional[str] = None,
+    sale_date: Optional[Any] = None,
+) -> str:
+    """Synthetic parcel key for a notice whose parcel is NOT in the spine.
+
+    'SCOTT-FC-24-117341' — mirrors the existing 'HENNEPIN-FC-2506001'
+    synthetic-parcel convention for sheriff rows.
+
+    CHANGED 2026-08-10. This used source_id alone, and source_id falls back
+    to `ef-{extraction id}` whenever a notice carries no attorney file
+    number. Minnesota requires a foreclosure notice to run SIX CONSECUTIVE
+    WEEKS (Minn. Stat. 580.03), so the same sale is extracted again every
+    week with a NEW extraction id -- and therefore a new source_id, a new
+    synthetic parcel, and a new distress event.
+
+    Measured live: 289 mnpublicnotice sheriff_sale rows were 219 distinct
+    properties. 68 duplicate rows, 24% inflation. 4318 Harvest Court,
+    Monticello (wright 155-154-004010, sale 2026-09-02, $16,380.98)
+    appeared NINETEEN times.
+
+    Keying on (county, parcel digits, sale date) is stable across every
+    republication of one sale, so the idempotency guard catches it. Where
+    the notice has no usable PID we keep the old source_id form -- there is
+    nothing more stable to use, and inventing one would merge sales that are
+    genuinely different.
+    """
+    digits = _pid_digits(real_pid)
+    if digits and sale_date:
+        return f"{_county_upper(county)}-FC-{digits}-{sale_date}"
     return f"{_county_upper(county)}-FC-{source_id}"
 
 
@@ -229,10 +277,35 @@ def derive_source_id(extracted: dict[str, Any]) -> str:
     return f"ef-{extracted.get('id')}"
 
 
-def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
+def build_promotion_rows(
+    extracted: dict[str, Any],
+    resolved_parcel_id: Optional[str] = None,
+) -> dict[str, Any]:
     """Given an ai.extracted_foreclosures record (as a dict), build the target
     rows. Returns {'source_id', 'parcel_row', 'distress_event', 'sheriff_sale'}.
-    Pure — no DB access."""
+    Pure — no DB access.
+
+    resolved_parcel_id: the REAL core.parcels.parcel_id when the notice's PID
+    was found in that county's spine. The caller does that lookup (it needs
+    the DB; this module stays pure) and passes the result in.
+
+    ADDED 2026-08-10. When supplied, the event hangs off the real parcel
+    instead of a synthetic stub, which does three things at once:
+
+      1. Republication collapses — same parcel, same sale date.
+      2. The row INHERITS market value, coordinates, address, owner and lot
+         size from the spine. That is why Beltrami rows render as em-dashes
+         today while Hennepin rows show $344,800: a synthetic stub has none
+         of it, and never will.
+      3. No synthetic parcel is minted, so core.parcels stops accumulating
+         one stub per notice.
+
+    Measured 2026-08-10: 185 of 217 distinct notices resolve. Of the 32 that
+    do not, several are counties with NO spine at all (beltrami holds 2 rows,
+    both synthetic; redwood holds 1) and some are two-parcel notices whose
+    PID field reads '505-0015-04912 and 505-0015-04913'. Those keep the
+    synthetic path and behave exactly as they do now.
+    """
     county = extracted.get("county")
     county_lo = _county_lower(county)
     county_code = _county_slug(county)  # FK-valid slug for core.counties
@@ -240,7 +313,12 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     # Real feed name, not a hardcoded constant. See derive_source().
     source = derive_source(extracted)
     real_pid = extracted.get("parcel_id")  # the real GIS PID, e.g. '220570230'
-    synthetic_pid = _synthetic_pid(county, source_id)
+    sale_date_raw = extracted.get("sale_date")
+    # The spine parcel when the caller resolved one; otherwise a synthetic
+    # key that is at least STABLE across the six weekly republications.
+    effective_pid = resolved_parcel_id or _synthetic_pid(
+        county, source_id, real_pid=real_pid, sale_date=sale_date_raw
+    )
 
     address = extracted.get("property_address") or "address not stated"
     city = extracted.get("city") or ""
@@ -285,7 +363,7 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     )
 
     distress_event = {
-        "parcel_id": synthetic_pid,
+        "parcel_id": effective_pid,
         "event_type": "sheriff_sale",
         "event_subtype": "scheduled",
         "event_date": sale_date,
@@ -299,7 +377,7 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     }
 
     sheriff_sale = {
-        "parcel_id": synthetic_pid,
+        "parcel_id": effective_pid,
         "sale_date": sale_date,
         "sale_time": _parse_sale_time(extracted.get("sale_time")),
         "sale_location": extracted.get("sale_location"),
@@ -318,8 +396,10 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
     # so the synthetic parcel must exist there first (mirrors how the sheriff
     # scraper inserts a parcels row before its distress_events row). county_code
     # must be the core.counties slug, not the title-case name.
-    parcel_row = {
-        "parcel_id": synthetic_pid,
+    # None when the parcel already exists in the spine — the caller skips the
+    # insert entirely rather than writing a stub over real assessor data.
+    parcel_row = None if resolved_parcel_id else {
+        "parcel_id": effective_pid,
         "state": "MN",
         "county_code": county_code,
         "address": address if address != "address not stated" else None,
@@ -334,6 +414,7 @@ def build_promotion_rows(extracted: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "source_id": source_id,
+        "parcel_id": effective_pid,
         "parcel_row": parcel_row,
         "distress_event": distress_event,
         "sheriff_sale": sheriff_sale,
