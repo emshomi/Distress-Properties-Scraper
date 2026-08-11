@@ -3196,40 +3196,47 @@ async def list_properties(
             query = query.eq("source", source)
 
         if county:
-            # Sources whose county is fixed by name (IN-list filterable).
-            county_sources = _sources_for_county(county)
-            # Per-row-county sources (statewide/extracted) can't be filtered
-            # by a source IN-list — their county lives in raw_data.detail.county
-            # as a slug. We OR a JSON-path match on that slug so a county query
-            # finds them too. Build the slug from the requested county name.
-            slug = None
-            for s, name in _SLUG_TO_COUNTY_NAME.items():
-                if name == county:
-                    slug = s
-                    break
-
-            if county_sources and slug:
-                src_list = ",".join(county_sources)
-                # (source in fixed-list) OR (per-row source AND detail.county == slug)
-                query = query.or_(
-                    f"source.in.({src_list}),"
-                    f"and(source.in.({','.join(_PER_ROW_COUNTY_SOURCES)}),"
-                    f"raw_data->detail->>county.eq.{slug})"
-                )
-            elif county_sources:
-                query = query.in_("source", county_sources)
-            elif slug:
-                # Only resolvable via per-row county.
-                query = query.in_("source", list(_PER_ROW_COUNTY_SOURCES))
-                query = query.eq("raw_data->detail->>county", slug)
-            else:
-                # Unknown county — no rows.
+            # REWRITTEN 2026-08-10. Two stacked defects, both measured live:
+            #
+            #  1. The slug was resolved by REVERSE-LOOKUP in
+            #     _SLUG_TO_COUNTY_NAME -- a hand-maintained map of FIFTEEN
+            #     counties. We hold signals in 41. Aitkin and Morrison have
+            #     data and returned total=0 because they simply were not in
+            #     that map. Slug-form input ('hennepin') also failed, since
+            #     the map is keyed by display name.
+            #
+            #  2. Even when the slug resolved, the per-row branch compared
+            #     raw_data->detail->>county to a SLUG -- but that field holds
+            #     the bare lowercase NAME ('st. louis', 'saint louis'), as the
+            #     comment above _county_slug says. So 'St. Louis' resolved to
+            #     st_louis and then matched nothing: total=0 against 37 real
+            #     rows. Wright worked only because single-word counties have
+            #     an identical name and slug. Every multi-word county was
+            #     broken: St. Louis, Le Sueur, Mille Lacs, Blue Earth,
+            #     Yellow Medicine, Otter Tail.
+            #
+            # Both disappear by folding the INPUT through _county_slug() --
+            # the same normaliser the rest of this module uses, which already
+            # handles 'St. Louis', 'Saint Louis', 'Washington County' and the
+            # alias table -- and then filtering on county_slug, a REAL COLUMN
+            # on signals.distress_with_parcel computed by the view's own
+            # expression. The filter can no longer drift from the view's rule
+            # because it IS the view's rule, and it needs no per-source
+            # branching: the view has already resolved fixed-map and per-row
+            # counties alike.
+            #
+            # Accepts EITHER form: 'Hennepin', 'hennepin', 'St. Louis',
+            # 'st_louis', 'Washington County' all fold to the same slug.
+            slug = _county_slug(county)
+            if not slug:
+                # Unresolvable input — no rows, same as before.
                 return success_envelope({
                     "properties": [],
                     "total": 0,
                     "limit": limit,
                     "offset": offset,
                 })
+            query = query.eq("county_slug", slug)
 
         if status_filter:
             sv = status_filter.strip().lower()
