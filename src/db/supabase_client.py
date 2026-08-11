@@ -119,6 +119,24 @@ def outcomes_table(table_name: str) -> Any:
     return get_client().schema("outcomes").table(table_name)
 
 
+def saved_table(table_name: str) -> Any:
+    """Access a table in the `saved` schema (searches — investor buy boxes).
+
+    ADDED 2026-08-11. A saved search is an investor's standing criteria plus
+    an alert cadence; the "N new" badge counts events matching it since the
+    user last looked.
+
+    Deliberately NOT in `marketplace`, despite that schema already holding
+    user-owned rows: marketplace is the SELLER side (owners listing their own
+    property, magic-link auth via marketplace.owners). Saved searches are the
+    INVESTOR side, keyed to app_auth.users.id from the JWT. Two different
+    account types; mixing them to save one accessor would be a mistake.
+
+    NOTE: requires `saved` in Supabase's exposed schemas (Settings → API),
+    same as outcomes."""
+    return get_client().schema("saved").table(table_name)
+
+
 
 # ============================================================
 # CONNECTIVITY CHECK
@@ -157,5 +175,6 @@ __all__ = [
     "access_table",
     "ai_table",
     "outcomes_table",
+    "saved_table",
     "ping_supabase",
 ]
