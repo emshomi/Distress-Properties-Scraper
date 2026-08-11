@@ -30,7 +30,11 @@ from src.db.supabase_client import (
     signals_table,
     core_table,
 )
-from src.llm.foreclosure_promotion import build_promotion_rows
+from src.llm.foreclosure_promotion import (
+    build_promotion_rows,
+    _county_slug as _fc_county_slug,
+    _pid_digits as _fc_pid_digits,
+)
 from src.scrapers.startribune_legal import run_startribune_scrape
 from src.scrapers.mnpublicnotice_probe import probe_mnpublicnotice
 from src.scrapers.hennepin_sheriff_probe import probe_hennepin_sheriff
@@ -262,6 +266,59 @@ async def list_extractions(status: str = "pending") -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to list extractions.")
 
 
+def _resolve_spine_parcel(extracted: dict[str, Any]) -> Optional[str]:
+    """The REAL core.parcels.parcel_id for this notice, or None.
+
+    ADDED 2026-08-10. Every mnpublicnotice foreclosure was hung off a
+    SYNTHETIC parcel built from the notice id, never the actual parcel — so
+    the rows carried no market value, no owner, no coordinates, no equity.
+    That is why a Beltrami row renders as em-dashes while a Hennepin row
+    shows $344,800: there is no parcel record behind it, only a stub named
+    after the notice.
+
+    Counties print the same PID in incompatible shapes (wright
+    '155-154-004010', beltrami '83.00180.00', dakota '42-42800-01-071'), so
+    the match is digits-only via core.parcel_pid_lookup, backed by the
+    expression index idx_parcels_county_pid_digits. Measured 2026-08-10:
+    exact match resolved 47 of 217 notices, digits-only resolved 185, and
+    the lookup runs in 0.57ms on an index scan.
+
+    Returns None on ANY doubt — no county, no usable PID, no hit, more than
+    one hit, or an error. The caller then falls back to the synthetic path,
+    which is exactly today's behaviour. A wrong parcel would attach a
+    foreclosure to someone else's property, so silence is the only safe
+    failure here.
+    """
+    county_code = _fc_county_slug(extracted.get("county"))
+    if not county_code:
+        return None
+    digits = _fc_pid_digits(extracted.get("parcel_id"))
+    if not digits:
+        return None
+    try:
+        hit = (
+            core_table("parcel_pid_lookup")
+            .select("parcel_id")
+            .eq("county_code", county_code)
+            .eq("pid_digits", digits)
+            .limit(2)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning(
+            "spine parcel lookup failed — falling back to synthetic PID",
+            county=county_code,
+            error_type=type(e).__name__,
+        )
+        return None
+    rows = hit.data or []
+    if len(rows) != 1:
+        # 0 = not in the spine (beltrami and redwood have NO spine at all).
+        # 2+ = ambiguous within one county; never guess.
+        return None
+    return rows[0].get("parcel_id")
+
+
 def _as_date(value: Any) -> Optional[date]:
     """Parse an ISO date out of whatever the API layer hands back.
 
@@ -434,17 +491,40 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 detail="This extraction was rejected; cannot approve.",
             )
 
-        built = build_promotion_rows(extracted)
+        # Resolve the notice's PID against the county spine BEFORE building.
+        # build_promotion_rows stays pure (no DB), so the lookup happens here
+        # and the answer is passed in. See _resolve_spine_parcel().
+        resolved_pid = _resolve_spine_parcel(extracted)
+        built = build_promotion_rows(extracted, resolved_parcel_id=resolved_pid)
         source_id = built["source_id"]
+        effective_pid = built["parcel_id"]
 
         # Idempotency guard: does the distress_events row already exist?
-        # event_date is selected too — it is what tells a postponement (later
-        # date, same source_id) apart from a re-scrape of the same notice.
+        #
+        # CHANGED 2026-08-10: was keyed on source_id, which is NOT stable.
+        # source_id falls back to `ef-{extraction id}` when a notice carries
+        # no attorney file number, and Minnesota requires a foreclosure
+        # notice to run SIX CONSECUTIVE WEEKS (Minn. Stat. 580.03) — so the
+        # same sale is re-extracted weekly with a new id, a new source_id,
+        # and this guard missed every time.
+        #
+        # Measured live: 289 mnpublicnotice sheriff_sale rows were 219
+        # distinct properties — 68 duplicates, 24% inflation. 4318 Harvest
+        # Court, Monticello appeared NINETEEN times, five of them on a
+        # single day.
+        #
+        # The true identity of a foreclosure event is the PARCEL plus the
+        # SALE DATE. Both are now stable: a resolved spine parcel, or a
+        # synthetic keyed on (county, pid digits, sale date). Sale date is
+        # deliberately NOT part of the match — a postponement keeps the same
+        # parcel with a later date, and _apply_postponement below must still
+        # see it as the same foreclosure moving, not a new one.
         existing = (
             signals_table("distress_events")
             .select("id, event_date, source")
             .in_("source", list(_PROMOTION_SOURCES))
-            .eq("source_id", source_id)
+            .eq("parcel_id", effective_pid)
+            .eq("event_type", "sheriff_sale")
             .limit(1)
             .execute()
         )
@@ -498,17 +578,26 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                         county_name=county_name,
                     )
 
-            # Parcel next (check-then-insert).
-            pid = built["parcel_row"]["parcel_id"]
-            parcel_exists = (
-                core_table("parcels")
-                .select("parcel_id")
-                .eq("parcel_id", pid)
-                .limit(1)
-                .execute()
-            )
-            if not parcel_exists.data:
-                core_table("parcels").insert(built["parcel_row"]).execute()
+            # Parcel next (check-then-insert). parcel_row is None when the
+            # PID resolved to a real spine parcel — that row already exists
+            # and carries assessor data a stub would overwrite.
+            if built["parcel_row"] is not None:
+                pid = built["parcel_row"]["parcel_id"]
+                # COMPOSITE key. Minnesota parcel IDs are NOT unique across
+                # counties, so a parcel_id-only check can find another
+                # county's row, skip the insert, and leave the FK unsatisfied.
+                # Same defect class fixed the same day in
+                # properties._apply_assessor_owners.
+                parcel_exists = (
+                    core_table("parcels")
+                    .select("parcel_id")
+                    .eq("county_code", built["parcel_row"].get("county_code"))
+                    .eq("parcel_id", pid)
+                    .limit(1)
+                    .execute()
+                )
+                if not parcel_exists.data:
+                    core_table("parcels").insert(built["parcel_row"]).execute()
 
             signals_table("distress_events").insert(built["distress_event"]).execute()
             signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
