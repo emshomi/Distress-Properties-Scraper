@@ -3314,7 +3314,46 @@ async def list_properties(
         # sort in Python, then slice the page. This is appropriate at our scale
         # (foreclosure is a few hundred rows), not a workaround to feel bad
         # about — sorting hundreds of dicts is instant.
-        computed_sorts = {"equity", "redemption_urgency"}
+        # CHANGED 2026-08-10: redemption_urgency REMOVED from this set.
+        #
+        # It is now a real, orderable pair of columns on
+        # signals.distress_with_parcel -- redemption_days_left and
+        # redemption_sort_bucket -- computed by signals.redemption_sort_key,
+        # which reproduces _redemption_fields() exactly: tracker exact-key
+        # then parcel-key fallback, resolved outcomes nulled, negative
+        # tracker countdowns nulled, published redemptionExpirationDate,
+        # postbulletin redemption_expires, then the sale+182d estimate with
+        # its per-source completion guards.
+        #
+        # VERIFIED before switching: the view's top 20 matched the live API's
+        # top 20 position-for-position, including the tracker-backed row
+        # hennepin_sheriff 2607016 whose event_date is five months later than
+        # its countdown implies. Distribution across all 1,665 rows: 665
+        # actionable (0-358 days), 115 expired (-4..-396), 885 no window.
+        #
+        # WHY IT MATTERED: being a computed sort forced needs_fetch_all, so
+        # the DEFAULT view of the data page fetched EVERY matching row and
+        # shaped all of them to return 50. Measured 2026-08-10: 2,904ms on
+        # redemption_urgency vs 753ms on a DB column, identical filters.
+        # The ordering query now plans at 36.7ms (EXPLAIN ANALYZE).
+        #
+        # equity STAYS computed -- it needs assessor values attached during
+        # shaping and has no DB-side equivalent.
+        computed_sorts = {"equity"}
+
+        # Bucketed ordering that reproduces _sort_computed's three-way split
+        # for redemption_urgency: actionable (days >= 0) ascending, then
+        # expired (days < 0) with the most recent first, then rows with no
+        # window. Postgres sorts NULLs last in ASC with nullsfirst=False,
+        # which is why the bucket column exists rather than ordering on
+        # days_left alone.
+        def _order_by_sort(q: Any, _sort: str, _desc: bool) -> Any:
+            if _sort == "redemption_urgency":
+                q = q.order("redemption_sort_bucket", desc=False,
+                            nullsfirst=False)
+                return q.order("redemption_days_left", desc=_desc,
+                               nullsfirst=False)
+            return q.order(_sort, desc=_desc, nullsfirst=False)
 
         # The outcome filter is PREMIUM data (which rows redeemed vs sold is
         # itself the leverage) — silently neutralized below premium, matching
@@ -3351,7 +3390,7 @@ async def list_properties(
             # how rows slip between page boundaries. Computed sorts re-sort
             # in Python afterward, so id-only order is sufficient for them.
             if sort not in computed_sorts:
-                query = query.order(sort, desc=(order == "desc"), nullsfirst=False)
+                query = _order_by_sort(query, sort, order == "desc")
             query = query.order("id", desc=False)
 
             # Fetch EVERY matching row before shaping/filtering — never a
@@ -3508,7 +3547,7 @@ async def list_properties(
         # id tiebreaker (2026-07-12): rows tied on the sort column can swap
         # across page boundaries between requests (same instability fixed in
         # the fetch-all path) — a unique secondary key pins them.
-        query = query.order(sort, desc=(order == "desc"), nullsfirst=False)
+        query = _order_by_sort(query, sort, order == "desc")
         query = query.order("id", desc=False)
         query = query.range(offset, offset + limit - 1)
 
