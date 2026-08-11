@@ -82,6 +82,26 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "ramsey_tax_roll", "event_type": "tax_forfeit"},
         {"source": "ramsey_tfl"},
         {"source": "mn_dor_red_book"},
+        # ADDED 2026-08-11. mnpn_redemption_notice is the statewide
+        # tax-forfeiture REDEMPTION feed: county auditors' published notices
+        # of parcels bid in to the State, with the owner, the amount to
+        # redeem and the county-stated deadline.
+        #
+        # 335 events across 13 counties (benton, carlton, chippewa,
+        # crow_wing, lac_qui_parle, lake, le_sueur, lyon, pine, pipestone,
+        # pope, rock, stevens) belonged to NO category, so no tab on the data
+        # page could reach them. They were in the database, correctly
+        # county-tagged, and in the county dropdown -- and invisible.
+        #
+        # Same defect shape as mnpublicnotice above: a source ships, the
+        # category map is not updated, and /stats silently understates.
+        # Measured 2026-08-11: total_signals reported 7,639 against 9,215
+        # actual rows.
+        #
+        # It belongs here rather than under a category of its own: a
+        # redemption window opened by a tax-judgment sale IS the
+        # tax-forfeiture pipeline, one step before forfeiture completes.
+        {"source": "mnpn_redemption_notice"},
     ],
     "vacant": [
         {"source": "mpls_vbr"},
