@@ -80,10 +80,6 @@ _ALLOWED_FILTER_KEYS = {
 
 _MAX_SEARCHES_PER_USER = 25
 
-# TEMPORARY 2026-08-11: last exception from _count_matches, surfaced in the
-# list response so the cause is visible. Remove with the debug fields.
-_LAST_COUNT_ERROR: Optional[str] = None
-
 
 class SavedSearchIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
@@ -137,7 +133,6 @@ async def _count_matches(
     the honest reading of "new things to look at": two separate events did
     appear, and the user will see two rows.
     """
-    global _LAST_COUNT_ERROR
     cats: list[Optional[str]] = list(categories) if categories else [None]
     total = 0
     for cat in cats:
@@ -171,7 +166,6 @@ async def _count_matches(
                 **call,
             )
         except TypeError as e:
-            _LAST_COUNT_ERROR = f"TypeError: {str(e)[:300]}"
             # A stored filter key that list_properties no longer accepts.
             # Log it loudly: it means _ALLOWED_FILTER_KEYS has drifted from
             # the endpoint signature and saved searches are now wrong.
@@ -181,11 +175,6 @@ async def _count_matches(
             )
             return None
         except Exception as e:
-            # TEMPORARY DIAGNOSTIC 2026-08-11, same reason as the list
-            # endpoint: logger.warning is not reaching Railway's logs, so the
-            # exception is stashed on the module for the next response to
-            # report. Remove once the cause is known.
-            _LAST_COUNT_ERROR = f"{type(e).__name__}: {str(e)[:300]}"
             logger.warning(
                 "saved search count failed",
                 error_type=type(e).__name__,
@@ -213,21 +202,12 @@ async def list_saved_searches(_ctx: TierContext = TierResolved) -> dict[str, Any
         )
         rows = result.data or []
     except Exception as e:
-        # TEMPORARY DIAGNOSTIC 2026-08-11: the exception text is returned to
-        # the caller because logger.warning is not reaching Railway's log
-        # stream, and three rounds of guessing produced nothing. Revert to a
-        # generic message once the cause is known — an internal error string
-        # is not something to leave in a production response.
         logger.warning(
             "saved search list failed", error_type=type(e).__name__
         )
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "message": "Could not load your saved searches.",
-                "debug_type": type(e).__name__,
-                "debug_error": str(e)[:500],
-            },
+            detail={"message": "Could not load your saved searches."},
         ) from e
 
     out: list[dict[str, Any]] = []
@@ -248,11 +228,7 @@ async def list_saved_searches(_ctx: TierContext = TierResolved) -> dict[str, Any
             ),
         })
 
-    return success_envelope({
-        "searches": out,
-        "count": len(out),
-        "debug_count_error": _LAST_COUNT_ERROR,
-    })
+    return success_envelope({"searches": out, "count": len(out)})
 
 
 @router.post(
