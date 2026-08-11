@@ -148,6 +148,11 @@ _SLUG_TO_COUNTY_NAME: dict[str, str] = {
     "stearns": "Stearns",
     "washington": "Washington",
     "wright": "Wright",
+    # ADDED 2026-08-10 with the /counties rewrite. Title-casing the slug
+    # renders "Mcleod"; the county is McLeod. Every other observed slug
+    # title-cases correctly (checked all 41), so this is the only entry
+    # the fallback gets wrong.
+    "mcleod": "McLeod",
 }
 
 # Reverse of the above. Derived, not hand-written, so the two cannot drift.
@@ -2546,62 +2551,77 @@ async def stats_endpoint() -> dict[str, Any]:
     summary="Covered counties with live signal counts (drives the county dropdown).",
 )
 async def covered_counties() -> dict[str, Any]:
-    """Counties from the coverage registry (core.source_county_map) with a
-    live row count each from distress_with_parcel. Public, no tier gating —
-    coverage is marketing-page data. Fails LOUD (503) if the registry is
-    unreachable: an empty dropdown would be an honest-looking lie."""
+    """Every county we hold distress signals for, with a live count each.
+
+    REWRITTEN 2026-08-10. The dropdown showed 9 counties. We hold events in
+    41.
+
+    Cause: membership was read from core.source_county_map, which maps ONE
+    source to ONE county. The statewide feeds cannot be represented that
+    way -- mnpublicnotice and startribune_legal carry county_slug NULL by
+    design, resolved per-row from raw_data.detail.county -- so every county
+    reached only by them was invisible. mnpublicnotice ALONE accounts for
+    32 of the 41.
+
+    The registry has 19 rows but only NINE distinct non-null slugs, and two
+    of those (carver_sheriff, scott_sheriff) are noted "no rows yet". So the
+    dropdown was advertising counties with no dedicated-source data while
+    hiding Wright (56 events), St. Louis (37) and Morrison (13).
+
+    WHY NO THRESHOLD. A volume floor was considered and rejected. Recency
+    cannot discriminate -- ALL 41 counties are active within 60 days,
+    because mnpublicnotice sweeps statewide daily. That leaves an arbitrary
+    event count, and there is no principled answer to "why is 3 coverage and
+    2 incidental". The honest claim is "we hold data here", and the count
+    beside each name says how much. A user who picks Yellow Medicine and
+    finds one property has learned something true; a user who never sees it
+    while we hold that property has been misled -- and false coverage
+    claims are the more expensive error.
+
+    Registry membership is now redundant rather than removed: the previous
+    code already dropped any county whose count was 0, and all 9 registry
+    slugs appear among the 41 observed. "Registry OR observed, minus
+    empties" therefore collapses to "observed".
+
+    Also 9 sequential COUNT round trips -> ONE read of
+    signals.counties_with_signals (41 rows, 20.2ms measured).
+
+    Public, no tier gating -- coverage is marketing-page data. Still fails
+    LOUD (503) rather than returning an empty dropdown, which would be an
+    honest-looking lie.
+    """
     try:
-        map_rows = (
-            core_table("source_county_map")
-            .select("county_slug")
-            .not_.is_("county_slug", "null")
+        rows = (
+            signals_table("counties_with_signals")
+            .select("county_slug, events")
             .execute()
             .data
             or []
         )
     except Exception as e:
         logger.error(
-            "county registry load failed", error_type=type(e).__name__
+            "county coverage load failed", error_type=type(e).__name__
         )
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="County coverage registry unavailable",
         )
 
-    slugs = sorted({r["county_slug"] for r in map_rows if r.get("county_slug")})
-
     counties: list[dict[str, Any]] = []
-    for slug in slugs:
-        try:
-            result = (
-                signals_table("distress_with_parcel")
-                .select("id", count="exact")
-                .eq("county_slug", slug)
-                .limit(1)
-                .execute()
-            )
-            count: Optional[int] = result.count or 0
-        except Exception as e:
-            # Count failed for this county only: keep the county (it IS
-            # registered coverage) with count=None rather than silently
-            # dropping it from the dropdown on a transient error.
-            logger.warning(
-                "county count failed",
-                county=slug,
-                error_type=type(e).__name__,
-            )
-            count = None
+    for r in rows:
+        slug = r.get("county_slug")
+        if not slug:
+            continue
+        count = r.get("events") or 0
         if count == 0:
-            continue  # registered but currently empty (e.g. a source not yet live)
-        counties.append(
-            {
-                "slug": slug,
-                "name": _SLUG_TO_COUNTY_NAME.get(
-                    slug, slug.replace("_", " ").title()
-                ),
-                "count": count,
-            }
-        )
+            continue
+        counties.append({
+            "slug": slug,
+            "name": _SLUG_TO_COUNTY_NAME.get(
+                slug, slug.replace("_", " ").title()
+            ),
+            "count": count,
+        })
 
     counties.sort(key=lambda c: c["name"])
     return success_envelope({"counties": counties})
