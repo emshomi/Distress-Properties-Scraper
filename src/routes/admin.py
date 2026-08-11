@@ -393,11 +393,35 @@ def _apply_postponement(existing_row: dict[str, Any],
     # hardcoded to 0 at promotion and had never moved, so the fact that a sale
     # had been postponed at all was recorded nowhere.
     parcel_id = new_sale.get("parcel_id")
+    # COMPOSITE KEY (2026-08-11). Both the read below and the UPDATE further
+    # down filtered on parcel_id ALONE. Minnesota parcel IDs are not unique
+    # across counties: measured 2026-08-11, 95,036 parcel_ids exist in more
+    # than one county (315,575 rows involved, one PIN in TWENTY-FIVE
+    # counties).
+    #
+    # The UPDATE was the dangerous half -- no county and no limit, so a
+    # postponement here could rewrite sale_date, sale_time, sale_location and
+    # postponement_count on another county's foreclosure entirely.
+    #
+    # sheriff_sales.county_code is set by build_promotion_rows, so the value
+    # is on new_sale. If it is ever missing, both statements below are
+    # SKIPPED rather than run unscoped: a lost postponement statistic is
+    # recoverable, a rewritten sale date on someone else's property is not.
+    county_code = new_sale.get("county_code")
+    if not parcel_id or not county_code:
+        logger.warning(
+            "postponement skipped -- no county_code on the sheriff_sale row",
+            source_id=source_id,
+            parcel_id=parcel_id,
+        )
+        return True
+
     prior = 0
     try:
         found = (
             signals_table("sheriff_sales")
             .select("postponement_count")
+            .eq("county_code", county_code)
             .eq("parcel_id", parcel_id)
             .limit(1)
             .execute()
@@ -416,7 +440,7 @@ def _apply_postponement(existing_row: dict[str, Any],
         "sale_time": new_sale.get("sale_time"),
         "sale_location": new_sale.get("sale_location"),
         "postponement_count": prior + 1,
-    }).eq("parcel_id", parcel_id).execute()
+    }).eq("county_code", county_code).eq("parcel_id", parcel_id).execute()
 
     logger.info(
         "sheriff sale POSTPONED — live rows updated",
