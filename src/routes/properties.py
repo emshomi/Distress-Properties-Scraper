@@ -107,6 +107,24 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "mpls_vbr"},
         {"source": "saint_paul_vacant"},
         {"source": "saint_paul_dsi"},
+        # ADDED 2026-08-11, after _extract_mpls_311 was written and deployed
+        # separately. mpls_311 is the SECOND-LARGEST source in the database
+        # (1,304 events) and belonged to no category, so no tab could reach
+        # a single one of them.
+        #
+        # It belongs here on the evidence of what the scraper collects:
+        # mpls_311.py filters server-side to VACATE, CON, CONCIT (condemned),
+        # UNOC/UNOCCIT (unoccupied), VB/VO/VS (vacant building, open,
+        # secured), VBRRefer, NOSH, Abate, Summons -- and discards routine
+        # inspection administration, which its own comment says "would drown
+        # the signal 10:1". VBRRefer is a referral INTO the same Vacant
+        # Building Registry mpls_vbr reports from: one enforcement ladder,
+        # one rung earlier.
+        #
+        # These rows sort to the TOP of this tab under "Most recent first"
+        # because their inspection dates are current. That is correct, not a
+        # fault -- the VBR rows move to later pages.
+        {"source": "mpls_311"},
     ],
     "tax_delinquent": [
         {"source": "hennepin_tax_roll", "event_type": "tax_delinquent"},
