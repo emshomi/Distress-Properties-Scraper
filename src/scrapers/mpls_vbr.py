@@ -231,6 +231,20 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
 
         return VbrListingInsert(
             parcel_id=parcel_id,
+            # ADDED 2026-08-10. VbrListingInsert gained an optional
+            # county_code field the same day; to_event() now projects it into
+            # signals.distress_events, where the composite FK
+            # (county_code, parcel_id) -> core.parcels and the dedup key
+            # (county_code, parcel_id, event_type, event_date, source) BOTH
+            # need it. A NULL leaves both unenforced -- NULL is never equal
+            # to anything -- so the event points at no parcel and cannot
+            # collide with a duplicate.
+            #
+            # Note the write() step below already sets county_code on the
+            # TYPED signals.vbr_listings rows (see the ClassVar comment
+            # there); this is the same value on the EVENT projection, which
+            # was missed.
+            county_code=self.county_code,
             city="Minneapolis",
             registry_type=label,
             date_entered_registry=vbr_date,
