@@ -1494,6 +1494,37 @@ _DEAL_CALIBRATION_TTL_S = 600
 # automatically. Honest sourcing: this is the county assessor's
 # owner-of-record, same provenance as every other owner on the platform.
 
+def _recompute_deal_math(shaped_rows: list[dict[str, Any]]) -> None:
+    """Second pass at deal math, AFTER the assessor patch has run.
+
+    DEFECT FIXED 2026-08-10. _compute_deal_math runs inside
+    _shape_property_row, but market_value for a great many rows is not known
+    at that point -- it is filled in afterwards by _apply_assessor_owners
+    from core.parcels. The gate requires a numeric market_value, so those
+    rows computed against None, returned None, and were never revisited.
+
+    Hennepin sheriff rows were unaffected and hid the bug: that feed
+    publishes an assessed value in its own payload, so market_value IS set
+    at shape time. Every source that does NOT publish a value -- which is
+    every statewide legal-notice feed -- silently lost deal math.
+
+    Measured live 2026-08-10: five Wright foreclosures, all 'In redemption',
+    all with market values from the spine ($225,700-$504,100) and real debts
+    ($2,430-$72,665), showed an em-dash under EST. EQUITY. 2469 Jaber Avenue
+    NE is $3,006 owed against $504,100 -- a half-million-dollar spread the
+    page could not display.
+
+    Only rows that MISSED are recomputed; a row that already produced deal
+    math is left exactly as it was.
+    """
+    for s in shaped_rows:
+        if s.get("deal_math") is not None:
+            continue
+        if not isinstance(s.get("market_value"), (int, float)):
+            continue
+        s["deal_math"] = _compute_deal_math(s)
+
+
 def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
     """Fill owner/owner_mailing (from core.owners) AND parcel foundation
     fields (from core.parcels) on shaped rows whose SOURCE published
@@ -3496,6 +3527,7 @@ async def list_properties(
                 for r in rows
             ]
             _apply_assessor_owners(shaped)
+            _recompute_deal_math(shaped)
 
             
 
@@ -3621,6 +3653,7 @@ async def list_properties(
             for r in rows
         ]
         _apply_assessor_owners(_shaped_page)
+        _recompute_deal_math(_shaped_page)
         return success_envelope({
             "properties": [
                 redact_property(s, tier=_ctx.tier)
@@ -3705,6 +3738,7 @@ async def get_property(
         delq_map = _load_delq_status_map()
         shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map, delq_map)
         _apply_assessor_owners([shaped])
+        _recompute_deal_math([shaped])
         shaped["raw"] = rows[0].get("raw_data") or {}
 
         # Attach enriched property characteristics from core.parcels, keyed by
