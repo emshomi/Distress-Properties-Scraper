@@ -197,6 +197,18 @@ class TaxForfeitScraper(BaseScraper[dict[str, Any], TaxForfeitInsert]):
                     TaxForfeitInsert(
                         parcel_id=pid,
                         county=county,
+                        # ADDED 2026-08-10. to_event() now projects
+                        # county_code into signals.distress_events, where the
+                        # composite FK (county_code, parcel_id) ->
+                        # core.parcels and distress_events_dedup_key both
+                        # need it. A NULL leaves both unenforced, because
+                        # NULL is never equal to anything.
+                        #
+                        # No normalisation needed here: _COUNTY_URLS is keyed
+                        # by the core.counties SLUG already ('st_louis',
+                        # 'otter_tail'), and ParcelUpsert below has always
+                        # passed this same value as county_code.
+                        county_code=county,
                         forfeit_date=forfeit_date,
                         appraised_value=appraised_value,
                         minimum_bid=minimum_bid,
