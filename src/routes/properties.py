@@ -107,6 +107,23 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
         {"source": "mpls_vbr"},
         {"source": "saint_paul_vacant"},
         {"source": "saint_paul_dsi"},
+        # ADDED 2026-08-11. mpls_311 is the SECOND-LARGEST source in the
+        # database -- 1,304 events -- and belonged to no category, so no tab
+        # on the data page could reach a single one of them.
+        #
+        # It belongs here on the evidence of what the scraper actually
+        # collects. mpls_311.py filters server-side to _DISTRESS_RESULTS and
+        # nothing else: VACATE, CON, CONCIT (condemnation and its citation),
+        # UNOC/UNOCCIT (unoccupied), VB/VO/VS (vacant building, open,
+        # secured), VBRRefer, NOSH, Abate, Summons. Its own comment says the
+        # excluded codes are "routine inspection administration, not
+        # distress, and would drown the signal 10:1".
+        #
+        # VBRRefer is a referral INTO the Vacant Building Registry that
+        # mpls_vbr already reports from -- the same municipal enforcement
+        # ladder, one rung earlier. A 311 condemnation and a VBR listing on
+        # the same property are the same story at two points in time.
+        {"source": "mpls_311"},
     ],
     "tax_delinquent": [
         {"source": "hennepin_tax_roll", "event_type": "tax_delinquent"},
