@@ -151,6 +151,15 @@ async def _count_matches(
         # parameters leaves the fourth as `Query(None)`, not None. Passing
         # the full set is the only safe way to reuse the endpoint directly.
         call: dict[str, Any] = {k: None for k in _ALLOWED_FILTER_KEYS}
+        # sort and order are the two filter keys whose Query default is NOT
+        # None — "event_date" and "asc". Passing None for them made
+        # list_properties order by nothing, and PostgREST rejected the
+        # query: "Failed to fetch properties: APIError", seen live
+        # 2026-08-11 while the same filters over HTTP returned 63 rows.
+        #
+        # The count does not care about order, but the endpoint does, so
+        # they get their real defaults.
+        call.update({"sort": "event_date", "order": "asc"})
         call.update(filters)
         try:
             res = await list_properties(
