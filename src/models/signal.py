@@ -201,6 +201,7 @@ class CodeViolationInsert(BaseModel):
         """Project this row into the unified distress_events feed."""
         return DistressEventInsert(
             parcel_id=self.parcel_id,
+            county_code=self.county_code,
             event_type="code_violation",
             event_subtype=self.violation_type,
             # THE date rule: use the true date from the source, or NULL.
@@ -229,6 +230,20 @@ class SheriffSaleInsert(BaseModel):
     """Hennepin / Ramsey sheriff sale payload."""
 
     parcel_id: str = Field(..., min_length=1, max_length=100)
+    # ADDED 2026-08-10. signals.distress_events has a COMPOSITE foreign key
+    # (county_code, parcel_id) -> core.parcels, and its dedup key is
+    # (county_code, parcel_id, event_type, event_date, source). A NULL
+    # county_code makes BOTH unenforced -- NULL is never equal to anything --
+    # so the row points at no parcel AND cannot collide with a duplicate.
+    #
+    # Measured live: 1,316 events carried county_code NULL, every one written
+    # on or after 2026-08-07 (the composite-key migration). mpls_311 alone was
+    # 1,304 of them; 12 sheriff rows were outright duplicates the dedup key
+    # should have refused. All were backfilled by hand.
+    #
+    # Optional so existing callers keep working; every scraper that knows its
+    # county should pass it.
+    county_code: str | None = Field(default=None, max_length=100)
     case_number: str | None = Field(default=None, max_length=100)
     sale_date: date
     sale_amount: Decimal | None = Field(default=None, ge=0)
@@ -247,6 +262,7 @@ class SheriffSaleInsert(BaseModel):
     def to_event(self) -> DistressEventInsert:
         return DistressEventInsert(
             parcel_id=self.parcel_id,
+            county_code=self.county_code,
             event_type="sheriff_sale",
             event_date=self.sale_date,
             severity="high",
@@ -289,6 +305,7 @@ class VbrListingInsert(BaseModel):
 
     # ---- Direct column mappings to signals.vacant_registrations ----
     parcel_id: str = Field(..., min_length=1, max_length=100)
+    county_code: str | None = Field(default=None, max_length=100)
     city: str | None = Field(default=None, max_length=200)
     registry_type: str | None = Field(default=None, max_length=100)
     date_entered_registry: date | None = None
@@ -340,6 +357,7 @@ class VbrListingInsert(BaseModel):
 
         return DistressEventInsert(
             parcel_id=self.parcel_id,
+            county_code=self.county_code,
             event_type=event_type,
             event_subtype=self.registry_type,
             event_date=true_date,
@@ -415,6 +433,7 @@ class ProbateFilingInsert(BaseModel):
             return None
         return DistressEventInsert(
             parcel_id=self.parcel_id,
+            county_code=self.county_code,
             event_type="probate_filing",
             event_subtype=self.case_type,
             # THE date rule: the true date or NULL — never a scrape-day
@@ -470,6 +489,9 @@ class TaxForfeitInsert(BaseModel):
 
     parcel_id: str = Field(..., min_length=1, max_length=100)
     county: str = Field(..., min_length=1, max_length=50)
+    # `county` above is a DISPLAY name ('St. Louis'); county_code is the
+    # core.counties slug ('st_louis'). The FK needs the slug.
+    county_code: str | None = Field(default=None, max_length=100)
     forfeit_date: date | None = None
     sale_date: date | None = None
     appraised_value: Decimal | None = Field(default=None, ge=0)
@@ -487,6 +509,7 @@ class TaxForfeitInsert(BaseModel):
         title_suffix = " (pre-2024 forfeiture — forced liquidation window)" if self.pre_2024_forfeit else ""
         return DistressEventInsert(
             parcel_id=self.parcel_id,
+            county_code=self.county_code,
             event_type="tax_forfeit",
             event_date=self.forfeit_date or self.observed_at.date(),
             severity=severity,
