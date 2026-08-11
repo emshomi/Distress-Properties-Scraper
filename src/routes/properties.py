@@ -3178,6 +3178,15 @@ async def list_properties(
         default=None,
         description="Filter by data source (e.g. 'anoka_sheriff').",
     ),
+    observed_since: Optional[str] = Query(
+        default=None,
+        description=(
+            "Only rows first observed AFTER this timestamp (ISO 8601). "
+            "Added 2026-08-11 for saved searches: the 'N new' badge counts "
+            "properties that started matching a buy box since the user last "
+            "looked. Omitted by the data page, so it changes nothing there."
+        ),
+    ),
     county: Optional[str] = Query(
         default=None,
         description="Filter by county name (e.g. 'Anoka').",
@@ -3398,6 +3407,17 @@ async def list_properties(
 
         if source:
             query = query.eq("source", source)
+
+        # ADDED 2026-08-11. Saved searches ask "what started matching since I
+        # last looked?" and get the answer from THIS endpoint rather than a
+        # parallel query, so the badge count can never disagree with the rows
+        # the user sees when they click it.
+        #
+        # observed_at is when WE first recorded the event, not when the county
+        # published it -- which is the correct basis here. A notice published
+        # three weeks ago that our scraper reached today is new TO THE USER.
+        if observed_since:
+            query = query.gt("observed_at", observed_since)
 
         if county:
             # REWRITTEN 2026-08-10. Two stacked defects, both measured live:
