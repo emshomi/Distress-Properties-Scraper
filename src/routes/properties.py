@@ -19,6 +19,8 @@ Routes:
 from __future__ import annotations
 
 import re as _re
+import threading
+import time as _time
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status as http_status
@@ -966,6 +968,117 @@ def _owner_key(raw: dict) -> Optional[str]:
     return str(gis_owner).strip().upper()
 
 
+# ============================================================
+# LOOKUP-MAP CACHE — stale-while-revalidate
+# ============================================================
+# ADDED 2026-08-10. /properties took 4.75 SECONDS, measured steady across
+# runs, and limit=1 cost the SAME as limit=50 — the signature of a fixed
+# number of round trips rather than a slow query or a large result.
+#
+# Cause: every request rebuilt four lookup maps from scratch, and
+# PostgREST caps a response at 1000 rows, so each map costs one HTTP
+# round trip PER PAGE:
+#
+#     parcel_distress_overlay   7,994 rows  ->  9 pages
+#     redemption_tracker        2,161 rows  ->  3 pages
+#     owner_distress_summary      684 rows  ->  1 page
+#     tax_delinquency_status      502 rows  ->  1 page
+#     + the matching rows themselves        ->  2 pages
+#                                              -- ---------
+#                                              16 round trips
+#
+# At ~300ms Railway->Supabase latency apiece that IS the 4.75 seconds.
+#
+# NOT a database problem, and this was checked before writing any code:
+# signals.parcel_distress_overlay computes in 99ms (EXPLAIN ANALYZE,
+# 2026-08-10). Materialising it would have saved 99ms of 4,750 — the fix
+# that looked obvious was worth almost nothing, so it was not made.
+#
+# The four maps are IDENTICAL FOR EVERY REQUEST — no user, tier or filter
+# input reaches them. Rebuilding them per request is pure repetition.
+#
+# WHY STALE-WHILE-REVALIDATE rather than a plain TTL:
+# a plain TTL makes whoever arrives first after expiry pay the full 4.75s.
+# At low traffic that is a LARGE FRACTION of real users — the cache would
+# help almost nobody. Here an expired entry is served IMMEDIATELY and
+# refreshed on a background thread, so the only request that ever pays is
+# the first one after a deploy.
+#
+# A refresh FAILURE keeps serving the last good maps and resets the clock,
+# so a Supabase blip degrades to slightly-stale badges rather than to no
+# badges. Same stale-if-error philosophy as _DEAL_CALIBRATION_CACHE.
+_MAP_CACHE_TTL_S = 300.0
+
+_map_caches: dict[str, dict[str, Any]] = {}
+_map_locks: dict[str, threading.Lock] = {}
+
+
+def _refresh_map_cache(name: str, fn: Any) -> None:
+    """Background refresh. Never raises — this runs on a daemon thread."""
+    entry = _map_caches[name]
+    try:
+        data = fn()
+        entry["data"] = data
+        entry["at"] = _time.monotonic()
+    except Exception as e:
+        # Keep the last good data and reset the clock so a failing
+        # dependency is retried once per TTL, not on every request.
+        entry["at"] = _time.monotonic()
+        logger.warning(
+            "map cache refresh failed — serving stale",
+            cache=name,
+            error_type=type(e).__name__,
+        )
+    finally:
+        entry["refreshing"] = False
+
+
+def _cached_map(name: str, ttl: float = _MAP_CACHE_TTL_S) -> Any:
+    """Memoise a zero-argument map loader with stale-while-revalidate."""
+    def decorator(fn: Any) -> Any:
+        _map_caches[name] = {"at": 0.0, "data": None, "refreshing": False}
+        _map_locks[name] = threading.Lock()
+
+        def wrapper() -> Any:
+            entry = _map_caches[name]
+            lock = _map_locks[name]
+            data = entry["data"]
+
+            if data is not None and (_time.monotonic() - entry["at"]) < ttl:
+                return data
+
+            if data is not None:
+                # STALE: hand back the old map now, refresh behind it.
+                spawn = False
+                with lock:
+                    if not entry["refreshing"]:
+                        entry["refreshing"] = True
+                        spawn = True
+                if spawn:
+                    threading.Thread(
+                        target=_refresh_map_cache,
+                        args=(name, fn),
+                        daemon=True,
+                    ).start()
+                return data
+
+            # COLD: nothing to serve, so this request must wait. The lock
+            # means concurrent cold requests load ONCE, not four times.
+            with lock:
+                if entry["data"] is not None:
+                    return entry["data"]
+                loaded = fn()
+                entry["data"] = loaded
+                entry["at"] = _time.monotonic()
+                return loaded
+
+        wrapper.__name__ = getattr(fn, "__name__", name)
+        wrapper.__doc__ = getattr(fn, "__doc__", None)
+        wrapper.uncached = fn
+        return wrapper
+    return decorator
+
+
 def _fetch_all_rows(table_name: str, columns: str) -> list[dict[str, Any]]:
     """Fetch EVERY row of a table/view, paging past PostgREST's per-response
     row cap (default 1000). A single .range(0, 9999) does NOT override that
@@ -1009,6 +1122,7 @@ def _fetch_all_rows(table_name: str, columns: str) -> list[dict[str, Any]]:
     return all_rows
 
 
+@_cached_map("overlay")
 def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
     """Fetch the whole overlay view and index it by (county, parcel_id).
 
@@ -1052,6 +1166,7 @@ def _load_overlay_map() -> dict[tuple[str, str], dict[str, Any]]:
     return overlay_map
 
 
+@_cached_map("owner")
 def _load_owner_map() -> dict[str, dict[str, Any]]:
     """Fetch signals.owner_distress_summary once and index it by owner_norm.
 
@@ -1238,6 +1353,7 @@ def _fetch_all_rows_in_schema(table_fn, table_name: str, columns: str) -> list[d
     return all_rows
 
 
+@_cached_map("tracker")
 def _load_redemption_tracker_map() -> dict[str, dict[Any, dict[str, Any]]]:
     """Fetch outcomes.redemption_tracker and index it two ways:
 
@@ -1303,6 +1419,7 @@ _TAX_STATUS_KEYS = (
 )
 
 
+@_cached_map("delq")
 def _load_delq_status_map() -> dict[tuple[str, str], dict[str, Any]]:
     """Fetch signals.tax_delinquency_status and index by
     (county_slug_lower, parcel_id) — the table's natural PK.
