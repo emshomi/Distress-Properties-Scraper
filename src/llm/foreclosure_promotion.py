@@ -364,6 +364,15 @@ def build_promotion_rows(
 
     distress_event = {
         "parcel_id": effective_pid,
+        # ADDED 2026-08-10. signals.distress_events has a COMPOSITE foreign
+        # key (county_code, parcel_id) -> core.parcels, and this dict never
+        # set county_code — only sheriff_sale and parcel_row did. Measured
+        # live: 8 mnpublicnotice sheriff rows carried county_code NULL, all
+        # of them observed 2026-08-08 to 08-10, i.e. every promotion since
+        # the column started mattering. A NULL member makes the composite FK
+        # unenforced, so those rows pointed at nothing and could not be
+        # re-keyed to their real parcel until the column was backfilled.
+        "county_code": county_code,
         "event_type": "sheriff_sale",
         "event_subtype": "scheduled",
         "event_date": sale_date,
