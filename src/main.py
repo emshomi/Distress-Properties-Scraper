@@ -27,6 +27,7 @@ from src.routes import (
     health,
     marketplace,
     properties,
+    saved_searches,
     status,
     trigger,
 )
@@ -174,7 +175,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    # DELETE added 2026-08-11 for DELETE /saved-searches/{id}. Without it the
+    # browser fails the preflight and blocks the request before it is sent —
+    # no status code, no server log, a bare "CORS error" in devtools. Same
+    # trap the X-Connect-Session header note below describes.
+    allow_methods=["GET", "POST", "DELETE", "HEAD", "OPTIONS"],
     # X-Connect-Session is what makes POST /connect/raise-hand a preflighted
     # request. Omitting it here fails the OPTIONS check, so the browser blocks
     # the POST before sending it — no status code, no server-side log, and a
@@ -214,6 +219,12 @@ app.include_router(connect.router)
 # right for browsing locked cards and wrong for anything that writes. It uses
 # resolve_investor, which 401s.
 app.include_router(marketplace.router)
+# Saved searches — an investor's standing criteria plus an alert cadence.
+# Uses resolve_tier for the tier claim, but every endpoint calls
+# _require_user() first, which 401s when the context carries no user_id.
+# resolve_tier alone would not be enough here for the reason given above:
+# it falls through to "free" rather than raising, and these endpoints write.
+app.include_router(saved_searches.router)
 
 
 # ============================================================
