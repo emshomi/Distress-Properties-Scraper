@@ -2477,6 +2477,35 @@ async def stats_endpoint() -> dict[str, Any]:
 
     total_signals = sum(c["count"] for c in categories if c["id"] != "parcels")
 
+    # ---- counties with ANY signal, from the same view the dropdown uses
+    # ADDED 2026-08-10. The dropdown said 41 while this endpoint said 7, on
+    # the SAME page. Both numbers were defensible in isolation and the pair
+    # was indefensible.
+    #
+    # counties_covered stays as it was -- counties with a DEDICATED distress
+    # source that has data -- because that distinction is real and the
+    # comment below defends it. What was missing is the number the coverage
+    # dropdown actually shows: counties where we hold ANY signal, including
+    # the 32 reached only by the statewide mnpublicnotice feed.
+    #
+    # Three coverage figures now ship together, which is the honest set:
+    #   counties_covered       7  dedicated scraper, has data
+    #   counties_with_signals 41  we hold at least one event
+    #   counties_with_parcels 59  parcel spine loaded
+    counties_with_signals = 0
+    try:
+        _cws = (
+            signals_table("counties_with_signals")
+            .select("county_slug")
+            .execute()
+        )
+        counties_with_signals = len(_cws.data or [])
+    except Exception as e:
+        logger.warning(
+            "stats: counties_with_signals read failed",
+            error_type=type(e).__name__,
+        )
+
     # ---- source presence, from the same single read -------------------
     # Was 20 sequential existence probes. A source counts as present iff it
     # has at least one row, which by_source already answers.
@@ -2520,6 +2549,7 @@ async def stats_endpoint() -> dict[str, Any]:
             # now far wider -- hence counties_with_parcels. Showing only one
             # of these misleads in whichever direction it is read.
             "counties_covered": len(distinct_counties),
+            "counties_with_signals": counties_with_signals,
             "counties_with_parcels": counties_with_parcels,
             "data_sources": len(distinct_sources),
             "last_updated": last_updated,
