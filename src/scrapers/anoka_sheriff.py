@@ -1210,6 +1210,19 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
 
             signals.append(DistressEventInsert(
                 parcel_id=parcel_id,
+                # ADDED 2026-08-10. This scraper builds DistressEventInsert
+                # DIRECTLY (no to_event() projection), so it must set
+                # county_code itself. Without it the composite FK
+                # (county_code, parcel_id) -> core.parcels is unenforced AND
+                # distress_events_dedup_key never collides, because NULL is
+                # not equal to anything.
+                #
+                # Measured 2026-08-10: 2 Anoka events carried county_code
+                # NULL and were exact duplicates of rows that already
+                # existed with the county set. The dedup key should have
+                # refused them. 1,316 rows across three sources were
+                # affected in total; all were backfilled by hand.
+                county_code=self.county_code,
                 event_type="sheriff_sale",
                 event_subtype=("pending_sale" if is_pending else "completed_sale"),
                 event_date=sale_date,
