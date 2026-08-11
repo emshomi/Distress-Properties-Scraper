@@ -453,6 +453,56 @@ def _extract_mpls_vbr(raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+def _extract_mpls_311(raw: dict, row: dict) -> dict[str, Any]:
+    """mpls_311 — Minneapolis 311 code-violation inspections.
+
+    ADDED 2026-08-11. This source had NO extractor, so it fell through to
+    _extract_generic, which looks for attributes.Address and attributes.City
+    -- neither of which this feed uses. Result: every column blank except
+    Address, which survived only because the top-level raw.address happens
+    to be populated.
+
+    The feed keys its street address as attributes.Display (raw.address
+    mirrors it), and carries no city at all -- every row is Minneapolis by
+    definition, so it is fixed here exactly as _extract_mpls_vbr does.
+
+    owner and market_value are deliberately None: _apply_assessor_owners()
+    fills the CURRENT owner of record and the assessor value from
+    core.parcels afterwards. Measured 2026-08-11 across all 1,304 rows --
+    1,287 resolve an owner, 1,236 a market value, 1,294 coordinates.
+
+    status carries Inspection_Result, which is the whole point of the
+    source: VO (vacant open), VS (vacant secured), CON/CONCIT (condemned),
+    VACATE (order to vacate), UNOC (unoccupied). mpls_311.py filters
+    server-side to exactly these codes and discards routine inspection
+    administration.
+    """
+    attrs = raw.get("attributes") or {}
+    return {
+        "address": raw.get("address") or attrs.get("Display"),
+        "city": "Minneapolis",
+        "zip": None,
+        "owner": None,
+        "sale_date": None,
+        "sale_time": None,
+        # A code violation carries no dollar amount. event_value is NULL on
+        # all 1,304 rows -- an honest em-dash, not a missing mapping.
+        "amount": None,
+        "status": attrs.get("Inspection_Result") or raw.get("inspection_result"),
+        "tax_parcel_no": attrs.get("APN") or row.get("parcel_id"),
+        "original_principal": None,
+        "municipality": "Minneapolis",
+        "lat": attrs.get("Latitude"),
+        "lng": attrs.get("Longitude"),
+        "neighborhood": None,
+        "registered_date": row.get("event_date"),
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+    }
+
+
 def _extract_saint_paul_vacant(raw: dict, row: dict) -> dict[str, Any]:
     """saint_paul_vacant — Saint Paul DSI ArcGIS feed. ALL-CAPS keys
     (ADDRESS, PIN, VACANT_AS_OF, VB_CATEGORY, DWELLING_TYPE). Note
@@ -942,6 +992,7 @@ _EXTRACTORS: dict[str, Any] = {
     "washington_sheriff": _extract_washington,
     "startribune_legal": _extract_startribune_legal,
     "mpls_vbr": _extract_mpls_vbr,
+    "mpls_311": _extract_mpls_311,
     "saint_paul_vacant": _extract_saint_paul_vacant,
     "saint_paul_dsi": _extract_saint_paul_vacant,
     "hennepin_tax_roll": _extract_hennepin_tax,
