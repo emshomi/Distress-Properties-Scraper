@@ -43,6 +43,20 @@ _VALID_TIERS = {"free", "basic", "standard", "premium"}
 class TierContext:
     tier: str          # free | basic | standard | premium | admin
     is_admin: bool
+    # ADDED 2026-08-11 for saved searches, which must know WHICH user is
+    # asking. The JWT already carries it -- `sub` holds the
+    # app_auth.users.id uuid -- and _tier_from_jwt was decoding the whole
+    # payload and discarding everything but `tier`.
+    #
+    # Deliberately resolved HERE rather than in a second dependency: two
+    # places decoding the same token means two definitions of "valid token",
+    # and when they drift you get a request that is premium to one layer and
+    # anonymous to the other. One decode, one answer.
+    #
+    # None for admin-key, access-key and anonymous callers -- none of those
+    # identifies a user account, so anything that needs a user_id must
+    # require it explicitly rather than assume it is present.
+    user_id: Optional[str] = None
 
 
 def _admin_matches(x_admin_key: Optional[str]) -> bool:
@@ -52,8 +66,8 @@ def _admin_matches(x_admin_key: Optional[str]) -> bool:
     return hmac.compare_digest(x_admin_key, expected)
 
 
-def _tier_from_jwt(token: str) -> Optional[str]:
-    """Verify an app_auth RS256 JWT and return its tier claim, or None.
+def _tier_from_jwt(token: str) -> tuple[Optional[str], Optional[str]]:
+    """Verify an app_auth RS256 JWT and return (tier, user_id), or (None, None).
 
     Requires JWT_PUBLIC_KEY to be configured (PEM). Verification failures are
     swallowed (treated as 'no valid token') — a bad token must not error the
@@ -61,7 +75,7 @@ def _tier_from_jwt(token: str) -> Optional[str]:
     """
     public_key = getattr(settings, "jwt_public_key", None)
     if _pyjwt is None or not public_key:
-        return None
+        return None, None
     # settings may wrap it as a SecretStr
     if hasattr(public_key, "get_secret_value"):
         public_key = public_key.get_secret_value()
@@ -76,9 +90,12 @@ def _tier_from_jwt(token: str) -> Optional[str]:
         )
     except Exception as e:
         logger.info("jwt verify failed (ignored)", error_type=type(e).__name__)
-        return None
+        return None, None
     tier = (payload.get("tier") or "").lower()
-    return tier if tier in _VALID_TIERS else "free"
+    # `sub` is the app_auth.users.id uuid. Returned as a plain string; the
+    # caller decides whether a route requires it.
+    user_id = payload.get("sub") or None
+    return (tier if tier in _VALID_TIERS else "free"), user_id
 
 
 def _tier_from_access_key(x_access_key: str) -> Optional[str]:
@@ -118,9 +135,11 @@ async def resolve_tier(
     # 2. app_auth JWT (Bearer) — tier from claim.
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-        jwt_tier = _tier_from_jwt(token)
+        jwt_tier, jwt_user_id = _tier_from_jwt(token)
         if jwt_tier:
-            return TierContext(tier=jwt_tier, is_admin=False)
+            return TierContext(
+                tier=jwt_tier, is_admin=False, user_id=jwt_user_id
+            )
 
     # 3. Access key — tier from its row.
     if x_access_key:
