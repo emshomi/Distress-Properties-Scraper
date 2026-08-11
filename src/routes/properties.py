@@ -2191,78 +2191,83 @@ def _count_for_filter(filter_dict: dict[str, str]) -> int:
     summary="Live signal counts (categories + summary + counties).",
 )
 async def stats_endpoint() -> dict[str, Any]:
-    """Live counts for the homepage signal catalog."""
+    """Live counts for the homepage signal catalog.
+
+    REWRITTEN 2026-08-10. This endpoint took 54 SECONDS. Measured against
+    the deployed API: /health 139ms, /counties 2.0s, /properties 4.2s,
+    /stats 54,537ms -- and warm was no faster than cold, which is the
+    signature of a fixed number of round trips rather than a slow query.
+
+    Cause: ~58 SEQUENTIAL PostgREST calls, each with count="exact":
+        23  one per _CATEGORY_FILTERS entry
+         1  exact count over core.parcels (2,663,676 rows)
+        20  one existence probe per source
+         1  newest observed_at
+         1  parcels_per_county
+       ~12  one per covered county
+    At roughly 900ms of round-trip latency apiece that IS the 54 seconds.
+
+    It was never data volume. signals.distress_events holds 9,292 rows and
+    aggregates in 10.8ms (EXPLAIN ANALYZE, 2026-08-10). The homepage was
+    slow because of how many times it asked, not how much it asked for.
+
+    Now TWO calls: signals.stats_source_counts (21 rows, source ->
+    event_type -> count + newest) and core.parcels_per_county. Every
+    number below is derived in Python from those, using the SAME maps as
+    before, so the output shape and every figure are unchanged.
+
+    The exact count over core.parcels is gone entirely -- parcels_indexed
+    is the sum of parcels_per_county, which was already being read.
+
+    The precedent is the 2026-08-07 parcels_per_county migration, whose
+    comment below states the rule this endpoint then went on breaking in
+    five other places: PostgREST cannot GROUP BY, so aggregate in the
+    database and read it once.
+    """
+    # ---- single read: per (source, event_type) counts -----------------
+    counts: dict[tuple[str, Optional[str]], int] = {}
+    by_source: dict[str, int] = {}
+    last_updated: Optional[str] = None
+    try:
+        rows = signals_table("stats_source_counts").select("*").execute()
+        for row in (rows.data or []):
+            src_name = row.get("source")
+            if not src_name:
+                continue
+            n = row.get("n") or 0
+            counts[(src_name, row.get("event_type"))] = n
+            by_source[src_name] = by_source.get(src_name, 0) + n
+            newest = row.get("newest")
+            if newest and (last_updated is None or newest > last_updated):
+                last_updated = newest
+    except Exception as e:
+        logger.warning(
+            "stats: stats_source_counts read failed",
+            error_type=type(e).__name__,
+        )
+
+    def _count_filter(f: dict[str, str]) -> int:
+        """Resolve one _CATEGORY_FILTERS entry from the single read.
+
+        A filter naming only a source sums that source's event types; one
+        naming an event_type takes that pair. Identical semantics to the
+        per-filter COUNT it replaces.
+        """
+        src_name = f.get("source")
+        if not src_name:
+            return 0
+        et = f.get("event_type")
+        if et is None:
+            return by_source.get(src_name, 0)
+        return counts.get((src_name, et), 0)
+
     categories: list[dict[str, Any]] = []
     for cat_id, filters in _CATEGORY_FILTERS.items():
-        total = sum(_count_for_filter(f) for f in filters)
+        total = sum(_count_filter(f) for f in filters)
         srcs = sorted({f.get("source", "") for f in filters if f.get("source")})
         categories.append({"id": cat_id, "count": total, "sources": srcs})
 
-    try:
-        parcels_result = (
-            core_table("parcels")
-            .select("parcel_id", count="exact")
-            .limit(1)
-            .execute()
-        )
-        parcels_count = parcels_result.count or 0
-    except Exception as e:
-        logger.warning(
-            "stats: parcels count failed",
-            error_type=type(e).__name__,
-        )
-        parcels_count = 0
-    categories.append({
-        "id": "parcels",
-        "count": parcels_count,
-        "sources": ["core.parcels"],
-    })
-
-    total_signals = sum(c["count"] for c in categories if c["id"] != "parcels")
-
-    # Probe each known source for presence (avoids the 1k-row response cap).
-    # Include the per-row-county sources too so they count toward data_sources.
-    _probe_sources = set(_SOURCE_TO_COUNTY.keys()) | _PER_ROW_COUNTY_SOURCES
-    distinct_sources: set[str] = set()
-    for src in _probe_sources:
-        try:
-            r = (
-                signals_table("distress_events")
-                .select("id", count="exact")
-                .eq("source", src)
-                .limit(1)
-                .execute()
-            )
-            if (r.count or 0) > 0:
-                distinct_sources.add(src)
-        except Exception as e:
-            logger.warning(
-                "stats: source existence probe failed",
-                source=src,
-                error_type=type(e).__name__,
-            )
-
-    distinct_counties = {
-        _SOURCE_TO_COUNTY[src]
-        for src in distinct_sources
-        if src in _SOURCE_TO_COUNTY
-    }
-
-    try:
-        newest = (
-            signals_table("distress_events")
-            .select("observed_at")
-            .order("observed_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        last_updated = (
-            newest.data[0].get("observed_at") if newest.data else None
-        )
-    except Exception:
-        last_updated = None
-
-    # Per-county parcel counts, read ONCE from core.parcels_per_county.
+    # ---- single read: per-county parcels ------------------------------
     # ADDED 2026-08-07 (migration: parcels_per_county.sql).
     #
     # PostgREST cannot GROUP BY, so a per-county count previously meant one
@@ -2270,6 +2275,7 @@ async def stats_endpoint() -> dict[str, Any]:
     # reads all of it in a single call.
     parcels_by_slug: dict[str, int] = {}
     counties_with_parcels = 0
+    parcels_count = 0
     try:
         ppc = core_table("parcels_per_county").select("*").execute()
         for row in (ppc.data or []):
@@ -2277,6 +2283,9 @@ async def stats_endpoint() -> dict[str, Any]:
             n = row.get("parcels") or 0
             if slug:
                 parcels_by_slug[slug] = n
+        # parcels_indexed derived here rather than via an exact count over
+        # 2.66M rows. Same number, one fewer round trip.
+        parcels_count = sum(parcels_by_slug.values())
         # Counties holding a REAL spine. Thresholded at >100 deliberately:
         # about ten counties exist in core.parcels holding a single synthetic
         # COUNTY-FC- stub minted by foreclosure_promotion to satisfy an FK for
@@ -2291,21 +2300,36 @@ async def stats_endpoint() -> dict[str, Any]:
             error_type=type(e).__name__,
         )
 
+    categories.append({
+        "id": "parcels",
+        "count": parcels_count,
+        "sources": ["core.parcels"],
+    })
+
+    total_signals = sum(c["count"] for c in categories if c["id"] != "parcels")
+
+    # ---- source presence, from the same single read -------------------
+    # Was 20 sequential existence probes. A source counts as present iff it
+    # has at least one row, which by_source already answers.
+    _probe_sources = set(_SOURCE_TO_COUNTY.keys()) | _PER_ROW_COUNTY_SOURCES
+    distinct_sources = {
+        src_name for src_name in _probe_sources
+        if by_source.get(src_name, 0) > 0
+    }
+
+    distinct_counties = {
+        _SOURCE_TO_COUNTY[src_name]
+        for src_name in distinct_sources
+        if src_name in _SOURCE_TO_COUNTY
+    }
+
     counties_breakdown: list[dict[str, Any]] = []
     for county in sorted(distinct_counties):
-        county_sources = _sources_for_county(county)
-        try:
-            cresult = (
-                signals_table("distress_events")
-                .select("id", count="exact")
-                .in_("source", county_sources)
-                .limit(1)
-                .execute()
-            )
-            ccount = cresult.count or 0
-        except Exception:
-            ccount = 0
-        # FIXED 2026-08-07. Was `parcels_count if county == "Hennepin"` —
+        # Was one COUNT per county. Same set of sources, summed locally.
+        ccount = sum(
+            by_source.get(s, 0) for s in _sources_for_county(county)
+        )
+        # FIXED 2026-08-07. Was `parcels_count if county == "Hennepin"` --
         # the ENTIRE STATEWIDE total assigned to Hennepin. True when Hennepin
         # was the only county with a spine; badly wrong after the MnGeo load
         # put 51 counties in core.parcels. The homepage showed Hennepin with
@@ -2324,7 +2348,7 @@ async def stats_endpoint() -> dict[str, Any]:
             "parcels_indexed": parcels_count,
             # counties_covered = counties with a DEDICATED distress source
             # that has data. It says nothing about parcel coverage, which is
-            # now far wider — hence counties_with_parcels. Showing only one
+            # now far wider -- hence counties_with_parcels. Showing only one
             # of these misleads in whichever direction it is read.
             "counties_covered": len(distinct_counties),
             "counties_with_parcels": counties_with_parcels,
@@ -2333,7 +2357,8 @@ async def stats_endpoint() -> dict[str, Any]:
         },
         "counties": counties_breakdown,
     })
-    
+
+
 # ============================================================
 # GET /counties — the data-driven coverage registry (2026-07-13)
 # ============================================================
