@@ -136,6 +136,17 @@ async def _count_matches(
     cats: list[Optional[str]] = list(categories) if categories else [None]
     total = 0
     for cat in cats:
+        # EVERY parameter is passed explicitly. list_properties is declared
+        # with FastAPI Query(default=None) defaults, and calling it as a
+        # plain Python function does NOT resolve those — an omitted
+        # parameter arrives as a Query object, which is truthy, so the
+        # endpoint would try to filter on it.
+        #
+        # Verified 2026-08-11: calling such a function with 3 of 4
+        # parameters leaves the fourth as `Query(None)`, not None. Passing
+        # the full set is the only safe way to reuse the endpoint directly.
+        call: dict[str, Any] = {k: None for k in _ALLOWED_FILTER_KEYS}
+        call.update(filters)
         try:
             res = await list_properties(
                 _ctx=ctx,
@@ -143,7 +154,7 @@ async def _count_matches(
                 observed_since=since,
                 limit=1,
                 offset=0,
-                **filters,
+                **call,
             )
         except TypeError as e:
             # A stored filter key that list_properties no longer accepts.
