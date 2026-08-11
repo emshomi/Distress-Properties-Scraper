@@ -193,12 +193,21 @@ async def list_saved_searches(_ctx: TierContext = TierResolved) -> dict[str, Any
         )
         rows = result.data or []
     except Exception as e:
+        # TEMPORARY DIAGNOSTIC 2026-08-11: the exception text is returned to
+        # the caller because logger.warning is not reaching Railway's log
+        # stream, and three rounds of guessing produced nothing. Revert to a
+        # generic message once the cause is known — an internal error string
+        # is not something to leave in a production response.
         logger.warning(
             "saved search list failed", error_type=type(e).__name__
         )
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"message": "Could not load your saved searches."},
+            detail={
+                "message": "Could not load your saved searches.",
+                "debug_type": type(e).__name__,
+                "debug_error": str(e)[:500],
+            },
         ) from e
 
     out: list[dict[str, Any]] = []
