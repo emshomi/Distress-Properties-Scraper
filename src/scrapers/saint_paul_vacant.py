@@ -153,6 +153,18 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         # used to project the unified distress_events row.
         return VbrListingInsert(
             parcel_id=pid,
+            # ADDED 2026-08-10. The write() step below already patches
+            # county_code onto the TYPED vacant_registrations rows, and its
+            # comment records why: a NULL-county row dedups only against
+            # other NULL-county rows, "precisely how 1,451 duplicate
+            # distress_events accumulated in 24 hours on 2026-08-07".
+            #
+            # The EVENT projection was never given the same treatment.
+            # to_event() now carries county_code through, so setting it here
+            # fixes the same class of bug on signals.distress_events, where
+            # the composite FK (county_code, parcel_id) -> core.parcels and
+            # distress_events_dedup_key both depend on it.
+            county_code=self.county_code,
             city="Saint Paul",
             registry_type=category_label,
             date_entered_registry=registered_date,
