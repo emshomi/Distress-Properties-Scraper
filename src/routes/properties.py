@@ -151,6 +151,20 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     "scott_sheriff": "Scott",
     "carver_sheriff": "Carver",
     "mpls_vbr": "Hennepin",
+    # ADDED 2026-08-11. Minneapolis is wholly within Hennepin County.
+    #
+    # Its absence is why the mpls_311 rows rendered with County, Owner,
+    # Type/Area and Est. Value all em-dash after the category was added:
+    # _resolve_county() returns None for a source not in this map, and
+    # _apply_assessor_owners() buckets its candidates on
+    # (county_slug, parcel_id) -- the composite key fixed 2026-08-10. An
+    # empty county means the key never matches, so NO parcel and NO owner is
+    # ever patched in. Four columns fall out together from one missing entry.
+    #
+    # This is the THIRD registration mpls_311 needed. A scraper is not
+    # "shipped" until it appears in core.source_county_map, _SOURCE_TO_COUNTY,
+    # _EXTRACTORS and _CATEGORY_FILTERS. Nothing enforces that.
+    "mpls_311": "Hennepin",
     "saint_paul_vacant": "Ramsey",
     "saint_paul_dsi": "Ramsey",
     "hennepin_tax_roll": "Hennepin",
