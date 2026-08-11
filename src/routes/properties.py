@@ -1512,7 +1512,7 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
     def _missing_coords(s: dict[str, Any]) -> bool:
         return s.get("lat") is None or s.get("lng") is None
 
-    val_need: dict[str, list[dict[str, Any]]] = {}
+    val_need: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for s in shaped_rows:
         if not (_missing_mv(s) or _missing_coords(s)
                 or s.get("lot_sqft") is None
@@ -1522,17 +1522,47 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
         pid = s.get("parcel_id")
         if not pid:
             continue
-        val_need.setdefault(pid, []).append(s)
+        # COMPOSITE KEY. Minnesota parcel IDs are NOT unique across counties.
+        #
+        # DEFECT FIXED 2026-08-10. This looked up core.parcels by parcel_id
+        # ALONE, then applied whatever came back -- address, city, zip,
+        # market value, lat/lng, lot size, property type -- to the row.
+        # Measured against live foreclosure rows the same day: of 710 PINs
+        # present in the spine, 3 exist in TWO counties.
+        #
+        #   301900150 -> 112723 Hundertmark Road, Chaska    (carver)
+        #             -> 430 Northeast 3rd Street, Clara City (chippewa)
+        #   210815000 -> 101 Jackson Street West, Caledonia (houston)
+        #             -> 1040 1st Avenue Northeast, Glenwood City (pope)
+        #   310421000 -> Swanville Twp (morrison) / renville
+        #
+        # Whichever row PostgREST returned first won, arbitrarily, and ALL
+        # SIX carry coordinates -- so the map pin landed in the wrong county
+        # with nothing on the page to show it was wrong.
+        #
+        # This is the single-column-join class the composite-key migration
+        # exists to prevent (a single-column PK previously destroyed ~191,600
+        # rows). Filtering on parcel_id alone also cannot use the
+        # (county_code, parcel_id) primary key, so it scanned 2.66M rows.
+        #
+        # The event row's PIN is used unchanged -- only the county condition
+        # is added, so this can only REMOVE wrong matches, never introduce
+        # new ones.
+        county = _county_slug(s.get("county")) or ""
+        if not county:
+            continue
+        val_need.setdefault((county, pid), []).append(s)
     if val_need:
         try:
             vres = (
                 core_table("parcels")
                 .select(
-                    "parcel_id, estimated_market_value, lat, lng, "
-                    "lot_sqft, prop_type_name:raw_data->>PR_TYP_NM1, "
+                    "county_code, parcel_id, estimated_market_value, "
+                    "lat, lng, lot_sqft, "
+                    "prop_type_name:raw_data->>PR_TYP_NM1, "
                     "address, city, zip"
                 )
-                .in_("parcel_id", list(val_need.keys()))
+                .in_("parcel_id", list({pid for (_c, pid) in val_need}))
                 .execute()
             )
             for p in (vres.data or []):
@@ -1543,7 +1573,13 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
                 paddr = (p.get("address") or "").strip() or None
                 pcity = (p.get("city") or "").strip() or None
                 pzip = (p.get("zip") or "").strip() or None
-                for s in val_need.get(p.get("parcel_id"), []):
+                # Match on the COMPOSITE key. A row from another county
+                # simply finds no bucket and is discarded.
+                _key = (
+                    (p.get("county_code") or "").lower(),
+                    p.get("parcel_id"),
+                )
+                for s in val_need.get(_key, []):
                     if s.get("address") is None and paddr:
                         # Source published no address (e.g. the delinquent
                         # tax list carries legal descriptions only) — the
@@ -1578,27 +1614,36 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
     #    absentee" is well-defined even when the displayed owner is a
     #    notice mortgagor). Additive: never overwrites a value already set
     #    by the source (tax rolls compute their own is_absentee).
-    need_name: dict[str, list[dict[str, Any]]] = {}
-    need_attrs: dict[str, list[dict[str, Any]]] = {}
+    need_name: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    need_attrs: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for s in shaped_rows:
         pid = s.get("parcel_id")
         if not pid:
             continue
+        # COMPOSITE KEY -- same defect and same fix as the parcel patch
+        # above. core.owners holds 1,911,003 rows across 51 counties with
+        # ZERO null county_code (verified 2026-08-10), so filtering on it
+        # drops nothing that was previously found.
+        county = _county_slug(s.get("county")) or ""
+        if not county:
+            continue
+        key = (county, pid)
         if not s.get("owner"):
-            need_name.setdefault(pid, []).append(s)
+            need_name.setdefault(key, []).append(s)
         if s.get("owner_type") is None or s.get("is_absentee") is None:
-            need_attrs.setdefault(pid, []).append(s)
-    all_pids = set(need_name) | set(need_attrs)
-    if not all_pids:
+            need_attrs.setdefault(key, []).append(s)
+    all_keys = set(need_name) | set(need_attrs)
+    if not all_keys:
         return
     try:
         result = (
             core_table("owners")
             .select(
-                "parcel_id, owner_name, owner_type, mailing_address, "
-                "mailing_city, mailing_state, mailing_zip, is_absentee"
+                "county_code, parcel_id, owner_name, owner_type, "
+                "mailing_address, mailing_city, mailing_state, "
+                "mailing_zip, is_absentee"
             )
-            .in_("parcel_id", list(all_pids))
+            .in_("parcel_id", list({pid for (_c, pid) in all_keys}))
             .eq("is_current", True)
             .execute()
         )
@@ -1614,6 +1659,8 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
         name = o.get("owner_name")
         if not pid:
             continue
+        # Composite match: another county's owner finds no bucket.
+        okey = ((o.get("county_code") or "").lower(), pid)
         mailing_bits = [
             o.get("mailing_address"),
             " ".join(
@@ -1626,11 +1673,11 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
         ]
         mailing = ", ".join(b for b in mailing_bits if b) or None
         if name:
-            for s in need_name.get(pid, []):
+            for s in need_name.get(okey, []):
                 s["owner"] = name
                 if not s.get("owner_mailing"):
                     s["owner_mailing"] = mailing
-        for s in need_attrs.get(pid, []):
+        for s in need_attrs.get(okey, []):
             if s.get("owner_type") is None:
                 s["owner_type"] = o.get("owner_type")
             if s.get("is_absentee") is None:
