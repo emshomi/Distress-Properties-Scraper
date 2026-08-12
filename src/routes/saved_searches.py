@@ -71,12 +71,31 @@ _VALID_FREQUENCIES = {"daily", "weekly", "never"}
 # _count_matches logs loudly rather than swallowing.
 _ALLOWED_FILTER_KEYS = {
     "source", "county", "status_filter", "redemption", "outcome",
-    "redeemed", "multi_signal", "min_amount",
-    "year_built_min", "year_built_max", "sqft_min", "lot_sqft_min",
+    "redeemed", "multi_signal", "min_amount", "max_amount",
+    "year_built_min", "year_built_max", "sqft_min",
+    "lot_sqft_min", "lot_sqft_max",
     "property_type", "school_district", "price_min", "price_max",
+    "equity_min", "equity_max",
     "sale_date_from", "sale_date_to", "owner_type", "absentee",
     "sort", "order",
 }
+
+# ADDED 2026-08-12: equity_min, equity_max, max_amount, lot_sqft_max.
+#
+# This is the failure the comment above predicts, and it happened. Those four
+# parameters were added to list_properties the same day and this set was not
+# updated with them. Because _count_matches builds its call as
+# {k: None for k in _ALLOWED_FILTER_KEYS}, the four missing names were never
+# passed — so they arrived as FastAPI Query objects, which are truthy, and the
+# endpoint tried to filter on Query(None). PostgREST rejected the query, the
+# except below swallowed it, and EVERY buy box lost its count badge until this
+# was found by looking at the page.
+#
+# Two symptoms, one cause: _clean_filters also drops unknown keys, so a buy
+# box saved with an equity filter would have silently discarded it on write.
+#
+# The rule this encodes: adding a filter parameter to list_properties is not
+# done until it appears HERE as well.
 
 _MAX_SEARCHES_PER_USER = 25
 
