@@ -20,6 +20,8 @@ import os
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, status as http_status
 from pydantic import BaseModel
 
@@ -838,5 +840,43 @@ async def scrape_mnpublicnotice(payload: MnNoticeScrapeIn) -> dict[str, Any]:
     except Exception as e:
         logger.exception("admin mnpublicnotice scrape failed", error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Failed to run the mnpublicnotice scrape.")
+
+@router.post(
+    "/admin/run-saved-search-alerts",
+    status_code=http_status.HTTP_200_OK,
+    summary="Send any saved-search digests that are due (manual trigger).",
+    dependencies=[AdminKeyRequired],
+)
+async def run_saved_search_alerts_now() -> dict[str, Any]:
+    """Run the alert job once, on demand.
+
+    ADDED 2026-08-11 so the digest can be watched working before it goes on
+    a schedule. Sending on a cron that has never been observed sending is
+    how a broken alert stays broken for a month.
+
+    Runs on a WORKER THREAD for the reason cron.py's header sets out at
+    length: the write path underneath is synchronous throughout, and awaiting
+    it on the API's loop would pin uvicorn for the duration.
+
+    Respects the same due-check as the scheduled run — a search alerted an
+    hour ago will not be alerted again, so calling this repeatedly cannot
+    spam anyone.
+    """
+    from src.services.saved_search_alerts import run_saved_search_alerts_blocking
+
+    try:
+        summary = await asyncio.to_thread(run_saved_search_alerts_blocking)
+    except Exception as e:
+        logger.exception(
+            "manual saved-search alert run failed",
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": f"Alert run failed: {type(e).__name__}: {e}"},
+        ) from e
+
+    return success_envelope(summary)
+
 
 __all__ = ["router"]
