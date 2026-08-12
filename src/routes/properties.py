@@ -3053,25 +3053,21 @@ def _apply_category_filter(query: Any, category: str) -> Any:
 
 
 # ============================================================
-# COMPUTED SORTS (equity / redemption urgency)
+# COMPUTED SORTS (redemption urgency)
 # ============================================================
 # These order on values that aren't plain DB columns, so they're applied in
 # Python after the rows are shaped (see list_properties). Both push rows that
 # can't be scored to the END regardless of asc/desc, so missing-data rows never
 # masquerade as the best or worst results — they're set aside, not hidden.
 
-def _equity_key(p: dict[str, Any]) -> float | None:
-    """Equity = market_value - amount_due. Returns None unless BOTH values are
-    present and numeric — a spread is only meaningful with both sides, so a row
-    missing either is unscoreable (sorts to the end) rather than faked as 0."""
-    mv = p.get("market_value")
-    amt = p.get("amount")
-    if mv is None or amt is None:
-        return None
-    try:
-        return float(mv) - float(amt)
-    except (TypeError, ValueError):
-        return None
+# _equity_key REMOVED 2026-08-12. Equity is now the real view column
+# equity_spread and is ordered by Postgres. Re-sorting it here would have been
+# worse than redundant: this function keyed off the SHAPED market_value (which
+# comes from each source's raw_data, patched from the parcel spine only where
+# missing), while the DB orders on emv_total. Those two disagree — measured the
+# same day, e.g. parcel 2702924110164 carries 25,337,400 in raw_data against
+# 25,137,400 on the spine — so a Python re-sort would have silently reordered
+# rows the database had already ordered by a different number.
 
 
 def _redemption_key(p: dict[str, Any]) -> int | None:
@@ -3162,21 +3158,14 @@ def _sort_computed(
     """Sort shaped rows by a computed key, always sending unscoreable rows
     (key is None) to the end. `descending` applies only to the scored rows.
 
-    equity:              higher spread = better deal. Default view wants the
-                         biggest deals first, so 'desc' is the natural order.
     redemption_urgency:  fewer days left = more urgent. 'asc' (soonest first)
                          is the natural order; expired rows (negative days)
                          would sort before in-redemption ones, so we also drop
                          already-expired rows to the bottom of the scored set
                          to keep 'act now' rows on top.
     """
-    if sort == "equity":
-        keyed = [(_equity_key(p), p) for p in rows]
-        scored = [(k, p) for (k, p) in keyed if k is not None]
-        unscored = [p for (k, p) in keyed if k is None]
-        scored.sort(key=lambda kp: kp[0], reverse=descending)
-        return [p for (_k, p) in scored] + unscored
-
+    # No "equity" branch: it sorts DB-side on equity_spread now. See the note
+    # where _equity_key used to live.
     if sort == "redemption_urgency":
         keyed = [(_redemption_key(p), p) for p in rows]
         # Split: still-actionable (days >= 0) vs expired (days < 0) vs no-window.
@@ -3330,6 +3319,28 @@ async def list_properties(
         default=None, ge=0,
         description="Maximum estimated market value (emv_total).",
     ),
+    # --- Equity spread (2026-08-12) ---
+    # Backed by signals.distress_with_parcel.equity_spread, added as a real
+    # view column the same day. No ge= bound: a spread is legitimately
+    # NEGATIVE (underwater — owed exceeds value), and "show me everything
+    # underwater" is a real investor query, not an input error.
+    #
+    # NULL on 76.5% of rows, because it needs BOTH market value and amount
+    # owed and most sources publish only one. Setting either bound therefore
+    # excludes three quarters of inventory — the frontend must show the same
+    # kind of coverage note that year_built has. A NULL spread means UNKNOWN,
+    # never zero.
+    equity_min: Optional[float] = Query(
+        default=None,
+        description="Minimum equity spread (emv_total - event_value), USD. "
+                    "May be negative. Rows without both values are excluded "
+                    "when this is set.",
+    ),
+    equity_max: Optional[float] = Query(
+        default=None,
+        description="Maximum equity spread (emv_total - event_value), USD. "
+                    "May be negative.",
+    ),
     
     sale_date_from: Optional[str] = Query(
         default=None,
@@ -3398,6 +3409,8 @@ async def list_properties(
             "school_district": school_district,
             "price_min": price_min,
             "price_max": price_max,
+            "equity_min": equity_min,
+            "equity_max": equity_max,
             "sale_date_from": sale_date_from,
             "sale_date_to": sale_date_to,
             "redemption": redemption,
@@ -3416,6 +3429,8 @@ async def list_properties(
     school_district = _gated["school_district"]
     price_min = _gated["price_min"]
     price_max = _gated["price_max"]
+    equity_min = _gated["equity_min"]
+    equity_max = _gated["equity_max"]
     sale_date_from = _gated["sale_date_from"]
     sale_date_to = _gated["sale_date_to"]
     redemption = _gated["redemption"]
@@ -3585,6 +3600,14 @@ async def list_properties(
             query = query.gte("emv_total", price_min)
         if price_max is not None:
             query = query.lte("emv_total", price_max)
+        # Pushed down to Postgres against the real equity_spread column. Rows
+        # where either side is NULL drop out on the comparison, which is the
+        # correct behaviour: an unknown spread cannot be asserted to fall
+        # inside a range.
+        if equity_min is not None:
+            query = query.gte("equity_spread", equity_min)
+        if equity_max is not None:
+            query = query.lte("equity_spread", equity_max)
 
         if sale_date_from:
             query = query.gte("event_date", sale_date_from)
@@ -3629,7 +3652,17 @@ async def list_properties(
         #
         # equity STAYS computed -- it needs assessor values attached during
         # shaping and has no DB-side equivalent.
-        computed_sorts = {"equity"}
+        # EMPTY as of 2026-08-12. "equity" lived here because the spread was
+        # computed in Python from two columns, which forced the fetch-all path
+        # — up to 20 separate 1000-row queries — every time anyone sorted by
+        # it. signals.distress_with_parcel.equity_spread is now a real column,
+        # so it sorts DB-side like any other and pages normally.
+        #
+        # Kept as a set rather than deleted: multi_signal, the tracker states
+        # and the owner filters still legitimately need the fetch-all path, and
+        # a future genuinely-computed sort belongs here rather than in a new
+        # mechanism.
+        computed_sorts: set[str] = set()
 
         # Bucketed ordering that reproduces _sort_computed's three-way split
         # for redemption_urgency: actionable (days >= 0) ascending, then
@@ -3661,11 +3694,18 @@ async def list_properties(
         def _spec(col: str, desc: bool) -> str:
             return f"{col}.{'desc' if desc else 'asc'}.nullslast"
 
+        # The PUBLIC sort key is not always the column name. "equity" is the
+        # string the frontend sends and saved searches have stored since the
+        # feature shipped; the column it now maps to is equity_spread. Renaming
+        # the param would silently break every saved buy box, so the mapping
+        # lives here instead.
+        _SORT_COLUMN = {"equity": "equity_spread"}
+
         def _order_by_sort(q: Any, _sort: str, _desc: bool) -> Any:
             if _sort == "redemption_urgency":
                 q = q.order(_spec("redemption_sort_bucket", False))
                 return q.order(_spec("redemption_days_left", _desc))
-            return q.order(_spec(_sort, _desc))
+            return q.order(_spec(_SORT_COLUMN.get(_sort, _sort), _desc))
 
         # The outcome filter is PREMIUM data (which rows redeemed vs sold is
         # itself the leverage) — silently neutralized below premium, matching
