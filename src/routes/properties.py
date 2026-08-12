@@ -1692,19 +1692,54 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
             continue
         val_need.setdefault((county, pid), []).append(s)
     if val_need:
-        try:
-            vres = (
-                core_table("parcels")
-                .select(
-                    "county_code, parcel_id, estimated_market_value, "
-                    "lat, lng, lot_sqft, "
-                    "prop_type_name:raw_data->>PR_TYP_NM1, "
-                    "address, city, zip"
+        # CHUNKED — READ BEFORE CHANGING (2026-08-12).
+        #
+        # This was ONE .in_() carrying every PIN that needed patching. PostgREST
+        # takes in_ as a URL query parameter, so 4,615 thirteen-character PINs
+        # built a ~60KB URI and the request failed. The except below caught it
+        # and logged a warning — and warnings raised inside a caught exception
+        # during a request are precisely the ones that do not reach Railway's
+        # log stream (recorded 2026-08-11). So the tax-delinquent tab rendered
+        # market_value $0 and NULL coordinates on every row, silently, for as
+        # long as that tab has had more than a few hundred rows.
+        #
+        # The foreclosure tab never hit it: a few hundred PINs stay under the
+        # URI limit, which is why this looked like it worked.
+        #
+        # 200 keeps the URI near 3KB with plenty of headroom. A partial failure
+        # now degrades one chunk to em-dash instead of the whole page.
+        _PID_CHUNK = 200
+        _all_pids = sorted({pid for (_c, pid) in val_need})
+        _parcel_rows: list[dict[str, Any]] = []
+        for _i in range(0, len(_all_pids), _PID_CHUNK):
+            _chunk = _all_pids[_i:_i + _PID_CHUNK]
+            try:
+                vres = (
+                    core_table("parcels")
+                    .select(
+                        "county_code, parcel_id, estimated_market_value, "
+                        "lat, lng, lot_sqft, "
+                        "prop_type_name:raw_data->>PR_TYP_NM1, "
+                        "address, city, zip"
+                    )
+                    .in_("parcel_id", _chunk)
+                    .execute()
                 )
-                .in_("parcel_id", list({pid for (_c, pid) in val_need}))
-                .execute()
-            )
-            for p in (vres.data or []):
+                _parcel_rows.extend(vres.data or [])
+            except Exception as e:
+                # logger.exception, not warning: this path was invisible for
+                # months precisely because a warning inside a caught exception
+                # never surfaced. A traceback does.
+                logger.exception(
+                    "assessor parcel patch chunk failed (those rows keep "
+                    "em-dash)",
+                    error_type=type(e).__name__,
+                    chunk_start=_i,
+                    chunk_size=len(_chunk),
+                    total_pids=len(_all_pids),
+                )
+        try:
+            for p in _parcel_rows:
                 emv = p.get("estimated_market_value")
                 plat, plng = p.get("lat"), p.get("lng")
                 plot = p.get("lot_sqft")
@@ -1738,9 +1773,13 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
                     if s.get("property_type_name") is None and ptype:
                         s["property_type_name"] = ptype
         except Exception as e:
-            logger.warning(
-                "assessor parcel patch failed (rows keep em-dash)",
+            # Applying the fetched rows onto the shaped rows. Separate from the
+            # fetch above so a mapping bug is not mistaken for a network
+            # failure. logger.exception for the same reason as above.
+            logger.exception(
+                "assessor parcel patch apply failed (rows keep em-dash)",
                 error_type=type(e).__name__,
+                parcel_rows=len(_parcel_rows),
             )
 
     # ---- Owners ----
@@ -3595,16 +3634,38 @@ async def list_properties(
         # Bucketed ordering that reproduces _sort_computed's three-way split
         # for redemption_urgency: actionable (days >= 0) ascending, then
         # expired (days < 0) with the most recent first, then rows with no
-        # window. Postgres sorts NULLs last in ASC with nullsfirst=False,
-        # which is why the bucket column exists rather than ordering on
-        # days_left alone.
+        # window. The bucket column exists so the three-way split is explicit
+        # rather than relying on null placement alone.
+        # NULLS LAST IS BUILT BY HAND — READ BEFORE CHANGING (2026-08-12).
+        #
+        # postgrest 0.18.0 CANNOT emit nullslast. Its order() builds the spec
+        # as:
+        #     f"{'.desc' if desc else ''}{'.nullsfirst' if nullsfirst else ''}"
+        # so nullsfirst=False emits NOTHING. It only knows how to ADD
+        # nullsfirst; there is no code path that produces nullslast.
+        #
+        # Every call here previously passed nullsfirst=False believing it
+        # forced NULLs to the end. It never did. The spec went out as
+        # "emv_total.desc" and Postgres applied its DEFAULT, which for DESC is
+        # NULLS FIRST — so every "highest first" view in the product led with
+        # its emptiest rows. Measured 2026-08-12: the first five rows of
+        # tax_delinquent sorted by market value were the 103 parcels (2.5%)
+        # with no spine match, all rendering as $0.
+        #
+        # The column argument is concatenated verbatim, so passing the FULL
+        # PostgREST order spec through it produces exactly the right string
+        # using only the public method:
+        #     order("emv_total.desc.nullslast")  ->  emv_total.desc.nullslast
+        # Verified against postgrest 0.18.0 before shipping. Do NOT reintroduce
+        # the desc= / nullsfirst= kwargs here; they cannot express this.
+        def _spec(col: str, desc: bool) -> str:
+            return f"{col}.{'desc' if desc else 'asc'}.nullslast"
+
         def _order_by_sort(q: Any, _sort: str, _desc: bool) -> Any:
             if _sort == "redemption_urgency":
-                q = q.order("redemption_sort_bucket", desc=False,
-                            nullsfirst=False)
-                return q.order("redemption_days_left", desc=_desc,
-                               nullsfirst=False)
-            return q.order(_sort, desc=_desc, nullsfirst=False)
+                q = q.order(_spec("redemption_sort_bucket", False))
+                return q.order(_spec("redemption_days_left", _desc))
+            return q.order(_spec(_sort, _desc))
 
         # The outcome filter is PREMIUM data (which rows redeemed vs sold is
         # itself the leverage) — silently neutralized below premium, matching
@@ -3642,7 +3703,7 @@ async def list_properties(
             # in Python afterward, so id-only order is sufficient for them.
             if sort not in computed_sorts:
                 query = _order_by_sort(query, sort, order == "desc")
-            query = query.order("id", desc=False)
+            query = query.order(_spec("id", False))
 
             # Fetch EVERY matching row before shaping/filtering — never a
             # single capped slice. The multi_signal filter and computed sorts
@@ -3793,14 +3854,15 @@ async def list_properties(
             return success_envelope(_envelope)
 
         # Fast DB-level column sort + pagination.
-        # nullsfirst=False: Postgres floats NULLs to the top of DESC sorts by
-        # default, which put date-less legal notices above every dated sale on
-        # "latest first". Nulls belong at the end in both directions.
+        # NULLs last is enforced by _order_by_sort building the spec by hand —
+        # Postgres floats NULLs to the top of DESC sorts by default, which put
+        # date-less legal notices above every dated sale on "latest first".
+        # Nulls belong at the end in both directions.
         # id tiebreaker (2026-07-12): rows tied on the sort column can swap
         # across page boundaries between requests (same instability fixed in
         # the fetch-all path) — a unique secondary key pins them.
         query = _order_by_sort(query, sort, order == "desc")
-        query = query.order("id", desc=False)
+        query = query.order(_spec("id", False))
         query = query.range(offset, offset + limit - 1)
 
         result = query.execute()
@@ -3876,7 +3938,11 @@ async def get_property(
         if parcel_id:
             result = result.eq("parcel_id", parcel_id)
         result = (
-            result.order("event_date", desc=True, nullsfirst=False)
+            # Full PostgREST spec in the column argument — postgrest 0.18.0
+            # cannot emit nullslast via kwargs (see _order_by_sort in
+            # list_properties). Without it a NULL-dated event outranks a dated
+            # one and this endpoint returns the WRONG event as "most recent".
+            result.order("event_date.desc.nullslast")
             .limit(2)
             .execute()
         )
