@@ -422,7 +422,8 @@ def gate_filters_for_tier(tier: str, params: dict[str, Any]) -> dict[str, Any]:
 
     Keys expected (any subset): multi_signal, min_amount, year_built_min,
     year_built_max, sqft_min, lot_sqft_min, property_type, school_district,
-    price_min, price_max, sale_date_from, sale_date_to, redemption, sort.
+    price_min, price_max, equity_min, equity_max, sale_date_from,
+    sale_date_to, redemption, sort.
 
     free / basic / premium / admin: returned unchanged (free/basic filter on
     locked rows as a teaser; premium/admin hunt on full data).
@@ -439,6 +440,12 @@ def gate_filters_for_tier(tier: str, params: dict[str, Any]) -> dict[str, Any]:
         "sqft_min", "lot_sqft_min",
         "property_type", "school_district",
         "price_min", "price_max",
+        # Equity spread (2026-08-12): the single most valuable hunting filter
+        # on the platform — "show me everything with $150k+ of spread" is the
+        # investor's core query. Premium-only, same as every other power
+        # filter. Standard still SEES the control (Decision 1) and gets the
+        # upgrade prompt.
+        "equity_min", "equity_max",
         "sale_date_from", "sale_date_to",
         "redemption",
         # Owner filters (2026-07-09): hunting by the current owner's
