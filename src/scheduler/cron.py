@@ -156,6 +156,39 @@ async def _run_scraper_job(scraper_class_name: str) -> None:
         )
 
 
+async def _run_saved_search_alerts_job() -> None:
+    """Send the saved-search digests that are due.
+
+    ADDED 2026-08-11. NOT a BaseScraper, so it does not belong in
+    _SCRAPER_SCHEDULES above — it reads saved.searches, counts matches via
+    /properties and sends email. Registered separately in start_scheduler().
+
+    Runs at 09:00 Central, AFTER the scrapers (06:00-08:30). A digest that
+    fired before the overnight scrape would report yesterday's news and the
+    genuinely new properties would wait a day.
+
+    Same worker-thread dispatch as the scrapers, for the reason this file's
+    header sets out: the write path underneath is synchronous throughout, and
+    awaiting it on the API's loop would pin uvicorn for the duration.
+    """
+    from src.services.saved_search_alerts import run_saved_search_alerts_blocking
+
+    try:
+        summary = await asyncio.to_thread(run_saved_search_alerts_blocking)
+        logger.info(
+            "Scheduled saved-search alerts complete",
+            considered=summary.get("considered"),
+            due=summary.get("due"),
+            sent=summary.get("sent"),
+            failed=summary.get("failed"),
+        )
+    except Exception as exc:
+        logger.exception(
+            "Scheduled saved-search alerts crashed",
+            error_type=type(exc).__name__,
+        )
+
+
 def _on_job_executed(event: JobExecutionEvent) -> None:
     logger.debug("APScheduler job executed", job_id=event.job_id)
 
@@ -233,6 +266,21 @@ def start_scheduler() -> AsyncIOScheduler:
             cron=str(cron_kwargs),
             next_run=str(next_run) if next_run else "unknown",
         )
+
+    # Saved-search digests. Registered outside the loop above because it is
+    # not a scraper — see _run_saved_search_alerts_job.
+    scheduler.add_job(
+        func=_run_saved_search_alerts_job,
+        trigger=CronTrigger(timezone=_SCHEDULE_TIMEZONE, hour=9, minute=0),
+        id="saved_search_alerts",
+        name="Send saved-search digests",
+        replace_existing=True,
+    )
+    logger.info(
+        "Registered scheduled job",
+        job="saved_search_alerts",
+        cron="09:00 daily",
+    )
 
     scheduler.start()
     _scheduler = scheduler
