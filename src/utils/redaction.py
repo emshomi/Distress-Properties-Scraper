@@ -435,9 +435,9 @@ def gate_filters_for_tier(tier: str, params: dict[str, Any]) -> dict[str, Any]:
 
     gated = dict(params)
     _GATED_FILTER_KEYS = (
-        "multi_signal", "min_amount",
+        "multi_signal", "min_amount", "max_amount",
         "year_built_min", "year_built_max",
-        "sqft_min", "lot_sqft_min",
+        "sqft_min", "lot_sqft_min", "lot_sqft_max",
         "property_type", "school_district",
         "price_min", "price_max",
         # Equity spread (2026-08-12): the single most valuable hunting filter
