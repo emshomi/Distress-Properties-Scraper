@@ -50,6 +50,30 @@ Unlike the web scrapers, fetch() queries the database instead of HTTP:
   write():  write_events_dedup (idempotent — re-mining is safe; unchanged
             parcels produce new=0).
 
+=== event_value IS NULL ON BOTH PATHS — DELIBERATE (2026-08-12) ===
+Both events used to set event_value=market_value. That field means "the
+amount at stake in this event": the debt on a delinquency, the minimum bid
+on a forfeit. The Hennepin parcel roll publishes NEITHER.
+
+The roll flags that a parcel is delinquent (EARLIEST_DELQ_YR) and what it is
+worth (MKT_VAL_TOT). It does not publish what is owed. Writing the market
+value there asserted a debt figure that was never measured — 3,943 rows
+where amount-owed and market value were byte-identical, including one at
+$76,700,000 against an actual annual tax of $2,557,224.
+
+The same applied to forfeits, where event_value renders as "Min. bid": these
+rows are mined from the roll, not from an auction listing, so no minimum bid
+exists to report.
+
+market_value stays in raw_data, and the display reads market value from the
+parcel spine (emv_total) — nothing is lost by this being NULL. An em-dash
+saying "we don't hold this" is honest; a number that is not the debt is not.
+GOVIRE_FOUR_TIER_SPEC.md: never conflate "you can't see this" with "this
+doesn't exist".
+
+If Hennepin ever publishes a delinquent balance, it goes here — and only
+then.
+
 Severity:
   tax_forfeit                     -> medium (already seized; awaiting auction)
   tax_delinquent, older year      -> higher distress (longer behind)
@@ -358,7 +382,11 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     # date. Dedup key is NULLS NOT DISTINCT (2026-07-07),
                     # so re-mining stays idempotent.
                     event_date=None,
-                    event_value=market_value,
+                    # NULL, not market_value — see the module docstring. This
+                    # field renders as "Min. bid" on the forfeit tab, and a
+                    # roll-mined parcel has no auction listing and therefore
+                    # no minimum bid. market_value is kept in raw_data below.
+                    event_value=None,
                     source=self.source_name,
                     source_id=parcel_id,
                     severity="medium",  # type: ignore[arg-type]
@@ -420,7 +448,10 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                     event_type="tax_delinquent",
                     event_subtype="property_tax_delinquent",
                     event_date=delq_event_date,
-                    event_value=market_value,
+                    # NULL, not market_value — see the module docstring. The
+                    # roll publishes no delinquent balance; annual_tax below
+                    # is the only real money figure it carries.
+                    event_value=None,
                     source=self.source_name,
                     source_id=parcel_id,
                     severity=severity,  # type: ignore[arg-type]
