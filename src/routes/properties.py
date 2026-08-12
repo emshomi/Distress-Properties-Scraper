@@ -3282,6 +3282,13 @@ async def list_properties(
         ge=0,
         description="Minimum event_value (USD) — the debt/bid amount (investor lens).",
     ),
+    max_amount: Optional[float] = Query(
+        default=None,
+        ge=0,
+        description="Maximum event_value (USD). Added 2026-08-12: deal size "
+                    "has an upper bound as well as a lower one — 'owes between "
+                    "$50k and $200k' is the shape of a real buy box.",
+    ),
     # --- Buyer-lens filters (backed by signals.distress_with_parcel columns) ---
     year_built_min: Optional[int] = Query(
         default=None, ge=1700, le=2100,
@@ -3301,6 +3308,13 @@ async def list_properties(
     lot_sqft_min: Optional[int] = Query(
         default=None, ge=0,
         description="Minimum lot size in square feet.",
+    ),
+    lot_sqft_max: Optional[int] = Query(
+        default=None, ge=0,
+        description="Maximum lot size in square feet. Added 2026-08-12 so the "
+                    "rail's lot-size control can be a real two-handle range — "
+                    "an upper bound is a genuine query (an investor hunting "
+                    "infill lots does not want a 40-acre parcel).",
     ),
     property_type: Optional[str] = Query(
         default=None,
@@ -3401,10 +3415,12 @@ async def list_properties(
         {
             "multi_signal": multi_signal,
             "min_amount": min_amount,
+            "max_amount": max_amount,
             "year_built_min": year_built_min,
             "year_built_max": year_built_max,
             "sqft_min": sqft_min,
             "lot_sqft_min": lot_sqft_min,
+            "lot_sqft_max": lot_sqft_max,
             "property_type": property_type,
             "school_district": school_district,
             "price_min": price_min,
@@ -3421,10 +3437,12 @@ async def list_properties(
     )
     multi_signal = _gated["multi_signal"]
     min_amount = _gated["min_amount"]
+    max_amount = _gated["max_amount"]
     year_built_min = _gated["year_built_min"]
     year_built_max = _gated["year_built_max"]
     sqft_min = _gated["sqft_min"]
     lot_sqft_min = _gated["lot_sqft_min"]
+    lot_sqft_max = _gated["lot_sqft_max"]
     property_type = _gated["property_type"]
     school_district = _gated["school_district"]
     price_min = _gated["price_min"]
@@ -3576,6 +3594,8 @@ async def list_properties(
 
         if min_amount is not None:
             query = query.gte("event_value", min_amount)
+        if max_amount is not None:
+            query = query.lte("event_value", max_amount)
 
         # --- Buyer-lens filters (real columns on the view) ---
         # Each is a plain DB-level comparison, so it's fast and scales with the
@@ -3592,6 +3612,8 @@ async def list_properties(
             query = query.gte("sqft", sqft_min)
         if lot_sqft_min is not None:
             query = query.gte("lot_sqft", lot_sqft_min)
+        if lot_sqft_max is not None:
+            query = query.lte("lot_sqft", lot_sqft_max)
         if property_type:
             query = query.eq("property_type", property_type)
         if school_district:
