@@ -76,6 +76,7 @@ import psycopg2
 import psycopg2.extras
 
 from src.config import settings
+from src.services.email import resend_send
 from src.utils.logger import logger
 
 
@@ -83,7 +84,6 @@ _TOKEN_BYTES = 32
 _LINK_TTL_MINUTES = 30
 _SESSION_TTL_DAYS = 30
 
-_RESEND_URL = "https://api.resend.com/emails"
 
 
 @contextmanager
@@ -138,58 +138,12 @@ def _normalize_phone(phone: Optional[str]) -> Optional[str]:
     return digits if len(digits) == 10 else None
 
 
-async def _resend_send(to_email: str, subject: str, text: str,
-                       context: str) -> bool:
-    """POST one email to Resend. Returns True on a 2xx, False on anything else.
-
-    NEVER raises. Every caller runs after the thing the owner actually asked
-    for has already succeeded — a link row is written, a listing is saved —
-    so a mail failure must degrade to a logged False, not an exception that
-    turns a completed action into an error the owner sees.
-
-    Shared rather than copied. The owner classifier lived in five files and
-    had drifted from the requirement in all of them; this is the second
-    caller and there will be a third, so it gets factored now while there is
-    still only one correct version to preserve.
-
-    `context` appears in the logs so a failure can be traced to which kind of
-    email failed — Railway drops loguru lines intermittently and a generic
-    "Resend rejected" line would be unattributable.
-    """
-    api_key = getattr(settings, "resend_api_key", None)
-    from_addr = getattr(settings, "alert_email_from", None)
-    if api_key is None or not from_addr:
-        logger.error("connect: RESEND_API_KEY or ALERT_EMAIL_FROM unset; "
-                     "cannot send email", context=context)
-        return False
-    if hasattr(api_key, "get_secret_value"):
-        api_key = api_key.get_secret_value()
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                _RESEND_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "from": from_addr,
-                    "to": [to_email],
-                    "subject": subject,
-                    "text": text,
-                },
-            )
-    except httpx.HTTPError as e:
-        logger.error("connect: Resend unreachable", context=context,
-                     error_type=type(e).__name__, error=str(e)[:400])
-        return False
-
-    if 200 <= resp.status_code < 300:
-        return True
-    logger.error("connect: Resend rejected send", context=context,
-                 status=resp.status_code, body=resp.text[:400])
-    return False
+# _resend_send MOVED 2026-08-11 to src/services/email.py. It was always
+# shared infrastructure — its own docstring said so — and the third caller
+# (the saved-search alert job, which runs on the scheduler) must not import
+# a private function out of a route module. Aliased so the call sites below
+# are unchanged.
+_resend_send = resend_send
 
 
 async def _send_magic_link(
