@@ -842,7 +842,11 @@ async def scrape_mnpublicnotice(payload: MnNoticeScrapeIn) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to run the mnpublicnotice scrape.")
 
 @router.post(
-    "/admin/run-saved-search-alerts",
+    # No "/admin" prefix here — the router already carries it (see the other
+    # routes in this file, which are declared "/approve", "/decline" etc).
+    # Writing it out produced /admin/admin/run-saved-search-alerts, which
+    # answered correctly and looked like a typo to anyone reading it.
+    "/run-saved-search-alerts",
     status_code=http_status.HTTP_200_OK,
     summary="Send any saved-search digests that are due (manual trigger).",
     dependencies=[AdminKeyRequired],
