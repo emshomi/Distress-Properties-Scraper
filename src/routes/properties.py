@@ -1362,6 +1362,105 @@ def _load_parcel_enrichment(county_code: str, parcel_id: str) -> Optional[dict[s
     return enrichment or None
 
 
+def _load_parcel_imagery(county_code: str, parcel_id: str) -> Optional[dict[str, Any]]:
+    """Fetch imagery REFERENCES for ONE parcel from core.parcel_imagery,
+    keyed by (county_code, parcel_id). Returns None if the parcel has no
+    imagery rows at all.
+
+    Shape returned:
+        {"street_view": {...} | None, "aerial": {...} | None,
+         "available": bool}
+
+    `available` is the ONLY imagery field safe to expose below STANDARD.
+    Everything else in here is a LOCATOR — see the gating note below.
+
+    === WHY pano_id IS A LOCATOR ===
+    A panorama id resolves to exact coordinates with ONE unauthenticated call
+    to Google's metadata endpoint. It is machine-readable and bulk-harvestable
+    across every row on a page, which makes it a STRONGER locator than the
+    address string, not a weaker one. src/utils/redaction.py already places
+    lat/lng in _LOCATOR_FIELDS alongside address, city and parcel_id; pano_id
+    belongs there by the same reasoning and must never reach a below-Standard
+    client. A blurred image with a live src in devtools is not a lock.
+
+    === WHY THE STATUSES ARE NOT COLLAPSED ===
+    'no_imagery' (Google has nothing here), 'too_far' (a panorama exists but
+    stands beyond the property-type threshold — a picture of a field, not of
+    the house) and 'no_location' (the parcel has no lat/lng at all, which is a
+    GEOCODING gap, not an imagery one) are three different facts. Collapsing
+    them would make a false statement about our own coverage — the same defect
+    shape as records_new making dead and healthy sources look identical.
+    The frontend renders a different message per status.
+
+    === COVERAGE, MEASURED 2026-08-13 ===
+    Of 8,321 distress parcels: 6,635 have a usable street-facing panorama,
+    7,453 have an aerial (every parcel with a coordinate), 688 have neither
+    for want of a coordinate. Street View near-coverage is 92% in the metro
+    counties and 37-45% rural, which is why aerial is a co-equal source and
+    not a fallback: on a 40-acre parcel the overhead is the better image.
+    """
+    if not county_code or not parcel_id:
+        return None
+    try:
+        result = (
+            core_table("parcel_imagery")
+            .select(
+                "source, status, pano_id, pano_date, pano_lat, pano_lng, "
+                "distance_m, heading_deg, zoom, resolved_at"
+            )
+            .eq("county_code", county_code)
+            .eq("parcel_id", parcel_id)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.warning(
+            "parcel imagery fetch failed",
+            county=county_code, parcel_id=parcel_id,
+            error_type=type(e).__name__,
+        )
+        return None
+
+    if not rows:
+        return None
+
+    by_source = {r.get("source"): r for r in rows}
+    sv = by_source.get("google_streetview")
+    ae = by_source.get("google_aerial")
+
+    out: dict[str, Any] = {
+        # True when EITHER source can render something. Non-locating: it says
+        # a picture exists, not where. This is what a Free/Basic client sees.
+        "available": bool(
+            (sv and sv.get("status") == "ok")
+            or (ae and ae.get("status") == "ok")
+        ),
+        "street_view": None,
+        "aerial": None,
+    }
+
+    if sv:
+        out["street_view"] = {
+            "status": sv.get("status"),
+            "pano_id": sv.get("pano_id"),
+            # Rendered against the distress timeline: an image captured
+            # BEFORE first delinquency shows the property before the trouble;
+            # one captured during redemption shows it after. Both dates are
+            # already in the payload, so this costs one line to display and is
+            # something no competitor holding only imagery can say.
+            "captured": sv.get("pano_date"),
+            "heading": sv.get("heading_deg"),
+            "distance_m": sv.get("distance_m"),
+        }
+    if ae:
+        out["aerial"] = {
+            "status": ae.get("status"),
+            "zoom": ae.get("zoom"),
+        }
+
+    return out
+
+
 # ============================================================
 # REDEMPTION OUTCOME TRACKER (outcomes.redemption_tracker)
 # ============================================================
@@ -4042,6 +4141,17 @@ async def get_property(
         eff_pid = _effective_parcel_id(src, raw_data, rows[0])
         county_slug = (_resolve_county(src, raw_data) or "").lower()
         shaped["enrichment"] = _load_parcel_enrichment(county_slug, eff_pid) if eff_pid else None
+
+        # Imagery references (Google pano ids, NEVER pixels — the terms permit
+        # storing the id indefinitely and prohibit storing the image). Same
+        # composite key as the enrichment lookup above. Detail view only: the
+        # list endpoint gets a camera glyph from a bulk join, because a
+        # thumbnail per row would be 50 billable panorama requests per page.
+        #
+        # Gated below by redact_property: imagery_pano is in _LOCATOR_FIELDS,
+        # so below STANDARD the pano id is nulled and flagged and the client
+        # receives only imagery.available — one non-locating boolean.
+        shaped["imagery"] = _load_parcel_imagery(county_slug, eff_pid) if eff_pid else None
 
         # Drop the internal de-dup key — single-property responses don't need it.
         shaped.pop("_eff_key", None)
