@@ -178,6 +178,80 @@ def _normalize_dakota_pin(raw_pin: Any) -> str | None:
     return sanitized or None
 
 
+def _polygon_centroid(
+    geometry: dict[str, Any] | None,
+) -> tuple[float | None, float | None]:
+    """Area-weighted centroid of an ArcGIS polygon, as (lat, lng).
+
+    ADDED 2026-08-13. Dakota's service is an ArcGIS SERVER MapServer (11.2)
+    and its advancedQueryCapabilities does NOT advertise
+    supportsReturningGeometryCentroid — unlike Washington's hosted
+    FeatureServer, which does. Sending returnCentroid here would be silently
+    IGNORED: polygons come back, no centroid key appears, and every row lands
+    with lat=None while the run reports success. That exact failure cost a
+    full 118,418-row Washington load earlier the same day, so it is checked
+    rather than assumed.
+
+    So we compute it ourselves from the rings.
+
+    WHY AREA-WEIGHTED AND NOT A VERTEX MEAN:
+    averaging vertices pulls the result toward whichever edge happens to carry
+    the most points — and these rings are dense (a single residential lot in
+    the sample response has ~40 vertices, unevenly spaced). On a rectangular
+    suburban lot the two agree closely; on an irregular rural parcel they can
+    differ by tens of metres, which matters directly because the imagery
+    resolver's too_far threshold is 60m for a structure. The shoelace formula
+    gives the true centroid in a dozen lines with no dependency.
+
+    Falls back to the vertex mean when the ring has zero signed area
+    (collinear or degenerate points), where the shoelace centroid is undefined
+    rather than merely imprecise.
+
+    Uses the FIRST ring only. Later rings in an ArcGIS polygon are holes or
+    disjoint parts; for "where is this parcel" the outer ring is the answer.
+    """
+    if not geometry:
+        return None, None
+    rings = geometry.get("rings")
+    if not rings or not isinstance(rings, list):
+        return None, None
+    ring = rings[0]
+    if not isinstance(ring, list) or len(ring) < 3:
+        return None, None
+
+    pts: list[tuple[float, float]] = []
+    for pt in ring:
+        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+            x, y = _safe_float(pt[0]), _safe_float(pt[1])
+            if x is not None and y is not None:
+                pts.append((x, y))
+    if len(pts) < 3:
+        return None, None
+
+    # Shoelace: signed area and area-weighted centroid.
+    area2 = 0.0
+    cx = 0.0
+    cy = 0.0
+    for i in range(len(pts)):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % len(pts)]
+        cross = (x0 * y1) - (x1 * y0)
+        area2 += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+
+    if abs(area2) < 1e-12:
+        # Degenerate ring — no area to weight by. Vertex mean is the only
+        # meaningful answer left, and is correct for a point-like parcel.
+        return (
+            sum(p[1] for p in pts) / len(pts),
+            sum(p[0] for p in pts) / len(pts),
+        )
+
+    factor = 1.0 / (3.0 * area2)
+    return cy * factor, cx * factor   # (lat, lng) — ArcGIS is (x=lng, y=lat)
+
+
 class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     """Dakota County tax parcels — streaming foundation loader."""
 
@@ -191,15 +265,27 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     # outFields=* payload that (with geometry) overwhelmed the server. Every
     # name here is verified present in the layer-71 schema.
     out_fields: ClassVar[str] = (  # CHANGED (added; was inherited "*")
-        "PIN,SITEADDRESS,FULLNAME_PUBLIC,JOINT_OWNER_PUBLIC,"
-        "OWN_ADD_L1,OWN_ADD_L2,OWN_ADD_L3,TOTALVAL,HOMESTEAD,"
-        "MUNICIPALITY,YEAR_BUILT,TAXPIN,OLDPIN"
+        "OBJECTID,PIN,SITEADDRESS,FULLNAME_PUBLIC,JOINT_OWNER_PUBLIC,"
+        "OWN_ADD_L1,OWN_ADD_L2,OWN_ADD_L3,HOMESTEAD,"
+        "MUNICIPALITY,YEAR_BUILT,TAXPIN,OLDPIN,"
+        # WIDENED 2026-08-13. Every name below is a ParcelUpsert field that
+        # was null on all ~150K Dakota parcels while this layer carried it.
+        # BEDS and BATH are notable: no other Minnesota loader populates
+        # them, because no other county's layer publishes them.
+        "TOTALVAL,LANDVAL,BLDGVAL,FNSHD_SF,TOTAL_SF,BEDS,BATH,"
+        "GAR_SF,TOTAL_ACRES,SCHOOL_DST,USE1_DESC,SALE_DATE,SALE_VALUE"
     )
-    # Geometry OFF: the address join needs no coordinates, and polygon geometry
-    # was the main cause of the too-heavy payload. lat/lng will be None.
-    return_geometry: ClassVar[bool] = False   # CHANGED (was True)
-    page_size: ClassVar[int] = 2000   # CHANGED (was 10000); layer max is 10000
-    max_pages: ClassVar[int] = 90     # CHANGED (was 30); ~150K / 2000 = 75 pages + headroom
+    # Geometry ON as POLYGONS — the layer does NOT support returnCentroid
+    # (checked 2026-08-13: no supportsReturningGeometryCentroid in
+    # advancedQueryCapabilities), so _polygon_centroid() computes it from the
+    # rings. Verified the server serves geometry at 2000/page without
+    # complaint; the "too-heavy payload" this comment used to describe was
+    # outFields=*, which is a different request entirely.
+    return_geometry: ClassVar[bool] = True    # CHANGED 2026-08-13 (was False)
+    # OBJECTID is required in out_fields for keyset paging (see _run_streaming).
+    objectid_field: ClassVar[str] = "OBJECTID"
+    page_size: ClassVar[int] = 2000   # layer maxRecordCount is 10000
+    max_pages: ClassVar[int] = 90     # ~150K / 2000 = 75 pages + headroom
     progress_log_every: ClassVar[int] = 20000
 
     # ---- parse_feature: convert one ArcGIS feature into a parcel dict ----
@@ -218,11 +304,15 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         address = _safe_str(attributes.get("SITEADDRESS"))
         city = _title_case_city(_safe_str(attributes.get("MUNICIPALITY")))
 
-        # Geometry: with return_geometry=False this is always None now. Kept
-        # inert/harmless so re-enabling geometry later needs no code change.
+        # Geometry: POLYGON rings. This layer cannot return a centroid, so we
+        # derive one. The geometry.get("y")/("x") branch is kept for the point
+        # case — if the service ever starts returning centroids, or the layer
+        # is swapped for a point layer, that path takes over unchanged.
         lat = None
         lng = None
-        if geometry:
+        if geometry and geometry.get("rings"):
+            lat, lng = _polygon_centroid(geometry)
+        elif geometry:
             lat = _safe_float(geometry.get("y"))
             lng = _safe_float(geometry.get("x"))
         if lat is not None and not (43.0 <= lat <= 50.0):
@@ -238,7 +328,19 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             year_built = None
 
         # Estimated market value: TOTALVAL (land + building total).
+        #
+        # FIXED 2026-08-13: written ONLY to estimated_market_value, the
+        # parallel LEGACY column. src/models/parcel.py records that emv_total
+        # is "the typed column the distress_with_parcel view and the UI
+        # actually read", so Dakota's assessed values were fetched, parsed and
+        # stored where nothing displays them — which is why its distress rows
+        # showed no valuation and no deal math. Not missing data, misrouted
+        # data. Same defect found in washington_parcels the same day.
         mkt_val = _safe_decimal(attributes.get("TOTALVAL"))
+
+        # TOTAL_ACRES is deeded acreage; core.parcels.lot_sqft is square feet.
+        acres = _safe_float(attributes.get("TOTAL_ACRES"))
+        lot_sqft = int(round(acres * 43560)) if acres and acres > 0 else None
 
         cleaned_raw = _clean_raw_data(attributes)
 
@@ -252,6 +354,18 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "year_built": year_built,
             "property_type": None,  # Dakota USE*_DESC is free text; not mapped yet
             "estimated_market_value": mkt_val,
+            # WIDENED 2026-08-13 — all previously null for every Dakota parcel
+            # while the layer carried them.
+            "emv_total": mkt_val,
+            "emv_land": _safe_decimal(attributes.get("LANDVAL")),
+            "emv_building": _safe_decimal(attributes.get("BLDGVAL")),
+            "sqft": _safe_int(attributes.get("FNSHD_SF")),
+            "lot_sqft": lot_sqft,
+            "beds": _safe_int(attributes.get("BEDS")),
+            "baths": _safe_float(attributes.get("BATH")),
+            "garage_sqft": _safe_int(attributes.get("GAR_SF")),
+            "use_class": _safe_str(attributes.get("USE1_DESC")),
+            "school_district": _safe_str(attributes.get("SCHOOL_DST")),
             "raw_data": cleaned_raw,
         }
 
@@ -289,6 +403,16 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     year_built=sig.get("year_built"),
                     property_type=sig.get("property_type"),  # type: ignore[arg-type]
                     estimated_market_value=sig.get("estimated_market_value"),
+                    emv_total=sig.get("emv_total"),
+                    emv_land=sig.get("emv_land"),
+                    emv_building=sig.get("emv_building"),
+                    sqft=sig.get("sqft"),
+                    lot_sqft=sig.get("lot_sqft"),
+                    beds=sig.get("beds"),
+                    baths=sig.get("baths"),
+                    garage_sqft=sig.get("garage_sqft"),
+                    use_class=sig.get("use_class"),
+                    school_district=sig.get("school_district"),
                     raw_data=sig.get("raw_data"),
                     data_sources=[self.source_name],
                     last_observed_at=datetime.now(timezone.utc),
@@ -303,7 +427,12 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     )
                 continue
 
-            row = payload.model_dump(mode="json", exclude_none=True)
+            # dump_owned(), NOT model_dump(exclude_none=True). This is a
+            # FULL-REFRESH loader — the source of record for these rows — so a
+            # field the layer does not publish is ABSENT, not unchanged.
+            # exclude_none drops the key, PostgREST omits the column from the
+            # UPDATE, and whatever was there survives. See src/models/parcel.py.
+            row = payload.dump_owned()
             row["last_observed_at"] = now_iso
             batch.append(row)
 
@@ -467,6 +596,16 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 timeout=settings.scraper_request_timeout_seconds,
                 headers={"User-Agent": "DistressProperties/1.0"},
             ) as client:
+                # KEYSET paging, not offset — changed 2026-08-13 alongside
+                # geometry. With resultOffset the server scans past every
+                # skipped row, so deep pages get linearly slower and eventually
+                # time out (hennepin_parcels died at page ~224 of 448 as pages
+                # degraded from ~7s to ~21s). Dakota's 75 pages survived that
+                # at geometry-off weight; polygon rings make every page far
+                # heavier, and this is the county's own server rather than
+                # ArcGIS Online. Keyset is constant-time at any depth.
+                after_oid = 0
+
                 for page in range(max_pages):
                     offset = page * page_size
 
@@ -480,7 +619,8 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
                     # --- FETCH one page ---
                     data = await self._fetch_page(
-                        client, offset, effective_page_size
+                        client, offset, effective_page_size,
+                        after_object_id=after_oid,
                     )
                     features = data.get("features") or []
                     if not features:
@@ -490,9 +630,16 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
                     # --- PARSE this page ---
                     page_signals: list[dict[str, Any]] = []
+                    max_oid_this_page = after_oid
                     for feature in features:
                         attributes = feature.get("attributes") or {}
+                        # Polygon rings — parse_feature computes the centroid.
+                        # No "centroid" key to prefer here: this layer does not
+                        # support returnCentroid (unlike Washington's).
                         geometry = feature.get("geometry")
+                        oid = attributes.get(self.objectid_field)
+                        if isinstance(oid, int) and oid > max_oid_this_page:
+                            max_oid_this_page = oid
                         try:
                             sig = await self.parse_feature(attributes, geometry)
                         except ParseError:
@@ -525,6 +672,19 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                         )
                         while next_progress <= total_fetched:
                             next_progress += self.progress_log_every
+
+                    # --- Advance the keyset cursor ---
+                    # No forward progress means the OBJECTIDs did not increase,
+                    # which would re-fetch the same page forever. Stop instead.
+                    if max_oid_this_page <= after_oid:
+                        logger.warning(
+                            "Dakota keyset cursor did not advance — stopping",
+                            scraper=self.source_name,
+                            after_oid=after_oid,
+                            page=page + 1,
+                        )
+                        break
+                    after_oid = max_oid_this_page
 
                     # --- Stop conditions ---
                     if len(features) < effective_page_size:
