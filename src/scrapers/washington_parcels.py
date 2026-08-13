@@ -42,12 +42,30 @@ Identical approach to dakota_parcels: override run() to stream
 fetch-page -> parse-page -> write-page -> discard, so we never hold the whole
 dataset in memory and each page is persisted as it is written.
 
-=== PAYLOAD NOTE (no geometry, trimmed fields) ===
-This is a hosted ArcGIS Online feature service (services1.arcgis.com), which
-caps pages at 2000 records. As with Dakota we request geometry=false and an
-explicit trimmed field list — the enrichment join needs only
-owner / mailing / value / homestead / address and NO geometry, which keeps each
-record tiny and the query reliable. Parcels load with lat/lng=None.
+=== PAYLOAD NOTE (centroids, widened fields) — REVISED 2026-08-13 ===
+This is a hosted ArcGIS Online feature service (services1.arcgis.com). Layer
+metadata reports maxRecordCount 1000 WITH geometry against
+standardMaxRecordCountNoGeometry 32000 — a 32x difference — which is why this
+loader and dakota_parcels originally requested geometry=false. For a PID join
+that was correct.
+
+The cost only became visible when imagery shipped: ALL 182 Washington distress
+parcels had no lat/lng, so no map, no Street View, no aerial and no geometry —
+and 172 of them HAD matched a real parcel. The coordinates were never missing,
+they were never requested.
+
+The layer advertises supportsReturningGeometryCentroid=true, so we now ask for
+the CENTROID rather than the polygon: one x/y pair per feature instead of a
+ring of hundreds. Payload stays light, and a centroid is the RIGHT point here —
+Street View needs somewhere to stand and look, not a boundary.
+
+The layer is projected in WCCS (Transverse Mercator, US survey feet), so the
+base class's outSR=4326 is load-bearing: without it centroids arrive in feet
+and the Minnesota bounding-box guard below nulls every one of them silently.
+
+Fields were widened at the same time. The trimmed list was chosen when only the
+join mattered, and left a dozen ParcelUpsert columns null across all 118,591
+parcels while the layer carried them all along.
 
 What it writes:
   - core.parcels rows + raw_data JSONB (all attributes preserved for mining)
@@ -186,13 +204,24 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
     # Explicit trimmed field list — only what enrichment needs. Every name here
     # is verified present in the TaxParcel layer-0 schema (from the API Explorer).
     out_fields: ClassVar[str] = (
-        "PIN,SITUS_ADDRESS,CITY,ZIP,OWNER_NAME,"
-        "OWN_ADD_L1,OWN_ADD_L2,OWN_ADD_L3,EMV_TOTAL,HOMESTEAD,"
-        "DWELL_TYPE,YEAR_BUILT"
+        "OBJECTID,PIN,SITUS_ADDRESS,CITY,ZIP,ZIP4,OWNER_NAME,"
+        "OWN_ADD_L1,OWN_ADD_L2,OWN_ADD_L3,HOMESTEAD,"
+        "DWELL_TYPE,YEAR_BUILT,"
+        # WIDENED 2026-08-13. Every name below is a ParcelUpsert field that
+        # was null on all 118,591 Washington parcels while this layer carried
+        # it. Verified against the layer-0 schema.
+        "EMV_TOTAL,EMV_LAND,EMV_BLDG,FIN_SQ_FT,NUM_UNITS,ACRES_DEED,"
+        "SCHOOL_DST,GARAGE,GARAGESQFT,BASEMENT,HEATING,COOLING,"
+        "SALE_DATE,SALE_VALUE,USE1_DESC"
     )
-    # Geometry OFF: the PID join needs no coordinates. lat/lng will be None.
-    return_geometry: ClassVar[bool] = False
-    # Hosted ArcGIS Online feature services cap pages at 2000.
+    # Geometry ON as CENTROIDS — see the payload note above. returnGeometry
+    # must also be true or the service ignores returnCentroid.
+    return_geometry: ClassVar[bool] = True
+    return_centroid: ClassVar[bool] = True
+    # OBJECTID is required in out_fields for keyset paging (see run()).
+    objectid_field: ClassVar[str] = "OBJECTID"
+    # Hosted ArcGIS Online feature services cap pages at 2000; this layer
+    # reports maxRecordCount 1000 WITH geometry, so 1000 is the ceiling now.
     page_size: ClassVar[int] = 1000
     max_pages: ClassVar[int] = 150    # ~118K / 1000 = 118 pages + headroom
     progress_log_every: ClassVar[int] = 20000
@@ -214,8 +243,10 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         city = _title_case_city(_safe_str(attributes.get("CITY")))
         zip_code = _safe_str(attributes.get("ZIP"))
 
-        # Geometry: with return_geometry=False this is always None now. Kept
-        # inert/harmless so re-enabling geometry later needs no code change.
+        # Geometry: the CENTROID, passed in by run()'s parse loop which reads
+        # feature["centroid"] as well as feature["geometry"]. Both shapes are
+        # {x, y}, so this code is unchanged from the geometry-off era — the
+        # original author kept it inert precisely so re-enabling needed none.
         lat = None
         lng = None
         if geometry:
@@ -233,7 +264,20 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             year_built = None
 
         # Estimated market value: EMV_TOTAL (land + building total).
+        #
+        # FIXED 2026-08-13: this was written ONLY to estimated_market_value —
+        # the parallel LEGACY column. src/models/parcel.py records that
+        # emv_total is "the typed column the distress_with_parcel view and the
+        # UI actually read". So Washington's assessed values were fetched,
+        # parsed and stored where nothing displays them, which is why its
+        # distress rows showed no valuation and no deal math. Not missing
+        # data — misrouted data. Both are written now: emv_total for the
+        # view, the legacy column for anything still reading it.
         mkt_val = _safe_decimal(attributes.get("EMV_TOTAL"))
+
+        # ACRES_DEED is deeded acreage; core.parcels.lot_sqft is square feet.
+        acres = _safe_float(attributes.get("ACRES_DEED"))
+        lot_sqft = int(round(acres * 43560)) if acres and acres > 0 else None
 
         cleaned_raw = _clean_raw_data(attributes)
 
@@ -242,11 +286,22 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "address": address,
             "city": city,
             "zip": zip_code,
+            "zip_plus_four": _safe_str(attributes.get("ZIP4")),
             "lat": lat,
             "lng": lng,
             "year_built": year_built,
             "property_type": None,  # DWELL_TYPE is free text; not mapped yet
             "estimated_market_value": mkt_val,
+            # WIDENED 2026-08-13 — all previously null for every Washington
+            # parcel while the layer carried them.
+            "emv_total": mkt_val,
+            "emv_land": _safe_decimal(attributes.get("EMV_LAND")),
+            "emv_building": _safe_decimal(attributes.get("EMV_BLDG")),
+            "sqft": _safe_int(attributes.get("FIN_SQ_FT")),
+            "lot_sqft": lot_sqft,
+            "num_units": _safe_int(attributes.get("NUM_UNITS")),
+            "use_class": _safe_str(attributes.get("USE1_DESC")),
+            "school_district": _safe_str(attributes.get("SCHOOL_DST")),
             "raw_data": cleaned_raw,
         }
 
@@ -281,9 +336,18 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     zip=sig.get("zip"),
                     lat=sig.get("lat"),
                     lng=sig.get("lng"),
+                    zip_plus_four=sig.get("zip_plus_four"),
                     year_built=sig.get("year_built"),
                     property_type=sig.get("property_type"),  # type: ignore[arg-type]
                     estimated_market_value=sig.get("estimated_market_value"),
+                    emv_total=sig.get("emv_total"),
+                    emv_land=sig.get("emv_land"),
+                    emv_building=sig.get("emv_building"),
+                    sqft=sig.get("sqft"),
+                    lot_sqft=sig.get("lot_sqft"),
+                    num_units=sig.get("num_units"),
+                    use_class=sig.get("use_class"),
+                    school_district=sig.get("school_district"),
                     raw_data=sig.get("raw_data"),
                     data_sources=[self.source_name],
                     last_observed_at=datetime.now(timezone.utc),
@@ -298,7 +362,14 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     )
                 continue
 
-            row = payload.model_dump(mode="json", exclude_none=True)
+            # dump_owned(), NOT model_dump(exclude_none=True). This is a
+            # FULL-REFRESH loader: it is the source of record for these rows,
+            # so a field the layer does not publish is ABSENT, not unchanged.
+            # exclude_none drops the key, PostgREST omits the column from the
+            # UPDATE, and whatever was there survives — which is how 6,268
+            # rows came to hold another county's property_type after the
+            # 2026-08-06 incident. See src/models/parcel.py.
+            row = payload.dump_owned()
             row["last_observed_at"] = now_iso
             batch.append(row)
 
@@ -456,6 +527,17 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 timeout=settings.scraper_request_timeout_seconds,
                 headers={"User-Agent": "DistressProperties/1.0"},
             ) as client:
+                # KEYSET paging, not offset — changed 2026-08-13 alongside
+                # centroids. _fetch_page's docstring records why: with
+                # resultOffset the server scans past every skipped row, so
+                # deep pages get linearly slower and eventually time out
+                # (hennepin_parcels died at page ~224 of 448 as pages
+                # degraded from ~7s to ~21s). Washington's 118 pages survived
+                # that at geometry-off weight; centroids make every page
+                # heavier and there is no reason to find the new limit the
+                # hard way. Keyset is constant-time at any depth.
+                after_oid = 0
+
                 for page in range(max_pages):
                     offset = page * page_size
 
@@ -469,7 +551,8 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
                     # --- FETCH one page ---
                     data = await self._fetch_page(
-                        client, offset, effective_page_size
+                        client, offset, effective_page_size,
+                        after_object_id=after_oid,
                     )
                     features = data.get("features") or []
                     if not features:
@@ -479,9 +562,21 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
                     # --- PARSE this page ---
                     page_signals: list[dict[str, Any]] = []
+                    max_oid_this_page = after_oid
                     for feature in features:
                         attributes = feature.get("attributes") or {}
-                        geometry = feature.get("geometry")
+                        # ArcGIS returns a requested centroid under its OWN
+                        # top-level key, NOT inside geometry. The base class's
+                        # parse() has this fallback, but this loader overrides
+                        # run() with its own parse loop and never calls it —
+                        # so without this line returnCentroid=true would fetch
+                        # centroids, hand parse_feature None, and write
+                        # lat=None on all 118,591 rows while reporting
+                        # success.
+                        geometry = feature.get("geometry") or feature.get("centroid")
+                        oid = attributes.get(self.objectid_field)
+                        if isinstance(oid, int) and oid > max_oid_this_page:
+                            max_oid_this_page = oid
                         try:
                             sig = await self.parse_feature(attributes, geometry)
                         except ParseError:
@@ -514,6 +609,19 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                         )
                         while next_progress <= total_fetched:
                             next_progress += self.progress_log_every
+
+                    # --- Advance the keyset cursor ---
+                    # No forward progress means the OBJECTIDs did not increase,
+                    # which would loop forever on the same page. Stop instead.
+                    if max_oid_this_page <= after_oid:
+                        logger.warning(
+                            "Washington keyset cursor did not advance — stopping",
+                            scraper=self.source_name,
+                            after_oid=after_oid,
+                            page=page + 1,
+                        )
+                        break
+                    after_oid = max_oid_this_page
 
                     # --- Stop conditions ---
                     if len(features) < effective_page_size:
