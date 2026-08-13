@@ -382,13 +382,20 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
         signals: list[SIGNAL] = []
         for feature in raw_records:
             attributes = feature.get("attributes") or {}
-            # ArcGIS returns a requested centroid under its OWN top-level key,
-            # NOT inside geometry. Without this fallback, return_centroid=True
-            # would send the param, receive the centroid, and hand
-            # parse_feature None — a silent no-op that looks like success and
-            # writes lat=None on every row. Both shapes are {x, y}, so
-            # subclasses reading geometry.get("y") need no change at all.
-            geometry = feature.get("geometry") or feature.get("centroid")
+            # CENTROID FIRST — order is load-bearing, and getting it wrong
+            # cost a full 118,418-row Washington load on 2026-08-13 that
+            # reported success with lat=None on every single row.
+            #
+            # A service asked for returnCentroid=true returns BOTH: "geometry"
+            # with the polygon rings AND "centroid" with {x, y}. Written the
+            # other way round, `feature.get("geometry") or ...` short-circuits
+            # on the truthy rings dict, the centroid is never read, and
+            # parse_feature calls .get("y") on a rings array and gets None.
+            # Silently — no error, no failed count, nothing to notice.
+            #
+            # Both shapes are {x, y}, so subclasses reading geometry.get("y")
+            # need no change; they just have to be handed the right one.
+            geometry = feature.get("centroid") or feature.get("geometry")
 
             try:
                 signal = await self.parse_feature(attributes, geometry)
