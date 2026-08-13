@@ -565,50 +565,69 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 source_id=source_id,
             )
 
-         signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
-            # FK chain: distress_events.parcel_id -> core.parcels.parcel_id,
-            # and core.parcels.county_code -> core.counties.county_code. So both
-            # the county AND the parcel must exist first.
+        if not already:
+            # parcel_row is None when the PID resolved to a real spine parcel:
+            # that row already exists and carries assessor data a stub would
+            # overwrite. BOTH the county seed and the parcel insert belong
+            # inside this guard.
             #
-            # Ensure the county exists in core.counties BEFORE inserting the
-            # parcel — statewide notices reference any of MN's 87 counties, and
-            # a parcel insert for an unseeded county would FK-fail (the cause of
-            # the approval 500s). Auto-seeding here means any new MN county
-            # self-heals instead of needing a manual seed.
-            county_code = built["parcel_row"].get("county_code")
-            if county_code:
-                county_exists = (
-                    core_table("counties")
-                    .select("county_code")
-                    .eq("county_code", county_code)
-                    .limit(1)
-                    .execute()
-                )
-                if not county_exists.data:
-                    # Build a readable name from the raw extraction county, e.g.
-                    # "Saint Louis" -> "Saint Louis County". Slug is the FK value.
-                    raw_county = (extracted.get("county") or county_code).strip()
-                    county_name = (
-                        raw_county
-                        if raw_county.lower().endswith("county")
-                        else f"{raw_county} County"
-                    )
-                    core_table("counties").insert({
-                        "county_code": county_code,
-                        "county_name": county_name,
-                        "state": "MN",
-                    }).execute()
-                    logger.info(
-                        "auto-seeded county for extraction promotion",
-                        county_code=county_code,
-                        county_name=county_name,
-                    )
+            # FIXED 2026-08-13: the county-seed block below read
+            # built["parcel_row"].get(...) OUTSIDE any None check, so every
+            # notice that resolved to a real parcel raised AttributeError and
+            # returned 500. _resolve_spine_parcel (added 2026-08-10) introduced
+            # the None case; this block predates it and was never updated.
+            # It failed on the GOOD notices — a resolved parcel carries address,
+            # value and owner, while the synthetic fallback that still worked
+            # renders as em-dashes. Measured: digits-only resolution hit 185 of
+            # 217 notices, so ~85% of approvals were failing.
+            parcel_row = built["parcel_row"]
 
-            # Parcel next (check-then-insert). parcel_row is None when the
-            # PID resolved to a real spine parcel — that row already exists
-            # and carries assessor data a stub would overwrite.
-            if built["parcel_row"] is not None:
-                pid = built["parcel_row"]["parcel_id"]
+            if parcel_row is not None:
+                # FK chain: distress_events.parcel_id -> core.parcels.parcel_id,
+                # and core.parcels.county_code -> core.counties.county_code. So
+                # both the county AND the parcel must exist first.
+                #
+                # Ensure the county exists in core.counties BEFORE inserting the
+                # parcel — statewide notices reference any of MN's 87 counties,
+                # and a parcel insert for an unseeded county would FK-fail (the
+                # cause of the earlier approval 500s). Auto-seeding here means
+                # any new MN county self-heals instead of needing a manual seed.
+                #
+                # Not needed when parcel_row is None: no parcel is being
+                # inserted, and the existing spine parcel's own FK already
+                # guarantees its county is seeded.
+                county_code = parcel_row.get("county_code")
+                if county_code:
+                    county_exists = (
+                        core_table("counties")
+                        .select("county_code")
+                        .eq("county_code", county_code)
+                        .limit(1)
+                        .execute()
+                    )
+                    if not county_exists.data:
+                        # Build a readable name from the raw extraction county,
+                        # e.g. "Saint Louis" -> "Saint Louis County". Slug is
+                        # the FK value.
+                        raw_county = (extracted.get("county") or county_code).strip()
+                        county_name = (
+                            raw_county
+                            if raw_county.lower().endswith("county")
+                            else f"{raw_county} County"
+                        )
+                        core_table("counties").insert({
+                            "county_code": county_code,
+                            "county_name": county_name,
+                            "state": "MN",
+                        }).execute()
+                        logger.info(
+                            "auto-seeded county for extraction promotion",
+                            county_code=county_code,
+                            county_name=county_name,
+                        )
+
+                # Parcel next (check-then-insert).
+                pid = parcel_row["parcel_id"]
                 # COMPOSITE key. Minnesota parcel IDs are NOT unique across
                 # counties, so a parcel_id-only check can find another
                 # county's row, skip the insert, and leave the FK unsatisfied.
@@ -617,13 +636,13 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 parcel_exists = (
                     core_table("parcels")
                     .select("parcel_id")
-                    .eq("county_code", built["parcel_row"].get("county_code"))
+                    .eq("county_code", county_code)
                     .eq("parcel_id", pid)
                     .limit(1)
                     .execute()
                 )
                 if not parcel_exists.data:
-                    core_table("parcels").insert(built["parcel_row"]).execute()
+                    core_table("parcels").insert(parcel_row).execute()
 
             signals_table("distress_events").insert(built["distress_event"]).execute()
             signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
