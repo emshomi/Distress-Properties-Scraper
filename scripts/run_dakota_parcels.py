@@ -14,7 +14,21 @@ also means the scraper's feature flag (SCRAPER_DAKOTA_PARCELS_ENABLED) must be
 enabled in the workflow env.
 
 Usage:
-    python -m scripts.run_dakota_parcels [trigger_name]
+    python -m scripts.run_dakota_parcels [trigger_name] [max_records]
+
+max_records (optional, ADDED 2026-08-13) caps the run at N parcels.
+
+This matters more here than for most loaders. Dakota's source is the COUNTY'S
+OWN server (gis2.co.dakota.mn.us, plain HTTP) rather than ArcGIS Online, and as
+of 2026-08-13 it is being asked for polygon geometry at 2000 records per page
+for the first time — the layer cannot return centroids, so the rings come back
+whole and _polygon_centroid() derives the point. A capped run confirms the
+server tolerates that weight before it is sent 75 consecutive pages of it.
+
+It also guards the failure mode that cost a full 118,418-row Washington load
+the same day: if the geometry handling is wrong, every row lands with lat=None
+and the run still reports success. 500 records answers that in seconds, and the
+answer is read from the DATABASE, not from the run status.
 
 Exits 0 on success, 1 on failure / disabled / partial, so GitHub Actions
 marks the run correctly.
@@ -33,10 +47,34 @@ from src.utils.logger import logger
 
 async def main() -> int:
     trigger = sys.argv[1] if len(sys.argv) > 1 else "github_actions"
-    logger.info("Dakota parcels runner starting", trigger=trigger)
-    print(f"[dakota-parcels-runner] trigger={trigger}", flush=True)
+
+    # Optional record cap. Anything unparseable — including the empty string a
+    # skipped workflow input produces — means NO cap. A test flag must never
+    # silently truncate a production run.
+    max_records: int | None = None
+    if len(sys.argv) > 2:
+        try:
+            parsed = int(sys.argv[2])
+            max_records = parsed if parsed > 0 else None
+        except (TypeError, ValueError):
+            max_records = None
+
+    logger.info(
+        "Dakota parcels runner starting",
+        trigger=trigger,
+        max_records=max_records,
+    )
+    print(
+        f"[dakota-parcels-runner] trigger={trigger} "
+        f"max_records={max_records or 'ALL'}",
+        flush=True,
+    )
 
     scraper = DakotaParcelsScraper()
+    if max_records is not None:
+        # Set on the INSTANCE, not the class — a class-level set would leak
+        # into any other scraper constructed in the same process.
+        scraper._max_records_override = max_records
 
     try:
         print(
