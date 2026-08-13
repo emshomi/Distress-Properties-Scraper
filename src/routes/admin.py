@@ -565,7 +565,7 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 source_id=source_id,
             )
 
-        signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
+         signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
             # FK chain: distress_events.parcel_id -> core.parcels.parcel_id,
             # and core.parcels.county_code -> core.counties.county_code. So both
             # the county AND the parcel must exist first.
