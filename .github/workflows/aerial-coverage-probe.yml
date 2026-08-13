@@ -1,0 +1,56 @@
+name: Aerial Coverage Probe
+# Measures whether Google satellite tiles actually RESOLVE anything over
+# Govire's parcels, per county and per zoom.
+#
+# ADDED 2026-08-13, after streetview-coverage-probe.yml found metro strong
+# (hennepin 92% near, ramsey 92%) and rural weak (crow_wing 45%, fillmore
+# 37%, carlton 37%). Satellite fills that gap, and on acreage it is arguably
+# the better image: a 40-acre Fillmore parcel shot from the road is a mailbox
+# and a treeline; from above it is the house, outbuildings and access track.
+# Both images ship on every parcel that has them — this is not a fallback.
+#
+# WHY IT MUST FETCH RATHER THAN ASK
+# Street View has a free metadata endpoint answering "is there imagery here?".
+# MAPS STATIC HAS NO EQUIVALENT — Google returns an image for every coordinate
+# on Earth, and no status field says whether it is a crisp roof or a green
+# smear. So the probe downloads tiles and measures byte size, pixel variance
+# and colour count. The question is not "does satellite exist" (it always
+# does) but "at what zoom does a structure resolve in THIS county".
+#
+# THIS ONE COSTS MONEY. Unlike the Street View probe there is no free
+# metadata tier; every request is billable. ~400 requests, comfortably inside
+# the Essentials monthly free threshold, and enough to separate crisp from
+# blurry. Keep the sample small — it is a measurement, not a survey.
+#
+# workflow_dispatch ONLY. Re-run after onboarding a county, or if Google
+# refreshes its aerial base.
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    name: Probe aerial coverage
+    runs-on: ubuntu-latest
+    # ~400 tile fetches at 0.08s pacing plus decode time. Deliberately tight:
+    # a probe that hangs should fail fast, not burn an hour of billable calls.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      # Mirrors parcel-geom-backfill.yml and streetview-coverage-probe.yml:
+      # outcome_capture/ scripts talk to Postgres directly via psycopg2 and do
+      # not use the FastAPI service's dependency set. Pillow is added here for
+      # the pixel-variance measurement — byte size alone cannot tell a flat
+      # field from a detailed one under every encoder.
+      - name: Install Python dependencies
+        run: pip install psycopg2-binary requests Pillow
+      - name: Probe aerial coverage
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+        run: |
+          python outcome_capture/probe_aerial_coverage.py
