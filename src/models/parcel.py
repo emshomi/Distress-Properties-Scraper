@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -89,10 +89,43 @@ TransactionType = Literal[
 
 class ParcelUpsert(BaseModel):
     """
-    Payload for resolve_parcel (creates or updates a parcel row).
+    Payload for a parcel write. TWO writer classes consume this, and they
+    serialise it DIFFERENTLY. Getting the wrong one silently corrupts data.
 
-    The resolver merges this with the existing row according to per-field
-    rules (overwrite, fill-in, or immutable). See parcel_resolver.py.
+    1. ENRICHMENT writers — the signal scrapers (hennepin_sheriff,
+       washington_sheriff, anoka_sheriff, dakota_sheriff, mpls_311,
+       mpls_vbr, saint_paul_vacant, tax_forfeit). A sheriff notice knows an
+       address; it knows nothing about emv_total or year_built. These call
+       resolve_parcel(), which merges per-field (overwrite / fill-in /
+       immutable / set-union) against the existing row. See
+       parcel_resolver.py. They use exclude_none=True, correctly: a field
+       they did not learn about must not be nulled.
+
+    2. FULL-REFRESH writers — the county parcel loaders (mngac_parcels,
+       olmsted_parcels, hennepin_parcels, ramsey_parcels, dakota_parcels,
+       washington_parcels, fillmore_parcels). These are the SOURCE OF RECORD
+       for the row and upsert direct, bypassing the resolver (a per-parcel
+       SELECT cannot run over 2.66M rows). They MUST call dump_owned().
+
+    Why dump_owned() exists — measured 2026-08-13:
+    exclude_none=True drops any field whose value is None, and PostgREST
+    builds its column list from the UNION of keys across the batch. A column
+    absent from every row in a batch never enters the UPDATE, so whatever was
+    already there SURVIVES. For a source of record that is wrong: "the layer
+    published no value" means the value is ABSENT, not "keep the old one".
+
+    Consequence: the 2026-08-06 composite-key incident left 18,415 rows in
+    twelve MnGeo counties holding other counties' data. The 08-07 recovery
+    reload corrected every column MnGeo publishes and could not touch the
+    rest. 6,268 rows still carried another parcel's property_type — a live
+    filter key — because _map_property_type returns None for that layer
+    (control: 0 of 464,846 non-converted rows have one) and the column
+    therefore never entered an UPDATE.
+
+    Nor could anything else fix them: parcel_resolver's fill-in rule only
+    writes when the existing value is null/empty, so it is structurally
+    incapable of CORRECTING a populated-but-wrong field. Only the
+    full-refresh loader can, and only via dump_owned().
     """
 
     parcel_id: str = Field(..., min_length=1, max_length=100)
@@ -126,9 +159,22 @@ class ParcelUpsert(BaseModel):
     # Assessor valuation + characteristics (2026-07-14): the typed columns
     # the distress_with_parcel view and the UI actually read (emv_total etc.),
     # DISTINCT from estimated_market_value above (a parallel legacy column).
-    # Added for the olmsted_parcels loader patch; optional everywhere, so
-    # existing loaders that don't set them are unaffected (exclude_none
-    # dumps also mean upserts never null-clobber backfilled values).
+    # Added for the olmsted_parcels loader patch; optional everywhere, so a
+    # loader that does not set them simply omits them.
+    #
+    # CORRECTED 2026-08-13. This block previously read "exclude_none dumps
+    # also mean upserts never null-clobber backfilled values" as though that
+    # were a safety property. It is the defect: for a full-refresh loader,
+    # not null-clobbering means PRESERVING another county's value forever.
+    # See the class docstring and dump_owned().
+    #
+    # SEPARATE OPEN DEFECT (recorded 2026-08-13, not fixed here):
+    # parcel_resolver._OVERWRITE_FIELDS lists estimated_market_value /
+    # _equity / _mortgage_balance but NOT emv_total / emv_land /
+    # emv_building. So the columns the view and UI actually read fall through
+    # to FILL-IN, and once set no scraper can ever refresh them — an assessed
+    # value is frozen at whatever landed first, and equity_spread is computed
+    # from it.
     emv_total: Decimal | None = Field(default=None, ge=0)
     emv_land: Decimal | None = Field(default=None, ge=0)
     emv_building: Decimal | None = Field(default=None, ge=0)
@@ -151,6 +197,41 @@ class ParcelUpsert(BaseModel):
     last_observed_at: datetime | None = None
 
     model_config = ConfigDict(extra="forbid")
+
+    # Never emitted as NULL by dump_owned(), whatever the caller passed:
+    #   raw_data          large, and "not re-fetched this run" is not "gone"
+    #   data_sources      set-unioned by the resolver, never overwritten
+    #   last_observed_at  every caller overwrites it with now_iso after dump
+    _NEVER_NULL: ClassVar[frozenset[str]] = frozenset({
+        "raw_data",
+        "data_sources",
+        "last_observed_at",
+    })
+
+    def dump_owned(self) -> dict[str, Any]:
+        """Serialise for a FULL-REFRESH upsert: emit every field the caller
+        explicitly passed, INCLUDING the ones that came out None.
+
+        For a source of record, a field the layer did not publish is absent,
+        not unchanged. Emitting the null is what lets a re-run CLEAR a value
+        that a previous write got wrong — which exclude_none=True cannot do,
+        and which parcel_resolver's fill-in rule cannot do either.
+
+        model_fields_set is exactly the fields supplied at construction, so a
+        caller that never mentions `beds` leaves it alone, while a caller that
+        passes beds=sig.get("beds") and gets None writes NULL. Ownership is
+        declared by the call site, not by a list here that would drift.
+
+        ENRICHMENT writers must NOT call this — see the class docstring. Use
+        model_dump(exclude_none=True) via resolve_parcel() instead.
+        """
+        full = self.model_dump(mode="json")
+        return {
+            name: value
+            for name, value in full.items()
+            if name in self.model_fields_set
+            and not (value is None and name in self._NEVER_NULL)
+        }
 
 
 class Parcel(BaseModel):
