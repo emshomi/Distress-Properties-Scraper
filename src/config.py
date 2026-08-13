@@ -118,6 +118,28 @@ class Settings(BaseSettings):
         description="Mapbox API token for geocoding",
     )
 
+    # ADDED 2026-08-13 — Google Maps Platform, for Street View imagery.
+    #
+    # In Settings rather than os.environ for the reason the Resend block
+    # above records: a credential that lives only in a standalone script
+    # silently no-ops the day the service needs it too. Street View is
+    # needed in BOTH places — the pano resolver job, and the API route that
+    # serves pano IDs to entitled tiers.
+    #
+    # The pano ID is a LOCATOR: one call to Google's metadata endpoint turns
+    # it into coordinates. It belongs behind the same tier gate as address
+    # and lat/lng (_LOCATOR_FIELDS in src/utils/redaction.py), and must never
+    # reach a below-Standard client.
+    #
+    # Google's terms permit storing the panorama ID indefinitely but PROHIBIT
+    # storing, caching or rehosting the imagery itself. We store IDs, never
+    # pixels; the browser fetches each image from Google directly.
+    google_maps_api_key: SecretStr | None = Field(
+        default=None,
+        description="Google Maps Platform key — Street View Static imagery "
+                    "and Maps JavaScript API",
+    )
+
     nominatim_user_agent: str = Field(
         default="distress-properties-scraper/1.0",
         description="User-Agent for Nominatim (fallback geocoder)",
