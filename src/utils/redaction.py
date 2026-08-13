@@ -14,7 +14,9 @@ covered by one chokepoint.
 The lock hierarchy (from the spec):
   - Tier 1 (sacred): exact equity / market_value / amount owed — the enrichment
     value that the county does NOT publish. Locked until BASIC.
-  - Tier 2 (locators): address, city, parcel, owner, exact sale/redemption dates.
+  - Tier 2 (locators): address, city, parcel, owner, exact sale/redemption
+    dates, and IMAGERY (a Google pano id is a locator — one metadata call
+    resolves it to coordinates; see _redact_imagery).
     Locked until STANDARD.
   - Tier 3 (leverage): owner portfolio, multi-signal overlay, redemption exact
     date. PREMIUM.
@@ -208,6 +210,56 @@ def _redact_tax_status(p: dict[str, Any], rank: int) -> None:
         }
 
 
+def _redact_imagery(p: dict[str, Any], rank: int) -> None:
+    """Tier-redact the nested imagery block in place on the COPIED payload.
+
+    ADDED 2026-08-13. Same nested-dict discipline as _redact_tax_status above:
+    the block is re-copied before mutation because redact_property's
+    dict(shaped) copy is shallow, and mutating the nested dict directly would
+    corrupt the caller's unredacted original.
+
+    === WHY IMAGERY IS A LOCATOR ===
+    A Google panorama id resolves to exact coordinates with ONE
+    unauthenticated call to the Street View metadata endpoint. It is
+    machine-readable and bulk-harvestable across every row on a page, which
+    makes it a STRONGER locator than the address string, not a weaker one.
+    lat/lng are already in _LOCATOR_FIELDS; pano_id belongs at the same tier
+    by the same reasoning.
+
+    The image itself is equally locating even without the id: Street View
+    frames a house from the kerb, and the house number, the mailbox, the kerb
+    stencil and the cross-street sign are routinely legible. Nothing needs to
+    be reverse-image-searched — it can simply be read.
+
+    === WHY _lock() IS NOT USED HERE ===
+    _lock() nulls the whole value, which for a nested dict would blank
+    `available` along with everything else. That boolean is the ONE imagery
+    field safe at any tier: it says a picture exists, not where. It is the
+    same non-locating-cue principle as equity_band and redemption_relative
+    above, and it is what lets a locked tile say "Street View imagery
+    available" without disclosing a thing.
+
+    Blurring the image server-side was considered and REJECTED: it would cost
+    a billable request per anonymous view, and storing the blurred derivative
+    would breach Google's prohibition on caching or rehosting Maps Content.
+    A CSS blur over a live URL is not a lock at all — the src is in devtools.
+
+    Below STANDARD the client receives exactly:
+        {"available": true|false, "locked": true}
+    """
+    block = p.get("imagery")
+    if not isinstance(block, dict):
+        return
+
+    if rank >= _TIER_RANK["standard"]:
+        return
+
+    p["imagery"] = {
+        "available": bool(block.get("available")),
+        "locked": True,
+    }
+
+
 def _lock(payload: dict[str, Any], field: str) -> None:
     """Null a field and flag it locked, only if the key is present."""
     if field in payload:
@@ -256,6 +308,12 @@ def redact_property(
     #      owner keys premium-only; below standard only the redeemed flag
     #      survives). No-op for rows without a tax_status block. ----
     _redact_tax_status(p, rank)
+
+    # ---- Imagery block (nested). Below standard it collapses to a single
+    #      non-locating boolean; at standard and above it passes through
+    #      whole. A pano id is a locator — one metadata call turns it into
+    #      coordinates — so it gates with address and lat/lng, not below them.
+    _redact_imagery(p, rank)
 
     # ---- BELOW STANDARD: lock locators + exact dates ----
     if rank < _TIER_RANK["standard"]:
