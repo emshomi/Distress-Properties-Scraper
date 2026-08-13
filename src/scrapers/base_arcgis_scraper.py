@@ -110,6 +110,32 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
     # Whether to fetch geometry (lat/lng). Most signal scrapers want this.
     return_geometry: ClassVar[bool] = True
 
+    # Whether to ask the service for each feature's CENTROID instead of its
+    # full geometry.
+    #
+    # ADDED 2026-08-13. Parcel layers are POLYGON layers, and a polygon
+    # geometry is a rings array of hundreds of coordinate pairs — which is
+    # why washington_parcels and dakota_parcels both turned geometry OFF:
+    # Washington's TaxParcel layer reports maxRecordCount 1000 WITH geometry
+    # against standardMaxRecordCountNoGeometry 32000, a 32x difference in
+    # what one request can carry.
+    #
+    # The cost of that decision was invisible until imagery: 182 of 182
+    # Washington distress parcels and 140 of 175 Dakota ones have no lat/lng,
+    # so they have no map, no Street View, no aerial and no geometry — while
+    # 172 of the Washington ones DID match a real parcel. The data was never
+    # missing; it was never requested.
+    #
+    # returnCentroid gives one x/y pair per feature rather than a ring, so
+    # the payload stays light AND we get the point. It is also the RIGHT
+    # point for this purpose: Street View wants somewhere to stand and look,
+    # and a polygon centroid is where the property is.
+    #
+    # Requires the layer to advertise supportsReturningGeometryCentroid
+    # (Washington's TaxParcel does). Defaults FALSE so the six other ArcGIS
+    # loaders are untouched.
+    return_centroid: ClassVar[bool] = False
+
     # Specific fields to fetch. Default '*' = all fields.
     # Subclasses can narrow this if a service has dozens of irrelevant fields.
     out_fields: ClassVar[str] = "*"
@@ -193,10 +219,17 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
         params: dict[str, Any] = {
             "outFields": self.out_fields,
             "returnGeometry": str(self.return_geometry).lower(),
-            "outSR": 4326,  # WGS84 lat/lng
+            "outSR": 4326,  # WGS84 lat/lng — applies to the centroid too, so
+                            # a layer in a local projection (Washington's
+                            # TaxParcel is in WCCS survey feet) still returns
+                            # degrees rather than feet, which the subclasses'
+                            # Minnesota bounding-box guards depend on.
             "resultRecordCount": page_size,
             "f": "json",  # ArcGIS REST JSON format
         }
+        if self.return_centroid:
+            params["returnCentroid"] = "true"
+
         if after_object_id is not None:
             oid = self.objectid_field
             params["where"] = (
@@ -349,7 +382,13 @@ class BaseArcGISScraper(BaseScraper[dict[str, Any], Any], Generic[SIGNAL]):
         signals: list[SIGNAL] = []
         for feature in raw_records:
             attributes = feature.get("attributes") or {}
-            geometry = feature.get("geometry")
+            # ArcGIS returns a requested centroid under its OWN top-level key,
+            # NOT inside geometry. Without this fallback, return_centroid=True
+            # would send the param, receive the centroid, and hand
+            # parse_feature None — a silent no-op that looks like success and
+            # writes lat=None on every row. Both shapes are {x, y}, so
+            # subclasses reading geometry.get("y") need no change at all.
+            geometry = feature.get("geometry") or feature.get("centroid")
 
             try:
                 signal = await self.parse_feature(attributes, geometry)
