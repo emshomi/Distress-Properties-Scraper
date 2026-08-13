@@ -565,15 +565,19 @@ class WashingtonParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     max_oid_this_page = after_oid
                     for feature in features:
                         attributes = feature.get("attributes") or {}
-                        # ArcGIS returns a requested centroid under its OWN
-                        # top-level key, NOT inside geometry. The base class's
-                        # parse() has this fallback, but this loader overrides
-                        # run() with its own parse loop and never calls it —
-                        # so without this line returnCentroid=true would fetch
-                        # centroids, hand parse_feature None, and write
-                        # lat=None on all 118,591 rows while reporting
-                        # success.
-                        geometry = feature.get("geometry") or feature.get("centroid")
+                        # CENTROID FIRST. The service returns BOTH when
+                        # returnCentroid=true: "geometry" with polygon rings
+                        # AND "centroid" with {x, y}. Reading geometry first
+                        # short-circuits on the truthy rings dict, so
+                        # parse_feature gets a rings array, calls .get("y"),
+                        # and writes lat=None — which is exactly what happened
+                        # on the 2026-08-13 load: 118,418 rows written, 0
+                        # failed, 0 coordinates, status "success".
+                        #
+                        # This loader overrides run() with its own parse loop
+                        # and never calls the base class's parse(), so the
+                        # same fix has to exist in both places.
+                        geometry = feature.get("centroid") or feature.get("geometry")
                         oid = attributes.get(self.objectid_field)
                         if isinstance(oid, int) and oid > max_oid_this_page:
                             max_oid_this_page = oid
