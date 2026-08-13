@@ -1,8 +1,19 @@
 name: Washington Parcels Loader
 # Manual + monthly. The full tax-parcel roll changes slowly; a monthly refresh
 # keeps owners/values current. Manual trigger always available via the UI.
+#
+# max_records ADDED 2026-08-13 alongside the centroid change. A full pass is
+# ~118K records; if the centroid handling is wrong every one of those rows
+# lands with lat=None and the run STILL reports success. A 200-record run
+# answers the same question in under a minute, and the answer is read from the
+# database rather than the run status. Leave it blank for a full run.
 on:
   workflow_dispatch:
+    inputs:
+      max_records:
+        description: 'Cap the run at N parcels (blank = full ~118K run)'
+        required: false
+        default: ''
   schedule:
     # 12:30 UTC = 6:30am Central (standard) / 7:30am (DST), 6th of the month.
     # Day after the sheriff job (5th), offset so they never overlap.
@@ -11,8 +22,14 @@ jobs:
   scrape:
     name: Run Washington parcels loader
     runs-on: ubuntu-latest
-    # ~118K records streamed in 2000-row pages + DB upserts. Generous timeout.
-    timeout-minutes: 30
+    # ~118K records streamed in 1000-row pages + DB upserts.
+    #
+    # RAISED 30 -> 60 on 2026-08-13. The old figure was sized for
+    # geometry-off pages, which the layer serves at up to 32,000 records
+    # (standardMaxRecordCountNoGeometry) against 1,000 WITH geometry. Centroids
+    # make every page heavier, and a run killed at 95% wastes the whole pass —
+    # this loader is not self-resuming the way the geom backfill is.
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -54,5 +71,7 @@ jobs:
           SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
           SCRAPER_TAX_FORFEIT_ENABLED: 'false'
           SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        # The runner treats an empty or unparseable second argument as NO cap,
+        # so a scheduled run (which supplies no inputs) is a full run.
         run: |
-          python -m scripts.run_washington_parcels github_actions
+          python -m scripts.run_washington_parcels github_actions "${{ inputs.max_records }}"
