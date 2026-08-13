@@ -17,15 +17,35 @@ system could ever correct it. geom was worse: a column with an index, no
 writer and no owner, stale on 1.5M rows and WRONG on 18,415 for eleven days.
 A field nobody owns rots. This one has an owner.
 
-=== SELF-RESUMING ===
+=== SELF-RESUMING, AND RE-RESOLVING ===
 The working set is "distress parcels with coordinates that have no imagery row
-for this source yet". A completed parcel is never revisited, so this can be
+for this source yet, OR whose row says no_location but which now HAVE
+coordinates". A parcel with a settled answer is never revisited, so this can be
 re-run at will and picks up where it stopped — same property as
 backfill_parcel_geom.py, and for the same reason: a run cut off half way costs
 a re-run, not a restart.
 
 The distress set GROWS (8,299 -> 8,321 in thirteen hours), so re-running after
 a scrape is the normal way new parcels get imagery.
+
+WHY no_location IS NOT SETTLED (added 2026-08-13):
+no_location means "we looked and there was nowhere to look" — a GEOCODING gap,
+not an imagery one. Geocoding gaps get fixed. Washington County is the worked
+example: all 182 of its distress parcels had no lat/lng because
+washington_parcels.py requested geometry=false, so every one got a no_location
+row. When that loader was changed to fetch centroids, 118,386 Washington
+parcels gained coordinates in a single 6-minute run — and the resolver skipped
+every one of them, because a row existed and "a completed parcel is never
+revisited".
+
+That is the failure shape this whole codebase keeps producing: a value that was
+true when written, silently outliving the condition that made it true. geom sat
+wrong on 18,415 rows for eleven days for the same reason.
+
+So no_location is provisional by construction, and the predicate re-opens it
+the moment the parcel has somewhere to look. UPSERT_SQL already carries
+ON CONFLICT ... DO UPDATE, so a re-resolved row overwrites cleanly and
+resolved_at advances — which is what that column exists for.
 
 === STREET VIEW IS ASKED. AERIAL IS DERIVED. ===
 Street View has a FREE metadata endpoint and coverage genuinely varies —
@@ -145,14 +165,30 @@ LEFT   JOIN core.parcel_imagery i
        ON  i.county_code = p.county_code
        AND i.parcel_id   = p.parcel_id
        AND i.source      = 'google_streetview'
-WHERE  i.parcel_id IS NULL
+WHERE  p.lat IS NOT NULL
+  AND  p.lng IS NOT NULL
+  AND  (
+         -- never resolved
+         i.parcel_id IS NULL
+         -- OR resolved as no_location BEFORE the parcel had coordinates.
+         -- That verdict was true when written and is not any more; see the
+         -- module docstring. Anything else (ok / no_imagery / too_far) is a
+         -- real answer about Google's coverage and stays settled.
+      OR i.status = 'no_location'
+       )
 LIMIT  %(batch)s;
 """
 
-# Parcels that exist in the spine but carry no coordinate. These get a
+# Parcels that exist in the spine but STILL carry no coordinate. These get a
 # no_location row rather than being skipped silently: "we checked and there is
 # nowhere to look" is a different fact from "we never checked", and a missing
-# row cannot express either. 868 parcels are in this state.
+# row cannot express either. 868 parcels were in this state on 2026-08-13;
+# Washington's 182 have since left it.
+#
+# This and WORKING_SET_SQL are mutually exclusive by their lat/lng predicates —
+# a parcel either has coordinates (main loop) or does not (here), never both.
+# The main loop re-opens a no_location row only once coordinates exist, so the
+# two cannot fight over the same parcel in the same run.
 NO_LOCATION_SQL = """
 SELECT d.county_slug                          AS county_code,
        d.eff_parcel_id                        AS parcel_id
