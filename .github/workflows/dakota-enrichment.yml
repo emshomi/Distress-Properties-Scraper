@@ -5,8 +5,26 @@ name: Dakota Parcels + Foreclosure Enrichment
 #   2. dakota_foreclosure_enrichment   — address-join sheriff sales to parcels
 # Order matters: the enrichment reads the parcels the loader just refreshed, so
 # they run sequentially in the SAME job (guaranteed order, not a timing guess).
+#
+# max_records ADDED 2026-08-13 alongside the geometry change. It caps STEP 1
+# ONLY and SKIPS step 2 — the enrichment joins against whatever parcels exist,
+# so running it in full after a deliberately partial load would produce a
+# confusing half-state. A capped run is a test of the loader, not of the join.
+#
+# Why a test run matters here more than most: Dakota's source is the COUNTY'S
+# OWN server (gis2.co.dakota.mn.us, plain HTTP), not ArcGIS Online, and it is
+# now being asked for polygon geometry — the layer does not support
+# returnCentroid, so rings come back whole and _polygon_centroid() derives the
+# point. If that handling is wrong, every row lands with lat=None and the run
+# still reports success. That exact failure cost a full 118,418-row Washington
+# load the same day. Leave blank for a full run.
 on:
   workflow_dispatch:
+    inputs:
+      max_records:
+        description: 'Cap step 1 at N parcels and SKIP step 2 (blank = full run, both steps)'
+        required: false
+        default: ''
   schedule:
     # 2nd of the month, 14:00 UTC = 8:00am Central (standard) / 9:00am (DST).
     # Offset from ramsey-tax (13:30) and the daily sheriff jobs (12:00-12:20 UTC)
@@ -16,9 +34,16 @@ jobs:
   scrape:
     name: Run Dakota parcels + foreclosure enrichment
     runs-on: ubuntu-latest
-    # Pure httpx + DB work, no Playwright. The parcel load streams ~150K records
-    # in ~15 pages of 10K; give generous headroom.
-    timeout-minutes: 30
+    # Pure httpx + DB work, no Playwright.
+    #
+    # RAISED 30 -> 90 on 2026-08-13. The old figure assumed "~15 pages of 10K",
+    # which the loader has not done for some time — page_size is 2000, so it is
+    # ~75 pages, and every page now carries polygon rings (a single residential
+    # lot in this layer has ~40 vertices). Washington's comparable load takes
+    # ~6.5 minutes for 118K WITHOUT rings; this is 150K WITH them, against a
+    # county server rather than ArcGIS Online. A run killed at 95% wastes the
+    # whole pass — this loader is not self-resuming.
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,8 +88,18 @@ jobs:
           SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
           SCRAPER_TAX_FORFEIT_ENABLED: 'false'
           SCRAPER_USPS_VACANCY_ENABLED: 'false'
+          MAX_RECORDS: ${{ inputs.max_records }}
+        # The runner treats an empty or unparseable second argument as NO cap,
+        # so a scheduled run (which supplies no inputs) is a full run of both
+        # steps. A capped run stops after step 1 — see the header.
         run: |
           echo "=== Step 1/2: load Dakota parcel spine (~150K) ==="
-          python -m scripts.run_dakota_parcels github_actions
+          python -m scripts.run_dakota_parcels github_actions "${MAX_RECORDS}"
+          if [ -n "${MAX_RECORDS}" ]; then
+            echo "=== Step 2/2 SKIPPED: capped run (max_records=${MAX_RECORDS}) ==="
+            echo "The enrichment joins against whatever parcels exist; running it"
+            echo "after a deliberately partial load would produce a half-state."
+            exit 0
+          fi
           echo "=== Step 2/2: enrich Dakota foreclosure rows by address join ==="
           python -m scripts.run_dakota_foreclosure_enrichment github_actions
