@@ -1,0 +1,48 @@
+name: Street View Coverage Probe
+# Measures real Google Street View coverage against Govire's distress parcels.
+#
+# ADDED 2026-08-13, BEFORE any imagery table, resolver or UI exists. The whole
+# imagery design rests on one number nobody has measured: does Street View
+# cover the parcels we actually show, or only the metro ones? Hennepin is
+# 5,648 of 8,299 distress parcels, so a pooled statewide rate would be 68%
+# Hennepin and would say nothing about Aitkin, Crow Wing or Carlton — which
+# is the only part in doubt. The probe reports strictly per county.
+#
+# WRITES NOTHING. No table, no column, no migration. If outstate coverage
+# comes back weak the design changes shape, and that has to be knowable
+# before a schema exists rather than after.
+#
+# COSTS NOTHING. Street View METADATA requests do not consume image quota and
+# this never requests an image. It is also the exact call the production
+# resolver will make, so the rate it reports is the real one.
+#
+# workflow_dispatch ONLY. This is a measurement, not a pipeline. Re-run it
+# after onboarding a county, or if Google's coverage is thought to have moved.
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    name: Probe Street View coverage
+    runs-on: ubuntu-latest
+    # ~800 metadata calls at 0.05s pacing plus latency is a couple of minutes.
+    # Deliberately tight: a probe that hangs should fail fast, not burn an hour.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      # Mirrors parcel-geom-backfill.yml: outcome_capture/ scripts talk to
+      # Postgres directly via psycopg2 and do not use the FastAPI service's
+      # dependency set. requests is added for the Google metadata endpoint.
+      - name: Install Python dependencies
+        run: pip install psycopg2-binary requests
+      - name: Probe Street View coverage
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+        run: |
+          python outcome_capture/probe_streetview_coverage.py
