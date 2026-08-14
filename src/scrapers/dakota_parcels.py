@@ -135,6 +135,33 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _arcgis_date_to_iso(value: Any) -> str | None:
+    """ArcGIS epoch-milliseconds -> 'YYYY-MM-DD', or None.
+
+    ArcGIS esriFieldTypeDate fields come back as integer milliseconds since
+    the Unix epoch, UTC. core.parcels.last_sale_date is a DATE column, so the
+    time component is dropped rather than carried as a fiction — a county
+    sale record has a day, not a moment.
+
+    Returns None for 0 and for negative values: 0 is 1970-01-01, which is what
+    this layer uses for "no sale on record", and a 1970 sale date on a
+    Minnesota parcel would silently become the comparison an investor prices
+    against.
+    """
+    if value is None:
+        return None
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _safe_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -273,7 +300,13 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         # BEDS and BATH are notable: no other Minnesota loader populates
         # them, because no other county's layer publishes them.
         "TOTALVAL,LANDVAL,BLDGVAL,FNSHD_SF,TOTAL_SF,BEDS,BATH,"
-        "GAR_SF,TOTAL_ACRES,SCHOOL_DST,USE1_DESC,SALE_DATE,SALE_VALUE"
+        "GAR_SF,TOTAL_ACRES,SCHOOL_DST,USE1_DESC,SALE_DATE,SALE_VALUE,"
+        # ADDED after ParcelUpsert was widened on 2026-08-13. These columns
+        # exist on core.parcels and this layer publishes them, but the model
+        # had no field for them, so nothing could be written. GAR_SF was
+        # already requested and had to be dropped mid-change when it raised
+        # extra_forbidden and failed all 500 writes of a capped test run.
+        "GARAGE,BASEMENT,HEATING,AIR_COND,TOTAL_TAX,SPEC_ASSESS,Legal"
     )
     # Geometry ON as POLYGONS — the layer does NOT support returnCentroid
     # (checked 2026-08-13: no supportsReturningGeometryCentroid in
@@ -363,9 +396,28 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "lot_sqft": lot_sqft,
             "beds": _safe_int(attributes.get("BEDS")),
             "baths": _safe_float(attributes.get("BATH")),
-            "garage_sqft": _safe_int(attributes.get("GAR_SF")),
             "use_class": _safe_str(attributes.get("USE1_DESC")),
             "school_district": _safe_str(attributes.get("SCHOOL_DST")),
+            # Structure characteristics, kept as the county writes them
+            # ("Attached 2 stall", "Full", "Forced air"). Not normalised —
+            # a wrong mapping across 87 counties' vocabularies is worse than
+            # the county's own words.
+            "garage": _safe_str(attributes.get("GARAGE")),
+            "garage_sqft": _safe_int(attributes.get("GAR_SF")),
+            "basement": _safe_str(attributes.get("BASEMENT")),
+            "heating": _safe_str(attributes.get("HEATING")),
+            "cooling": _safe_str(attributes.get("AIR_COND")),
+            # Tax and legal
+            "annual_tax": _safe_decimal(attributes.get("TOTAL_TAX")),
+            "special_assessments": _safe_decimal(attributes.get("SPEC_ASSESS")),
+            "homestead_status": _safe_str(attributes.get("HOMESTEAD")),
+            "legal_description": _safe_str(attributes.get("Legal")),
+            # Prior arm's-length sale — NOT the distress event. This is what an
+            # investor compares an asking price against. SALE_DATE and
+            # SALE_VALUE were already being requested and thrown away, because
+            # the model had nowhere to put them.
+            "last_sale_price": _safe_decimal(attributes.get("SALE_VALUE")),
+            "last_sale_date": _arcgis_date_to_iso(attributes.get("SALE_DATE")),
             "raw_data": cleaned_raw,
         }
 
@@ -410,9 +462,19 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     lot_sqft=sig.get("lot_sqft"),
                     beds=sig.get("beds"),
                     baths=sig.get("baths"),
-                    garage_sqft=sig.get("garage_sqft"),
                     use_class=sig.get("use_class"),
                     school_district=sig.get("school_district"),
+                    garage=sig.get("garage"),
+                    garage_sqft=sig.get("garage_sqft"),
+                    basement=sig.get("basement"),
+                    heating=sig.get("heating"),
+                    cooling=sig.get("cooling"),
+                    annual_tax=sig.get("annual_tax"),
+                    special_assessments=sig.get("special_assessments"),
+                    homestead_status=sig.get("homestead_status"),
+                    legal_description=sig.get("legal_description"),
+                    last_sale_price=sig.get("last_sale_price"),
+                    last_sale_date=sig.get("last_sale_date"),
                     raw_data=sig.get("raw_data"),
                     data_sources=[self.source_name],
                     last_observed_at=datetime.now(timezone.utc),
