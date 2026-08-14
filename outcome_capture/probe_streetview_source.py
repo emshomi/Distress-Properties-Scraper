@@ -70,18 +70,24 @@ META_URL = "https://maps.googleapis.com/maps/api/streetview/metadata"
 #              type. Measured 2026-08-14 over all 6,899 ok parcels: fixed 206,
 #              dropped 13, and EIGHTEEN third-party photospheres survived it,
 #              eleven of them named individuals and virtual-tour companies.
-#   google   — official Google collections only. The Maps JavaScript API
-#              exposes this source; whether the REST metadata endpoint honours
-#              it is UNDOCUMENTED, which is why it is measured rather than
-#              assumed.
 #
-# ALL THREE ARE ASKED ON THE SAME RUN, seconds apart, because Google publishes
-# imagery continuously. Comparing a variant measured now against one measured
-# forty minutes ago attributes to the parameter whatever changed in between.
+# source=google WAS TRIED AND DOES NOT EXIST HERE (2026-08-14). The Maps
+# JavaScript API exposes a GOOGLE source meaning official collections only, so
+# it was measured rather than assumed. The REST metadata endpoint answered
+# HTTP 400: "Invalid request. Invalid 'source' parameter." / INVALID_REQUEST.
+# Do not re-add it. `outdoor` is the only source value this endpoint accepts.
+#
+# The 18 third-party photospheres that survive `outdoor` are therefore a
+# CLASSIFICATION problem, not a parameter problem — to be decided from the
+# copyright string and pano_id shape, which agreed on all 6,899 rows.
+#
+# EVERY VARIANT IS ASKED ON THE SAME RUN, seconds apart, because Google
+# publishes imagery continuously. Comparing a variant measured now against one
+# measured forty minutes ago attributes to the parameter whatever changed in
+# between.
 VARIANTS: list[tuple[str, str | None]] = [
     ("baseline", None),
     ("outdoor", "outdoor"),
-    ("google", "google"),
 ]
 
 # The frame resumes on the LAST variant written. All variants for a parcel go
@@ -189,6 +195,14 @@ def fetch_metadata(key: str, lat: float, lng: float,
 
     A transport failure is retried. ZERO_RESULTS is NOT: it is an answer, and
     retrying it turns a real finding into a slow one.
+
+    A 4xx CARRYING A status FIELD IS ALSO AN ANSWER, and is returned as one.
+    On 2026-08-14 source=google drew HTTP 400 with
+    {"status": "INVALID_REQUEST", "error_message": "Invalid request. Invalid
+    'source' parameter."} — Google naming the exact fault — and this function
+    collapsed it to None, which the caller reported as "metadata endpoint
+    unreachable". The endpoint was reachable and explicit. Only a genuine
+    transport failure returns None now.
     """
     params: dict[str, Any] = {"location": f"{lat},{lng}", "key": key}
     if source:
@@ -203,7 +217,22 @@ def fetch_metadata(key: str, lat: float, lng: float,
             if resp.status_code in (429, 500, 502, 503, 504):
                 time.sleep(2 ** attempt)
                 continue
-            log(f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+            # Not a transport failure — Google refused and said why. Hand the
+            # body back so the caller reports Google's own words instead of
+            # inventing a network diagnosis. Retrying is pointless: the
+            # request is malformed and will be malformed next time too.
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            if isinstance(body, dict) and body.get("status"):
+                log(f"HTTP {resp.status_code} status={body.get('status')} "
+                    f"{body.get('error_message', '')}")
+                return body
+
+            log(f"HTTP {resp.status_code} (unparseable body): "
+                f"{resp.text[:200]}")
             return None
         except requests.RequestException:
             if attempt == MAX_RETRIES:
@@ -268,7 +297,7 @@ def main() -> int:
         log("FATAL: GOOGLE_MAPS_API_KEY is not set")
         return 1
 
-    run = os.environ.get("PROBE_RUN", "three_way_v1_2026-08-14")
+    run = os.environ.get("PROBE_RUN", "outdoor_v1_2026-08-14")
     max_parcels = int(os.environ.get("MAX_PARCELS", "0"))  # 0 = no cap
     log(f"probe_run={run} max_parcels={max_parcels or 'uncapped'}")
 
