@@ -99,6 +99,42 @@ the house OPPOSITE. The stored heading is the bearing from where the camera
 stood to the parcel — the difference between a photo of the property and a
 photo of its neighbour.
 
+=== THE SOURCE FILTER, AND THE PUBLISHER (added 2026-08-14) ===
+This script used to send only `location` and `key`. Google's default panorama
+search includes INDOOR collections and third-party photospheres, so
+8300 NORMAN CENTER DR, Bloomington — a $48.8M commercial parcel — served a
+member of the public's photo of a CAFE INTERIOR as a picture of the property,
+with nothing indicating it was wrong.
+
+Measured over all 6,899 ok rows before changing anything
+(audit.streetview_source_probe, probe_run outdoor_v1_2026-08-14):
+    206 panoramas CHANGED under source=outdoor (187 off a photosphere)
+     13 LOST coverage entirely — third-party imagery was all that existed
+     18 third-party photospheres SURVIVED source=outdoor
+  6,662 unchanged
+Two signals identified the class and agreed on ALL 6,899 rows: a CAoS-prefixed
+pano_id, and a copyright other than '© Google'.
+
+source=google was tried and REJECTED BY GOOGLE — HTTP 400, "Invalid request.
+Invalid 'source' parameter." It exists only in the Maps JavaScript API. Do not
+re-add it.
+
+So the residue is judged on the PUBLISHER. An ok Street View row must come from
+a verified publisher; anything else is unverified_source, and
+parcel_imagery_notok_has_no_pano_ck drops the pano_id so no stale locator is
+left behind. VERIFIED_PUBLISHERS is '© Google' alone: '© WSB' is a Minnesota
+municipal engineering firm whose panoramas sit 23-40m out on the roadway in six
+cities and is very probably fine, but nobody has looked at one, and "probably
+fine" is not a standard for telling a subscriber this is their property.
+
+=== POLICY IS FINGERPRINTED (added 2026-08-14) ===
+geom sat WRONG on 18,415 rows for eleven days because nothing distinguished a
+row decided under old rules from one decided under current rules. Every row now
+carries RESOLVER_POLICY, computed from the constants below. The working set
+re-opens anything whose policy is not the current one, so changing a threshold,
+the source parameter or the verified-publisher list re-resolves the affected
+rows automatically instead of needing someone to remember.
+
 === WHAT IS NEVER STORED ===
 Google's terms prohibit pre-fetching, indexing, storing, resharing or
 rehosting Maps Content, and name bulk download of Street View images
@@ -148,6 +184,36 @@ LAND_TYPES = {"land", "agricultural"}
 # table to maintain.
 AERIAL_ZOOM = 18
 
+# The only source value this endpoint accepts besides the default. Excludes
+# indoor collections and photospheres of undetermined type. Measured, not
+# assumed — see the docstring.
+STREETVIEW_SOURCE = "outdoor"
+
+# Publishers whose panoramas we will present as a picture of the property.
+# Deliberately minimal. Adding one changes RESOLVER_POLICY below, which
+# re-resolves every affected row on the next run — no manual sweep.
+VERIFIED_PUBLISHERS = frozenset({"© Google"})
+
+
+def _policy() -> str:
+    """Fingerprint of the rules a row was decided under.
+
+    COMPUTED from the constants rather than hand-written, so a threshold that
+    changes without its fingerprint changing is impossible. That failure is
+    exactly how geom rotted: a value that was true when written, with nothing
+    able to tell it had outlived its condition.
+    """
+    pubs = ",".join(sorted(VERIFIED_PUBLISHERS))
+    return (f"sv1|source={STREETVIEW_SOURCE}"
+            f"|struct={NEAR_METRES_STRUCTURE:.0f}"
+            f"|land={NEAR_METRES_LAND:.0f}"
+            f"|landlot={LAND_LOT_SQFT}"
+            f"|zoom={AERIAL_ZOOM}"
+            f"|pubs={pubs}")
+
+
+RESOLVER_POLICY = _policy()
+
 
 WORKING_SET_SQL = """
 SELECT d.county_slug                          AS county_code,
@@ -172,9 +238,13 @@ WHERE  p.lat IS NOT NULL
          i.parcel_id IS NULL
          -- OR resolved as no_location BEFORE the parcel had coordinates.
          -- That verdict was true when written and is not any more; see the
-         -- module docstring. Anything else (ok / no_imagery / too_far) is a
-         -- real answer about Google's coverage and stays settled.
+         -- module docstring.
       OR i.status = 'no_location'
+         -- OR decided under rules that are no longer the rules. This is the
+         -- general form of the line above and the reason geom cannot happen
+         -- again here: a settled answer stays settled only while the policy
+         -- that settled it is still current.
+      OR i.resolver_policy IS DISTINCT FROM %(policy)s
        )
 LIMIT  %(batch)s;
 """
@@ -209,13 +279,14 @@ LIMIT  %(batch)s;
 UPSERT_SQL = """
 INSERT INTO core.parcel_imagery
     (county_code, parcel_id, source, status, pano_id, pano_date,
-     pano_lat, pano_lng, distance_m, heading_deg, zoom,
-     resolved_at, error_detail, updated_at)
+     pano_copyright, pano_lat, pano_lng, distance_m, heading_deg, zoom,
+     resolved_at, error_detail, resolver_policy, updated_at)
 VALUES %s
 ON CONFLICT (county_code, parcel_id, source) DO UPDATE SET
     status       = EXCLUDED.status,
     pano_id      = EXCLUDED.pano_id,
     pano_date    = EXCLUDED.pano_date,
+    pano_copyright = EXCLUDED.pano_copyright,
     pano_lat     = EXCLUDED.pano_lat,
     pano_lng     = EXCLUDED.pano_lng,
     distance_m   = EXCLUDED.distance_m,
@@ -223,6 +294,7 @@ ON CONFLICT (county_code, parcel_id, source) DO UPDATE SET
     zoom         = EXCLUDED.zoom,
     resolved_at  = EXCLUDED.resolved_at,
     error_detail = EXCLUDED.error_detail,
+    resolver_policy = EXCLUDED.resolver_policy,
     updated_at   = now();
 """
 
@@ -268,8 +340,17 @@ def fetch_metadata(key: str, lat: float, lng: float) -> dict[str, Any] | None:
 
     A transport failure is retried. ZERO_RESULTS is NOT: it is an answer, and
     retrying it turns a real finding into a slow one.
+
+    A 4xx CARRYING A status FIELD IS ALSO AN ANSWER. On 2026-08-14 an invalid
+    source value drew HTTP 400 with {"status": "INVALID_REQUEST",
+    "error_message": "..."} — Google naming the exact fault — and the probe
+    collapsed it to None, which its caller reported as "metadata endpoint
+    unreachable". The endpoint was reachable and explicit. Only a genuine
+    transport failure returns None.
     """
-    params = {"location": f"{lat},{lng}", "key": key}
+    params = {"location": f"{lat},{lng}",
+              "source": STREETVIEW_SOURCE,
+              "key": key}
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.get(META_URL, params=params, timeout=REQUEST_TIMEOUT)
@@ -278,7 +359,20 @@ def fetch_metadata(key: str, lat: float, lng: float) -> dict[str, Any] | None:
             if resp.status_code in (429, 500, 502, 503, 504):
                 time.sleep(2 ** attempt)
                 continue
-            log(f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+            # Refused, with a reason. Hand it back rather than inventing a
+            # network diagnosis. Retrying a malformed request is pointless.
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+            if isinstance(body, dict) and body.get("status"):
+                log(f"HTTP {resp.status_code} status={body.get('status')} "
+                    f"{body.get('error_message', '')}")
+                return body
+
+            log(f"HTTP {resp.status_code} (unparseable body): "
+                f"{resp.text[:200]}")
             return None
         except requests.RequestException as e:
             if attempt == MAX_RETRIES:
@@ -295,11 +389,12 @@ def resolve_one(key: str, row: dict[str, Any], now_iso: str) -> list[tuple]:
     meta = fetch_metadata(key, lat, lng)
 
     if meta is None:
-        sv = (cc, pid, "google_streetview", "error", None, None,
+        sv = (cc, pid, "google_streetview", "error", None, None, None,
               None, None, None, None, None, now_iso,
-              "metadata request failed", now_iso)
+              "metadata request failed", RESOLVER_POLICY, now_iso)
     else:
         status = meta.get("status")
+        copyright_ = meta.get("copyright")
         if status == "OK":
             loc = meta.get("location") or {}
             plat, plng = loc.get("lat"), loc.get("lng")
@@ -309,17 +404,37 @@ def resolve_one(key: str, row: dict[str, Any], now_iso: str) -> list[tuple]:
                 # parcel_imagery_ok_has_pano_ck. Record it as an error rather
                 # than letting the database reject the whole batch.
                 sv = (cc, pid, "google_streetview", "error", None, None,
-                      None, None, None, None, None, now_iso,
-                      "OK without pano_id or location", now_iso)
+                      copyright_, None, None, None, None, None, now_iso,
+                      "OK without pano_id or location", RESOLVER_POLICY,
+                      now_iso)
+            elif copyright_ not in VERIFIED_PUBLISHERS:
+                # A real panorama from a publisher we will not vouch for.
+                # NOT no_imagery (Google has something), NOT too_far
+                # (distance is fine), NOT error (the lookup worked) — a
+                # fourth fact, and collapsing it into any of the others
+                # would be a false statement about our own coverage.
+                #
+                # pano_id must be NULL — notok_has_no_pano_ck — so nothing
+                # is left behind that could later be mistaken for coverage.
+                # The copyright IS kept: it is the whole reason for the
+                # verdict and the only way to review it without paying
+                # Google again.
+                dist = haversine_m(lat, lng, plat, plng)
+                sv = (cc, pid, "google_streetview", "unverified_source",
+                      None, meta.get("date"), copyright_, plat, plng,
+                      round(dist, 1), None, None, now_iso,
+                      f"publisher {copyright_!r} is not verified",
+                      RESOLVER_POLICY, now_iso)
             else:
                 dist = haversine_m(lat, lng, plat, plng)
                 limit = near_threshold(row.get("property_type"),
                                        row.get("lot_sqft"))
                 if dist <= limit:
                     sv = (cc, pid, "google_streetview", "ok", pano,
-                          meta.get("date"), plat, plng, round(dist, 1),
+                          meta.get("date"), copyright_, plat, plng,
+                          round(dist, 1),
                           round(bearing_deg(plat, plng, lat, lng), 2),
-                          None, now_iso, None, now_iso)
+                          None, now_iso, None, RESOLVER_POLICY, now_iso)
                 else:
                     # A panorama exists but is not looking at this property.
                     # pano_id must be NULL here — notok_has_no_pano_ck — and
@@ -327,21 +442,26 @@ def resolve_one(key: str, row: dict[str, Any], now_iso: str) -> list[tuple]:
                     # value waiting to be mistaken for coverage. distance_m is
                     # kept, so the reason stays inspectable.
                     sv = (cc, pid, "google_streetview", "too_far", None,
-                          meta.get("date"), plat, plng, round(dist, 1),
-                          None, None, now_iso,
+                          meta.get("date"), copyright_, plat, plng,
+                          round(dist, 1), None, None, now_iso,
                           f"nearest panorama {dist:.0f}m away "
-                          f"(limit {limit:.0f}m)", now_iso)
+                          f"(limit {limit:.0f}m)", RESOLVER_POLICY, now_iso)
         elif status == "ZERO_RESULTS":
             sv = (cc, pid, "google_streetview", "no_imagery", None, None,
-                  None, None, None, None, None, now_iso, None, now_iso)
+                  None, None, None, None, None, None, now_iso, None,
+                  RESOLVER_POLICY, now_iso)
         else:
-            sv = (cc, pid, "google_streetview", "error", None, None,
+            sv = (cc, pid, "google_streetview", "error", None, None, None,
                   None, None, None, None, None, now_iso,
-                  f"metadata status={status}", now_iso)
+                  f"metadata status={status}"
+                  + (f" — {meta.get('error_message')}"
+                     if meta.get("error_message") else ""),
+                  RESOLVER_POLICY, now_iso)
 
     # Aerial: derived, never fetched. See the module docstring.
-    aerial = (cc, pid, "google_aerial", "ok", None, None,
-              None, None, None, None, AERIAL_ZOOM, now_iso, None, now_iso)
+    aerial = (cc, pid, "google_aerial", "ok", None, None, None,
+              None, None, None, None, AERIAL_ZOOM, now_iso, None,
+              RESOLVER_POLICY, now_iso)
 
     return [sv, aerial]
 
@@ -356,6 +476,7 @@ def main() -> int:
         log("FATAL: GOOGLE_MAPS_API_KEY is not set")
         return 1
     dry_run = os.environ.get("DRY_RUN") == "1"
+    log(f"policy: {RESOLVER_POLICY}")
 
     # Control point before spending a run. A denied key returns REQUEST_DENIED
     # on every call, and 7,453 identical denials written as status='error'
@@ -391,8 +512,9 @@ def main() -> int:
                 for src in ("google_streetview", "google_aerial"):
                     rows.append((r["county_code"], r["parcel_id"], src,
                                  "no_location", None, None, None, None, None,
-                                 None, None, now_iso,
-                                 "parcel has no lat/lng", now_iso))
+                                 None, None, None, now_iso,
+                                 "parcel has no lat/lng",
+                                 RESOLVER_POLICY, now_iso))
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, UPSERT_SQL, rows)
             conn.commit()
@@ -401,7 +523,8 @@ def main() -> int:
 
         while batches < MAX_BATCHES:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(WORKING_SET_SQL, {"batch": BATCH_SIZE})
+                cur.execute(WORKING_SET_SQL, {"batch": BATCH_SIZE,
+                                              "policy": RESOLVER_POLICY})
                 work = [r for r in cur.fetchall()
                         if r["lat"] is not None and r["lng"] is not None]
 
