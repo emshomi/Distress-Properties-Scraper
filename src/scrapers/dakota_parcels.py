@@ -306,7 +306,17 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         # had no field for them, so nothing could be written. GAR_SF was
         # already requested and had to be dropped mid-change when it raised
         # extra_forbidden and failed all 500 writes of a capped test run.
-        "GARAGE,BASEMENT,HEATING,AIR_COND,TOTAL_TAX,SPEC_ASSESS,Legal"
+        #
+        # NAMES VERIFIED against the layer's own field list, not inferred.
+        # A first attempt sent GARAGE / BASEMENT / HEATING / AIR_COND /
+        # SPEC_ASSESS — four of which DO NOT EXIST on this layer and one of
+        # which is spelled SPECIAL_ASSESSMENTS. The server answered with a
+        # bare 400 "Failed to execute query" naming nothing, so the whole run
+        # died on page 1 with fetched=0. Dakota publishes garage SIZE (GAR_SF)
+        # but no garage type, and no basement / heating / cooling at all —
+        # that was an assumption about what an assessor layer contains rather
+        # than a reading of this one.
+        "TOTAL_TAX,SPECIAL_ASSESSMENTS,Legal,HOME_STYLE,ABOVEGRD_SF"
     )
     # Geometry ON as POLYGONS — the layer does NOT support returnCentroid
     # (checked 2026-08-13: no supportsReturningGeometryCentroid in
@@ -398,18 +408,20 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "baths": _safe_float(attributes.get("BATH")),
             "use_class": _safe_str(attributes.get("USE1_DESC")),
             "school_district": _safe_str(attributes.get("SCHOOL_DST")),
-            # Structure characteristics, kept as the county writes them
-            # ("Attached 2 stall", "Full", "Forced air"). Not normalised —
-            # a wrong mapping across 87 counties' vocabularies is worse than
-            # the county's own words.
-            "garage": _safe_str(attributes.get("GARAGE")),
+            # Structure characteristics. Dakota publishes garage SIZE but not
+            # garage TYPE, and carries no basement / heating / cooling field —
+            # verified against the layer's field list. Those three stay null
+            # here rather than being faked from something adjacent.
             "garage_sqft": _safe_int(attributes.get("GAR_SF")),
-            "basement": _safe_str(attributes.get("BASEMENT")),
-            "heating": _safe_str(attributes.get("HEATING")),
-            "cooling": _safe_str(attributes.get("AIR_COND")),
-            # Tax and legal
+            # HOME_STYLE is the county's own words ("Rambler", "Split Level").
+            # core.parcels.garage is text, so the style goes nowhere near it;
+            # this rides in raw_data only, alongside ABOVEGRD_SF.
+            #
+            # Tax and legal. TOTAL_TAX, not TAX: TOTAL_TAX is the figure an
+            # owner actually pays. special_assessments is stored separately
+            # regardless, so using base TAX would understate the carry.
             "annual_tax": _safe_decimal(attributes.get("TOTAL_TAX")),
-            "special_assessments": _safe_decimal(attributes.get("SPEC_ASSESS")),
+            "special_assessments": _safe_decimal(attributes.get("SPECIAL_ASSESSMENTS")),
             "homestead_status": _safe_str(attributes.get("HOMESTEAD")),
             "legal_description": _safe_str(attributes.get("Legal")),
             # Prior arm's-length sale — NOT the distress event. This is what an
@@ -464,11 +476,7 @@ class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     baths=sig.get("baths"),
                     use_class=sig.get("use_class"),
                     school_district=sig.get("school_district"),
-                    garage=sig.get("garage"),
                     garage_sqft=sig.get("garage_sqft"),
-                    basement=sig.get("basement"),
-                    heating=sig.get("heating"),
-                    cooling=sig.get("cooling"),
                     annual_tax=sig.get("annual_tax"),
                     special_assessments=sig.get("special_assessments"),
                     homestead_status=sig.get("homestead_status"),
