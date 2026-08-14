@@ -192,7 +192,31 @@ STREETVIEW_SOURCE = "outdoor"
 # Publishers whose panoramas we will present as a picture of the property.
 # Deliberately minimal. Adding one changes RESOLVER_POLICY below, which
 # re-resolves every affected row on the next run — no manual sweep.
-VERIFIED_PUBLISHERS = frozenset({"© Google"})
+# Publishers whose panoramas we will present as a picture of the property.
+# Deliberately minimal. Adding one changes RESOLVER_POLICY below, which
+# re-resolves every affected row on the next run — no manual sweep.
+#
+# VERIFIED BY INSPECTION, 2026-08-14 — each entry required someone to open a
+# panorama and look at it. Nothing is admitted on the strength of the
+# publisher's name.
+#
+#   © Google  Street View proper.
+#   © WSB     Minnesota municipal engineering firm. Panoramas inspected at
+#             1044 Jackson St, Saint Paul and 23092 Bittersweet St NW, Saint
+#             Francis: vehicle-mounted capture with the car's own hood in
+#             frame, camera at windscreen height, on the roadway, subject
+#             property framed as a Street View car would frame it. Jackson St
+#             offers "See more dates" — the street has been driven more than
+#             once, which only a systematic programme does. Publishes across
+#             hennepin, anoka, washington, ramsey and dakota, 2019-2024.
+#
+# REJECTED, and the reason this list is inspected rather than reasoned about:
+#   © Hennepin County — a county government, an outdoor panorama, 22.4m from
+#   3160 FRANCE AVE S. It is a photograph of a paved BIKE TRAIL through trees,
+#   with a cyclist in it. No roadway, no buildings, nothing of the property.
+#   Institutional respectability is not evidence, and 22.4m is inside every
+#   distance threshold we have — which is why distance cannot do this job.
+VERIFIED_PUBLISHERS = frozenset({"© Google", "© WSB"})
 
 
 def _policy() -> str:
