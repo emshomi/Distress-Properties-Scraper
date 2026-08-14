@@ -150,6 +150,28 @@ def _safe_decimal(value: str | None) -> Decimal | None:
         return None
 
 
+def _tax_parcel_no_to_pid(value: Any) -> str | None:
+    """Anoka detail-page `tax_parcel_no` -> a core.parcels parcel_id.
+
+    The county writes the PIN dashed on the detail page
+    ("08-31-24-22-0220") and undashed in the list page's propid
+    ("053123420040"). core.parcels stores the undashed 12-digit form, so a
+    pending-sale PIN has to have its punctuation removed before it can join.
+
+    Returns None unless the result is EXACTLY 12 digits. A short or long
+    value is not silently zero-padded or truncated: a wrong parcel_id does
+    not fail loudly, it attaches a foreclosure to somebody else's property.
+    Measured 2026-08-14: all 74 tax_parcel_no values present across Anoka's
+    synthetic events were 12 digits after stripping, and 73 matched a real
+    Anoka parcel — so the strict check costs nothing real and guards the
+    case where the county changes format.
+    """
+    if value is None:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    return digits if len(digits) == 12 else None
+
+
 def _parse_mmddyyyy(value: str | None) -> date | None:
     """Parse the several date shapes the two Anoka tables use.
 
@@ -1130,17 +1152,55 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             # 147 an address. The 136 events with no dedup collision were
             # re-keyed by hand; this stops the scraper recreating them.
             #
-            # Pending Sales rows expose NO propid, so they keep the synthetic
-            # id. That is a real limitation of the source list page, not an
-            # extraction failure — the PIN only appears once a sale completes.
-            #
             # Deliberately NOT normalised through safe_normalize_parcel_id:
             # the county's propid is already the assessor's own format and
             # matched 155/156 verbatim. Normalising would risk reshaping a
             # value that is already correct.
+            #
+            # ── SECOND SOURCE, ADDED 2026-08-14 ────────────────────────────
+            # The comment that stood here said Pending Sales "expose NO
+            # propid ... the PIN only appears once a sale completes", and
+            # treated that as a limitation of the source rather than
+            # something to work around. Half of it is right: the LIST page
+            # carries no propid for pending rows. But the DETAIL page carries
+            # `tax_parcel_no` — dashed, e.g. "08-31-24-22-0220" — and THIS
+            # SCRAPER ALREADY FETCHES AND STORES IT. _extract_detail() picks
+            # it up at line ~1091 and it lands in raw_data.detail.
+            #
+            # It was even being USED: the enrichment step below keys on
+            # tax_parcel_no to pull gis_owner, gis_market_value and
+            # gis_homestead off the Anoka parcel layer. A pending row we
+            # inspected carried gis_market_value 307700 — fetched via this
+            # PIN — while its parcel_id stayed ANOKA-FC-23832 and the
+            # property showed no map, no imagery, no valuation and no deal
+            # math on the detail panel.
+            #
+            # So the PIN was present, stored, and proven to resolve. It just
+            # never reached the one field that decides whether a property is
+            # connected to core.parcels.
+            #
+            # Measured 2026-08-14 over all 181 synthetic Anoka events:
+            #   74 carry detail.tax_parcel_no
+            #   74 of 74 are exactly 12 digits once punctuation is stripped
+            #   73 of 74 match an existing (anoka, parcel_id) in core.parcels
+            # The remaining 107 have no tax_parcel_no at all — a separate
+            # problem (the detail page was not fetched, or the county did not
+            # publish one) needing its own fix, not this one.
+            #
+            # WHY DIGITS-ONLY AND NOT _norm(): _norm is imported above as
+            # `_norm_pin`, which reads like a PIN normaliser and is not — it
+            # upper-cases and collapses spaces, leaving "08-31-24-22-0220"
+            # dashed. That is correct for the ENRICHMENT, which matches the
+            # parcel layer's PIN2 field (dashed). core.parcels stores the
+            # 12-digit form, so this side needs the dashes gone. Two formats,
+            # two sources, both right — hence an explicit conversion here
+            # rather than borrowing a function that does something else.
             propid = r.get("propid")
+            tax_pin = _tax_parcel_no_to_pid(r.get("tax_parcel_no"))
             if propid and str(propid).strip():
                 parcel_id = str(propid).strip()
+            elif tax_pin:
+                parcel_id = tax_pin
             else:
                 parcel_id = f"ANOKA-FC-{detail_id}"
 
