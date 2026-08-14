@@ -185,6 +185,60 @@ class ParcelUpsert(BaseModel):
     # Status fields
     vacancy_status: VacancyStatus | None = None
 
+    # ------------------------------------------------------------------
+    # ADDED 2026-08-13 — columns core.parcels has carried since the schema was
+    # designed and that NO model field reached, so no loader could write them
+    # and they were null on all 2.66M rows.
+    #
+    # The gap surfaced when dakota_parcels tried to send garage_sqft: the model
+    # is extra="forbid", so it raised a validation error and failed all 500
+    # writes of a capped test run. The column existed, the county published the
+    # value, and the model was the only thing in the way. Dakota's layer alone
+    # carries garage/basement/heating/cooling, sale price and date, and legal
+    # description; Washington's carries several of the same.
+    #
+    # Types are read off pg_catalog, NOT assumed: numeric -> Decimal,
+    # date -> date, integer -> int, text -> str. A model type disagreeing with
+    # its column would move the same failure one layer down, where it surfaces
+    # at write time on a full run instead of at validation on a capped one.
+    #
+    # DELIBERATELY NOT ADDED:
+    #   geom          derived by trg_parcels_set_geom from lat/lng. A model
+    #                 field would let a loader write it directly and
+    #                 reintroduce the exact divergence the trigger exists to
+    #                 make impossible — 18,415 rows held another county's
+    #                 geometry for eleven days before it was caught.
+    #   first_observed_at / created_at / updated_at   database-managed.
+    #
+    # All optional with None defaults, so every existing loader is unaffected.
+
+    # Address components. Some county layers publish these split rather than as
+    # one line; `address` above stays the canonical single string.
+    street_number: str | None = None
+    street_name: str | None = None
+    unit: str | None = None
+
+    # Structure characteristics — text as the counties publish it ("Attached 2
+    # stall", "Full", "Forced air"), NOT normalised. Normalising across 87
+    # counties' vocabularies is its own project, and a wrong mapping is worse
+    # than the county's own words.
+    garage: str | None = None
+    garage_sqft: int | None = None
+    basement: str | None = None
+    heating: str | None = None
+    cooling: str | None = None
+
+    # Tax and legal
+    annual_tax: Decimal | None = None
+    special_assessments: Decimal | None = None
+    homestead_status: str | None = None
+    legal_description: str | None = None
+
+    # Last recorded sale. NOT the distress event — this is the prior arm's
+    # length transfer, which is what an investor compares an asking price to.
+    last_sale_price: Decimal | None = None
+    last_sale_date: date | None = None
+
     # Source-specific raw attributes preserved verbatim.
     # Schema varies by scraper — Hennepin parcels store the 80+ ArcGIS
     # attributes here for later mining of distress signals (FORFEIT_LAND_IND,
