@@ -61,6 +61,33 @@ import requests
 
 META_URL = "https://maps.googleapis.com/maps/api/streetview/metadata"
 
+# The variants asked about EVERY parcel, in order, seconds apart.
+#
+#   baseline — exactly what resolve_parcel_imagery.py sends today: location
+#              and key, nothing else. Adding anything here would make the
+#              baseline a fiction.
+#   outdoor  — excludes indoor collections and photospheres of undetermined
+#              type. Measured 2026-08-14 over all 6,899 ok parcels: fixed 206,
+#              dropped 13, and EIGHTEEN third-party photospheres survived it,
+#              eleven of them named individuals and virtual-tour companies.
+#   google   — official Google collections only. The Maps JavaScript API
+#              exposes this source; whether the REST metadata endpoint honours
+#              it is UNDOCUMENTED, which is why it is measured rather than
+#              assumed.
+#
+# ALL THREE ARE ASKED ON THE SAME RUN, seconds apart, because Google publishes
+# imagery continuously. Comparing a variant measured now against one measured
+# forty minutes ago attributes to the parameter whatever changed in between.
+VARIANTS: list[tuple[str, str | None]] = [
+    ("baseline", None),
+    ("outdoor", "outdoor"),
+    ("google", "google"),
+]
+
+# The frame resumes on the LAST variant written. All variants for a parcel go
+# in one transaction, so this one existing means the parcel is finished.
+RESUME_VARIANT = VARIANTS[-1][0]
+
 BATCH_SIZE = 250
 PACE_SECONDS = 0.05
 REQUEST_TIMEOUT = 10
@@ -103,7 +130,9 @@ WITNESS_EXPECTED_PANO = "CAoSHENJQUJJaEJZZFdITGVjTFJRWmlwQVc4cXlVdzI."
 # Every `ok` Street View row, with the coordinate the resolver would use today.
 # Ordered so a capped run and the full run cover the same parcels in the same
 # sequence — a capped run is then a true prefix of the full one, not a
-# different population.
+# different population. The anti-join sentinel is RESUME_VARIANT, the last
+# variant written, so adding a variant does not silently skip parcels that
+# were finished under the old set.
 FRAME_SQL = """
 SELECT i.county_code                          AS county_code,
        i.parcel_id                            AS parcel_id,
@@ -117,7 +146,7 @@ LEFT   JOIN audit.streetview_source_probe s
        ON  s.probe_run   = %(run)s
        AND s.county_code = i.county_code
        AND s.parcel_id   = i.parcel_id
-       AND s.variant     = 'outdoor'
+       AND s.variant     = %(resume_variant)s
 WHERE  i.source   = 'google_streetview'
   AND  i.status   = 'ok'
   AND  p.lat IS NOT NULL
@@ -239,7 +268,7 @@ def main() -> int:
         log("FATAL: GOOGLE_MAPS_API_KEY is not set")
         return 1
 
-    run = os.environ.get("PROBE_RUN", "outdoor_v1_2026-08-14")
+    run = os.environ.get("PROBE_RUN", "three_way_v1_2026-08-14")
     max_parcels = int(os.environ.get("MAX_PARCELS", "0"))  # 0 = no cap
     log(f"probe_run={run} max_parcels={max_parcels or 'uncapped'}")
 
@@ -253,52 +282,60 @@ def main() -> int:
         return 1
     log(f"control point baseline: {describe(ctl)}")
 
-    ctl_out = fetch_metadata(key, CONTROL_LAT, CONTROL_LNG, source="outdoor")
-    if ctl_out is None:
-        log("FATAL: metadata endpoint unreachable with source=outdoor")
-        return 1
-    if ctl_out.get("status") in ("REQUEST_DENIED", "INVALID_REQUEST"):
-        log(f"FATAL: source=outdoor rejected — status="
-            f"{ctl_out.get('status')} {ctl_out.get('error_message', '')}")
-        return 1
-    log(f"control point outdoor:  {describe(ctl_out)}")
+    for variant, source in VARIANTS:
+        if source is None:
+            continue
+        c = fetch_metadata(key, CONTROL_LAT, CONTROL_LNG, source=source)
+        if c is None:
+            log(f"FATAL: metadata endpoint unreachable with source={source}")
+            return 1
+        if c.get("status") in ("REQUEST_DENIED", "INVALID_REQUEST"):
+            log(f"FATAL: source={source} rejected — status={c.get('status')} "
+                f"{c.get('error_message', '')}")
+            return 1
+        log(f"control point {variant}: {describe(c)}")
 
     # --- Control point 2: is the parameter actually HONOURED? -------------
     # The witness is a coordinate whose nearest panorama is known to be a
     # business interior. If outdoor returns the SAME pano_id there, Google is
     # ignoring the parameter and every row this run writes would be a pair of
     # identical answers misread as "no indoor problem exists".
-    w_base = fetch_metadata(key, WITNESS_LAT, WITNESS_LNG)
-    w_out = fetch_metadata(key, WITNESS_LAT, WITNESS_LNG, source="outdoor")
     log(f"witness ({WITNESS_LABEL})")
-    log(f"  baseline: {describe(w_base)}")
-    log(f"  outdoor:  {describe(w_out)}")
+    witness: dict[str, dict | None] = {}
+    for variant, source in VARIANTS:
+        w = fetch_metadata(key, WITNESS_LAT, WITNESS_LNG, source=source)
+        witness[variant] = w
+        log(f"  {variant}: {describe(w)}")
+        if w is None:
+            log(f"FATAL: witness lookup failed for {variant} — cannot verify "
+                f"the parameter")
+            return 1
 
-    if w_base is None or w_out is None:
-        log("FATAL: witness lookup failed — cannot verify the parameter")
-        return 1
-
-    if w_base.get("pano_id") != WITNESS_EXPECTED_PANO:
+    if witness["baseline"].get("pano_id") != WITNESS_EXPECTED_PANO:
         log(f"FATAL: baseline at the witness returned "
-            f"{w_base.get('pano_id')!r}, expected {WITNESS_EXPECTED_PANO!r} "
-            f"— the panorama core.parcel_imagery is serving for "
-            f"{WITNESS_LABEL}. The defect this probe measures no longer "
-            f"reproduces at this coordinate, so the probe cannot claim to "
-            f"measure it. Re-read the stored pano_id before re-running.")
+            f"{witness['baseline'].get('pano_id')!r}, expected "
+            f"{WITNESS_EXPECTED_PANO!r} — the panorama core.parcel_imagery is "
+            f"serving for {WITNESS_LABEL}. The defect this probe measures no "
+            f"longer reproduces at this coordinate, so the probe cannot claim "
+            f"to measure it. Re-read the stored pano_id before re-running.")
         return 1
 
-    if w_out.get("pano_id") == WITNESS_EXPECTED_PANO:
-        log("FATAL: source=outdoor returned the SAME panorama as baseline at "
-            "the witness — the known indoor case. The parameter is not being "
-            "honoured, and a census run would write 13,798 identical pairs "
-            "that would read as proof no indoor problem exists. A probe whose "
-            "instrument cannot move must not be trusted when it reports no "
-            "movement.")
-        return 1
-
-    log(f"source=outdoor is honoured — baseline returns the known indoor "
-        f"panorama, outdoor returns status={w_out.get('status')} "
-        f"pano={w_out.get('pano_id')}")
+    # EVERY filtering variant must move off the known photosphere. A parameter
+    # Google does not recognise is SILENTLY IGNORED — it would return the cafe
+    # panorama, and a census would then write thousands of identical answers
+    # that read as proof the parameter changes nothing. An instrument that
+    # cannot be shown to move must not be believed when it reports no movement.
+    for variant, source in VARIANTS:
+        if source is None:
+            continue
+        if witness[variant].get("pano_id") == WITNESS_EXPECTED_PANO:
+            log(f"FATAL: source={source} returned the SAME panorama as "
+                f"baseline at the witness — the known third-party "
+                f"photosphere. That parameter is not being honoured.")
+            return 1
+        log(f"source={source} is honoured — witness moves to "
+            f"status={witness[variant].get('status')} "
+            f"pano={witness[variant].get('pano_id')}")
 
     conn = psycopg2.connect(dsn)
     counts: dict[str, int] = defaultdict(int)
@@ -317,7 +354,9 @@ def main() -> int:
 
             with conn.cursor(
                     cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(FRAME_SQL, {"run": run, "batch": remaining})
+                cur.execute(FRAME_SQL, {"run": run,
+                                        "resume_variant": RESUME_VARIANT,
+                                        "batch": remaining})
                 work = cur.fetchall()
 
             if not work:
@@ -344,23 +383,25 @@ def main() -> int:
                 cc, pid = r["county_code"], r["parcel_id"]
                 lat, lng = r["lat"], r["lng"]
 
-                base = fetch_metadata(key, lat, lng)
-                time.sleep(PACE_SECONDS)
-                out = fetch_metadata(key, lat, lng, source="outdoor")
-                time.sleep(PACE_SECONDS)
+                answers: dict[str, dict | None] = {}
+                for variant, source in VARIANTS:
+                    m = fetch_metadata(key, lat, lng, source=source)
+                    answers[variant] = m
+                    rows.append(
+                        probe_row(run, cc, pid, lat, lng, variant, m))
+                    time.sleep(PACE_SECONDS)
 
-                rows.append(probe_row(run, cc, pid, lat, lng, "baseline", base))
-                rows.append(probe_row(run, cc, pid, lat, lng, "outdoor", out))
-
-                b_pano = (base or {}).get("pano_id")
-                o_pano = (out or {}).get("pano_id")
-                o_status = (out or {}).get("status")
-                if o_status != "OK":
-                    counts["outdoor_lost_coverage"] += 1
-                elif b_pano != o_pano:
-                    counts["panorama_changed"] += 1
-                else:
-                    counts["unchanged"] += 1
+                b_pano = (answers["baseline"] or {}).get("pano_id")
+                for variant, source in VARIANTS:
+                    if source is None:
+                        continue
+                    a = answers[variant] or {}
+                    if a.get("status") != "OK":
+                        counts[f"{variant}_lost_coverage"] += 1
+                    elif a.get("pano_id") != b_pano:
+                        counts[f"{variant}_changed"] += 1
+                    else:
+                        counts[f"{variant}_unchanged"] += 1
 
             # Both variants for every parcel in ONE transaction, so the
             # 'outdoor' row the frame resumes on can never exist without its
@@ -379,7 +420,8 @@ def main() -> int:
             log(f"WARNING: hit MAX_BATCHES ({MAX_BATCHES}) — re-run to finish")
 
         print()
-        log(f"done: {done} parcels probed, {done * 2} rows written")
+        log(f"done: {done} parcels probed, "
+            f"{done * len(VARIANTS)} rows written")
         for k, n in sorted(counts.items(), key=lambda kv: -kv[1]):
             log(f"  {k}: {n}")
         log("These counts are a convenience. The measurement is the table — "
