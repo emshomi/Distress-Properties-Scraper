@@ -1,0 +1,74 @@
+name: Street View Source Probe
+# Measures what `source=outdoor` changes about Street View resolution, BEFORE
+# resolve_parcel_imagery.py is changed to send it.
+#
+# WHY (2026-08-14)
+# The resolver sends only `location` and `key`. Google's default search includes
+# INDOOR collections and user photospheres, so for a commercial parcel in a
+# retail area the nearest panorama is frequently the inside of a shop. 8300
+# Norman Center Dr, Bloomington — a $48.8M commercial parcel — renders a cafe
+# interior, with nothing in the product indicating the photo is not of the
+# property. All 6,899 `ok` rows were resolved under that request and all 6,899
+# are suspect.
+#
+# COST: ZERO. Street View METADATA requests are free and do not consume image
+# quota. This probe never requests an image. 6,899 parcels x 2 variants =
+# 13,798 free calls.
+#
+# WHY A CENSUS AND NOT A SAMPLE
+# A sample would buy a confidence interval where a complete answer costs the
+# same nothing. Every affected row can be named rather than estimated, which is
+# what the re-resolution afterwards needs anyway.
+#
+# WHY max_parcels DEFAULTS TO 25 AND NOT TO UNCAPPED
+# Deliberately the opposite of the resolver's workflow. A dispatch that accepts
+# the defaults should be a smoke test; the full census should be something
+# typed on purpose. Capped runs caught three separate defects in seconds each
+# on the Washington and Dakota loaders last session, where the full run would
+# have taken 30+ minutes to fail the same way.
+#
+# SELF-RESUMING on (probe_run, county_code, parcel_id). Both variant rows for a
+# parcel are written in one transaction, so a run cut off half way costs a
+# re-run of the remainder, not a restart.
+#
+# THE LOG IS NOT THE MEASUREMENT. The script prints running counts as a
+# convenience. The answer is in audit.streetview_source_probe — query it.
+on:
+  workflow_dispatch:
+    inputs:
+      max_parcels:
+        description: 'Parcels to probe. 25 = smoke test. 0 = full census (~6,899).'
+        required: false
+        default: '25'
+      probe_run:
+        description: 'Run label. Change it to measure again without overwriting.'
+        required: false
+        default: 'outdoor_v1_2026-08-14'
+jobs:
+  probe:
+    name: Probe Street View source=outdoor
+    runs-on: ubuntu-latest
+    # 13,798 requests at 0.05s pacing plus latency is roughly 30-50 minutes.
+    # Generous because the script is self-resuming.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      # Mirrors parcel-imagery-resolve.yml. psycopg2 talks to Postgres direct,
+      # requests hits the Google metadata endpoint. No Pillow — nothing here
+      # decodes an image, because nothing here fetches one.
+      - name: Install Python dependencies
+        run: pip install psycopg2-binary requests
+      - name: Probe Street View source
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+          MAX_PARCELS: ${{ inputs.max_parcels }}
+          PROBE_RUN: ${{ inputs.probe_run }}
+        run: |
+          python outcome_capture/probe_streetview_source.py
