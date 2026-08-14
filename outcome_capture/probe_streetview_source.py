@@ -72,11 +72,32 @@ MAX_BATCHES = 200
 # would show up as a difference from two scripts already known good.
 CONTROL_LAT, CONTROL_LNG = 44.977053, -93.066465
 
-# 8300 Norman Center Dr, Bloomington — the parcel that renders a cafe interior.
-# This is the instrument check: if source=outdoor does not change the answer
-# HERE, the parameter is not being honoured and the run is worthless.
-WITNESS_LAT, WITNESS_LNG = 44.862060, -93.320480
-WITNESS_LABEL = "8300 Norman Center Dr, Bloomington"
+# hennepin / 1611621310014 — 8300 NORMAN CENTER DR, Bloomington. The parcel
+# that renders a cafe interior. Coordinate and pano_id are READ FROM
+# core.parcels and core.parcel_imagery (2026-08-14), not estimated: the first
+# version of this probe used a hand-guessed coordinate ~3km away, the witness
+# assertion correctly aborted the run, and that abort is the only reason a
+# 13,798-request census was not spent on a coordinate that was never the
+# defect.
+WITNESS_LAT, WITNESS_LNG = 44.853085, -93.353105
+WITNESS_LABEL = "hennepin/1611621310014 — 8300 NORMAN CENTER DR, Bloomington"
+
+# The panorama core.parcel_imagery currently serves for that parcel, resolved
+# 2026-08-13 at 34.4m. The assertion is that the BASELINE request still returns
+# exactly this, and that outdoor returns something else.
+#
+# Asserting on the specific id rather than on "the two answers differ" is the
+# whole point. Two answers differ at plenty of coordinates for reasons that
+# have nothing to do with indoor imagery; only this id proves the probe is
+# pointed at the panorama that produced the defect.
+#
+# NOTE THE SHAPE. Official Street View captures carry a 22-character opaque id
+# (Z0D1wuEgE3qg4bj_E_LuzA, 8IJl6bYtnWVX5NQqysznqg) and report copyright
+# "© Google". This one is CAoS-prefixed and dot-terminated — the form Google
+# uses for photo ENTITIES, which is what user and business photospheres are.
+# The census records both copyright and id so that shape can be counted rather
+# than assumed.
+WITNESS_EXPECTED_PANO = "CAoSHENJQUJJaEJZZFdITGVjTFJRWmlwQVc4cXlVdzI."
 
 
 # Every `ok` Street View row, with the coordinate the resolver would use today.
@@ -197,8 +218,13 @@ def probe_row(run: str, cc: str, pid: str, lat: float, lng: float,
 def describe(meta: dict[str, Any] | None) -> str:
     if meta is None:
         return "transport_error"
+    pano = meta.get("pano_id")
+    # Official captures are a 22-char opaque id; CAoS-prefixed ids are photo
+    # entities (user / business photospheres). Printed so the shape is visible
+    # in the log without going to the table.
+    shape = "photo_entity" if (pano or "").startswith("CAoS") else "streetview"
     return (f"status={meta.get('status')} "
-            f"pano={meta.get('pano_id')} "
+            f"pano={pano} [{shape}] "
             f"date={meta.get('date')} "
             f"copyright={meta.get('copyright')!r}")
 
@@ -252,16 +278,27 @@ def main() -> int:
         log("FATAL: witness lookup failed — cannot verify the parameter")
         return 1
 
-    if (w_base.get("pano_id") == w_out.get("pano_id")
-            and w_base.get("status") == w_out.get("status")):
-        log("FATAL: source=outdoor returned an IDENTICAL answer at the "
-            "witness coordinate. Either the parameter is not honoured, or "
-            "this coordinate is not the indoor case it was believed to be. "
-            "Resolve that before spending a run — a probe whose instrument "
-            "cannot move must not be trusted when it reports no movement.")
+    if w_base.get("pano_id") != WITNESS_EXPECTED_PANO:
+        log(f"FATAL: baseline at the witness returned "
+            f"{w_base.get('pano_id')!r}, expected {WITNESS_EXPECTED_PANO!r} "
+            f"— the panorama core.parcel_imagery is serving for "
+            f"{WITNESS_LABEL}. The defect this probe measures no longer "
+            f"reproduces at this coordinate, so the probe cannot claim to "
+            f"measure it. Re-read the stored pano_id before re-running.")
         return 1
 
-    log("source=outdoor is honoured (witness answers differ) — proceeding")
+    if w_out.get("pano_id") == WITNESS_EXPECTED_PANO:
+        log("FATAL: source=outdoor returned the SAME panorama as baseline at "
+            "the witness — the known indoor case. The parameter is not being "
+            "honoured, and a census run would write 13,798 identical pairs "
+            "that would read as proof no indoor problem exists. A probe whose "
+            "instrument cannot move must not be trusted when it reports no "
+            "movement.")
+        return 1
+
+    log(f"source=outdoor is honoured — baseline returns the known indoor "
+        f"panorama, outdoor returns status={w_out.get('status')} "
+        f"pano={w_out.get('pano_id')}")
 
     conn = psycopg2.connect(dsn)
     counts: dict[str, int] = defaultdict(int)
@@ -284,6 +321,22 @@ def main() -> int:
                 work = cur.fetchall()
 
             if not work:
+                if batches == 0:
+                    # A measurement job that finds nothing to measure and
+                    # exits 0 is the Washington failure shape: written=118,418
+                    # failed=0 with lat NULL on every row. On 2026-08-14 this
+                    # script returned green having probed nothing, and the
+                    # empty table was read as a query defect for two steps.
+                    # An empty frame is now a FAILURE, and it names what it
+                    # looked for.
+                    log("FATAL: the frame returned ZERO parcels. Expected "
+                        "core.parcel_imagery rows with source="
+                        "'google_streetview' AND status='ok' whose parcel has "
+                        "lat/lng and which have no 'outdoor' row for "
+                        f"probe_run={run!r}. Either the frame is genuinely "
+                        "exhausted for this label — use a new PROBE_RUN — or "
+                        "DATABASE_URL points somewhere without that data.")
+                    return 1
                 break
 
             rows: list[tuple] = []
