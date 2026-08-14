@@ -330,12 +330,48 @@ class MplsThreeOneOneScraper(BaseArcGISScraper[CodeViolationInsert]):
         for sig in signals:
             if sig.parcel_id in unique_parcels:
                 continue
-            address = (sig.raw_data or {}).get("address")
+            # ADDRESS DELIBERATELY NOT SENT (2026-08-14).
+            #
+            # This scraper is NOT the source of record for a parcel's address —
+            # hennepin_parcels is, from the county assessor. And the city's
+            # Display string is demonstrably unreliable: measured across 1,343
+            # mpls_311 events, 70 carry a Display address that contradicts the
+            # SAME RECORD's own APN and coordinates. Examples, each verified by
+            # point-in-parcel against core.parcels.geom:
+            #
+            #   Display "2424 ALDRICH AVE N" -> coordinates land 0.5m inside
+            #   the parcel the assessor calls 2424 ALDRICH AVE S
+            #   Display "2200 EMERSON AVE N" -> 0.3m inside 2200 EMERSON AVE S
+            #   Display "3520 43RD ST E"     -> 0.3m inside 3520 43RD ST W
+            #   Display "1700 LAKE ST W"     -> 0.5m inside 1700 LAKE ST E
+            #
+            # In Minneapolis N and S are different halves of the city, so these
+            # are different houses. The APN and the coordinates agree with each
+            # other; only the Display string disagrees. The city publishes a
+            # record that contradicts itself.
+            #
+            # WHY THIS MATTERED EVEN THOUGH NOTHING IS CURRENTLY CORRUPTED:
+            # resolve_parcel applies FILL-IN semantics to address — it writes
+            # only when the existing value is null or empty. So a parcel that
+            # already has the assessor's address is safe TODAY, purely because
+            # hennepin_parcels happened to get there first. That is ordering,
+            # not design. Reach a parcel before the assessor loader does — a
+            # new parcel, or a county onboarded signal-first — and the wrong
+            # address lands, and fill-in then makes it PERMANENT, because
+            # fill-in can never correct a populated value. Identical trap to
+            # the one that left another county's property_type on 6,268 rows.
+            #
+            # The address stays in raw_data (it is what the city said, and
+            # that is worth keeping); it just does not get written to the
+            # spine. resolve_parcel is still called so the parcel row exists
+            # and the event's FK holds.
             unique_parcels[sig.parcel_id] = ParcelUpsert(
                 parcel_id=sig.parcel_id,
                 county_code=self.county_code,
                 state="MN",
-                address=str(address).strip() if address else None,
+                # city is safe where address is not: every one of these
+                # complaints IS in Minneapolis. It is a constant about the
+                # source, not a per-parcel claim that can be wrong.
                 city="Minneapolis",
                 data_sources=[self.source_name],
                 last_observed_at=datetime.now(timezone.utc),
