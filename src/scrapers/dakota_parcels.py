@@ -267,16 +267,42 @@ def _polygon_centroid(
         cx += (x0 + x1) * cross
         cy += (y0 + y1) * cross
 
-    if abs(area2) < 1e-12:
-        # Degenerate ring — no area to weight by. Vertex mean is the only
-        # meaningful answer left, and is correct for a point-like parcel.
+    def _vertex_mean() -> tuple[float, float]:
         return (
             sum(p[1] for p in pts) / len(pts),
             sum(p[0] for p in pts) / len(pts),
         )
 
+    if abs(area2) < 1e-12:
+        # Degenerate ring — no area to weight by. Vertex mean is the only
+        # meaningful answer left, and is correct for a point-like parcel.
+        return _vertex_mean()
+
     factor = 1.0 / (3.0 * area2)
-    return cy * factor, cx * factor   # (lat, lng) — ArcGIS is (x=lng, y=lat)
+    lat = cy * factor
+    lng = cx * factor   # ArcGIS is (x=lng, y=lat)
+
+    # A polygon's centroid CANNOT lie outside its own bounding box. If it
+    # does, the ring is degenerate in a way the area check did not catch —
+    # a sliver whose signed area is tiny but above 1e-12, where dividing by
+    # 3*area2 amplifies floating-point error into a large displacement.
+    #
+    # Found 2026-08-14 on the full Dakota load: parcel 2002822350052, city
+    # "West St Paul", landed at 45.72193, -94.78528 — about 130km northwest,
+    # near St. Cloud. One row in 167,314, but sliver parcels exist in every
+    # county and the same maths runs for all of them.
+    #
+    # This is an INVARIANT, not a tuned threshold: no magic number to get
+    # wrong, and it holds for any polygon anywhere. When it trips, the vertex
+    # mean is guaranteed inside the hull and is the honest fallback.
+    min_x = min(p[0] for p in pts)
+    max_x = max(p[0] for p in pts)
+    min_y = min(p[1] for p in pts)
+    max_y = max(p[1] for p in pts)
+    if not (min_y <= lat <= max_y and min_x <= lng <= max_x):
+        return _vertex_mean()
+
+    return lat, lng
 
 
 class DakotaParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
