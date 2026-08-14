@@ -1727,6 +1727,92 @@ def _recompute_deal_math(shaped_rows: list[dict[str, Any]]) -> None:
         s["deal_math"] = _compute_deal_math(s)
 
 
+def _apply_imagery_flags(shaped_rows: list[dict[str, Any]]) -> None:
+    """Set `imagery_available` on shaped LIST rows — one bulk fetch, no
+    Google call, no per-row lookup.
+
+    ADDED 2026-08-14. The detail panel renders the image itself; the list
+    needs only a camera glyph, so an investor can see WHICH rows have a photo
+    before spending a click.
+
+    === WHY A BOOLEAN AND NOT A THUMBNAIL ===
+    Google's terms forbid storing the imagery, so every thumbnail is a live
+    request. Fifty rows on a page x one image each = FIFTY billable panoramas
+    PER PAGE VIEW, against a 10,000/month free threshold — a four-figure
+    monthly bill for decoration, and unreadable at 96px anyway. This flag is
+    read from OUR OWN core.parcel_imagery table: free, and it answers the only
+    question the list needs to answer.
+
+    === WHY IT IS SAFE AT EVERY TIER ===
+    `imagery_available` says a picture EXISTS, not where. It locates nothing,
+    exactly like equity_band and redemption_relative. The pano id — which one
+    metadata call turns into coordinates — never appears in a list response at
+    all; it is detail-only and gated at STANDARD via _LOCATOR_FIELDS.
+
+    === COMPOSITE KEY, AND CHUNKING ===
+    Both non-negotiable, and both for reasons already paid for in this file:
+
+    Minnesota parcel IDs are NOT unique across counties. _apply_assessor_owners
+    above looked up core.parcels by parcel_id ALONE until 2026-08-10 and put
+    map pins in the wrong county. core.parcel_imagery is keyed
+    (county_code, parcel_id, source) and this bucket must match on both.
+
+    PostgREST sends .in_() as a URL query parameter. One .in_() carrying every
+    PIN on the page built a ~60KB URI, failed, and was swallowed by a caught
+    exception whose warning never reached the log stream — the tax-delinquent
+    tab rendered $0 and NULL coordinates for months. 200 per chunk keeps the
+    URI near 3KB, and a failed chunk costs those rows their glyph, not the page.
+
+    Strictly additive and silent on failure: no glyph is the honest fallback,
+    and it is indistinguishable from a parcel that genuinely has no imagery —
+    which is the correct behaviour, because a MISSING flag and a FALSE flag
+    mean the same thing to the reader.
+    """
+    need: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for s in shaped_rows:
+        pid = s.get("parcel_id")
+        if not pid:
+            continue
+        county = _county_slug(s.get("county")) or ""
+        if not county:
+            continue
+        need.setdefault((county, pid), []).append(s)
+    if not need:
+        return
+
+    _PID_CHUNK = 200
+    _all_pids = sorted({pid for (_c, pid) in need})
+    _rows: list[dict[str, Any]] = []
+    for _i in range(0, len(_all_pids), _PID_CHUNK):
+        _chunk = _all_pids[_i:_i + _PID_CHUNK]
+        try:
+            ires = (
+                core_table("parcel_imagery")
+                .select("county_code, parcel_id, status")
+                .eq("status", "ok")
+                .in_("parcel_id", _chunk)
+                .execute()
+            )
+            _rows.extend(ires.data or [])
+        except Exception as e:
+            # logger.exception, not warning. A warning raised inside a caught
+            # exception during a request does not reach Railway's log stream —
+            # that is how the assessor patch failed invisibly for months.
+            logger.exception(
+                "imagery flag chunk failed (those rows get no camera glyph)",
+                error_type=type(e).__name__,
+                chunk_start=_i,
+                chunk_size=len(_chunk),
+                total_pids=len(_all_pids),
+            )
+
+    for r in _rows:
+        _key = ((r.get("county_code") or "").lower(), r.get("parcel_id"))
+        # A row from another county finds no bucket and is discarded.
+        for s in need.get(_key, []):
+            s["imagery_available"] = True
+
+
 def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
     """Fill owner/owner_mailing (from core.owners) AND parcel foundation
     fields (from core.parcels) on shaped rows whose SOURCE published
@@ -3912,6 +3998,8 @@ async def list_properties(
                 for r in rows
             ]
             _apply_assessor_owners(shaped)
+            # Camera glyph source. Bulk, free, no Google call.
+            _apply_imagery_flags(shaped)
             _recompute_deal_math(shaped)
 
             
@@ -4039,6 +4127,7 @@ async def list_properties(
             for r in rows
         ]
         _apply_assessor_owners(_shaped_page)
+        _apply_imagery_flags(_shaped_page)
         _recompute_deal_math(_shaped_page)
         return success_envelope({
             "properties": [
