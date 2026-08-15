@@ -214,7 +214,38 @@ def _merge_enrichment_into_raw(raw_data: dict[str, Any],
 
 async def run_hennepin_foreclosure_enrichment() -> dict[str, int]:
     """Enrich hennepin_sheriff events with parcel owner/value/homestead by a
-    unique normalized-address match to core.parcels. UPDATES events in place.
+    unique normalized-address match to core.parcels, AND re-key the event onto
+    the matched parcel. UPDATES events in place.
+
+    === WHY THIS ALSO WRITES parcel_id (2026-08-15) ===
+    hennepin_sheriff mints parcel_id = 'HENNEPIN-FC-<saleRecordNumber>' for
+    every sale, because the sheriff notice publishes no PIN. That placeholder
+    row EXISTS in core.parcels, so every join succeeds and returns a row with
+    no lat, no emv_total, no owner -- nothing errors, nothing logs, and the
+    product renders em-dashes as though the county published nothing.
+
+    This job was already resolving the real parcel and storing its id at
+    raw_data.detail.gis_pid -- and then updating raw_data ALONE, leaving
+    parcel_id synthetic forever. The component that knew the answer declined to
+    record it where it mattered.
+
+    Measured 2026-08-15: 607 hennepin sheriff_sale events on stubs, 418 with a
+    gis_pid already sitting unused. A migration re-keyed those 418; the very
+    next scraper run created 353 fresh stubs. Repairing data while the source
+    keeps producing the defect is a treadmill -- so the re-key belongs HERE,
+    where it runs every time.
+
+    SAFETY. The re-key only fires on a UNIQUE address match: len(matches) > 1
+    is already skipped above ("Never guess"), which is the condo case --
+    615 parcels can share '121 WASHINGTON AVE S' and the notice's unit number
+    appears nowhere in core.parcels. The index is built only from parcels
+    carrying a real assessor PID, so the target row is guaranteed to exist and
+    the composite FK cannot break.
+
+    COLLISIONS. parcel_id is part of the dedup unique key, so a re-key can
+    collide with an event that already holds that key. On failure this retries
+    with raw_data ONLY, so the enrichment still lands and the event simply
+    stays on its stub -- a collision must never cost the owner/value data.
 
     Returns a small stats dict. Raises on a parcel-read failure (nothing has
     been written at that point); per-row update failures are counted, not
@@ -234,6 +265,8 @@ async def run_hennepin_foreclosure_enrichment() -> dict[str, int]:
     no_match = 0
     multi_match = 0
     failed = 0
+    rekeyed = 0
+    rekey_collision = 0
 
     for ev in events:
         raw = ev.get("raw_data") or {}
@@ -252,15 +285,57 @@ async def run_hennepin_foreclosure_enrichment() -> dict[str, int]:
         enrichment = matches[0]
         new_raw = _merge_enrichment_into_raw(raw, enrichment)
 
+        # Re-key onto the matched parcel. Only when the event is still on a
+        # placeholder AND the match produced a usable PID -- an event already
+        # pointing at a real parcel is left alone.
+        current_pid = ev.get("parcel_id") or ""
+        new_pid = enrichment.get("gis_pid")
+        should_rekey = (
+            bool(new_pid)
+            and current_pid.startswith("HENNEPIN-FC-")
+            and new_pid != current_pid
+        )
+
+        payload: dict[str, Any] = {"raw_data": new_raw}
+        if should_rekey:
+            payload["parcel_id"] = new_pid
+
         try:
             (
                 signals_table("distress_events")
-                .update({"raw_data": new_raw})
+                .update(payload)
                 .eq("id", ev["id"])
                 .execute()
             )
             enriched += 1
+            if should_rekey:
+                rekeyed += 1
         except Exception as e:
+            # parcel_id is part of the dedup unique key, so the likeliest
+            # failure is a collision with an event that already holds this
+            # (county, parcel, type, date, source). Retry WITHOUT the re-key so
+            # the owner/value enrichment still lands -- losing it to a key
+            # clash would trade a fixable problem for an invisible one.
+            if should_rekey:
+                try:
+                    (
+                        signals_table("distress_events")
+                        .update({"raw_data": new_raw})
+                        .eq("id", ev["id"])
+                        .execute()
+                    )
+                    enriched += 1
+                    rekey_collision += 1
+                    logger.info(
+                        "Hennepin enrichment: re-key collided, enriched only",
+                        event_id=ev.get("id"),
+                        source_id=ev.get("source_id"),
+                        from_parcel=current_pid,
+                        to_parcel=new_pid,
+                    )
+                    continue
+                except Exception as e2:
+                    e = e2
             failed += 1
             logger.warning(
                 "Hennepin enrichment: row update failed",
@@ -273,6 +348,8 @@ async def run_hennepin_foreclosure_enrichment() -> dict[str, int]:
     stats = {
         "events": len(events),
         "enriched": enriched,
+        "rekeyed": rekeyed,
+        "rekey_collision": rekey_collision,
         "no_match": no_match,
         "multi_match": multi_match,
         "failed": failed,
