@@ -68,6 +68,7 @@ client keeps the session cookie rather than reconnecting per request.
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import re
 import sys
@@ -87,16 +88,47 @@ _PACE_SECONDS = 1.5
 _MAX_RETRIES = 3
 _LIST_PAGE_SIZE = 100
 
-# 'Property ID number:' followed by 27-029-24-24-0203
+# BOTH PATTERNS ARE WRITTEN AGAINST CAPTURED MARKUP, NOT AGAINST SCREENSHOTS.
+#
+# The first version of this file guessed both from rendered pages and matched
+# NOTHING: run #1 on 2026-08-15 returned resolved=0 of 113 candidates, 107 of
+# them reported as 'unit_not_in_building' when the real cause was that neither
+# regex could ever fire. The page source was then captured and both were
+# rebuilt and tested against it.
+#
+# Single-result page. The label and the value are SEPARATE divs with newlines
+# and tabs between them:
+#     <div class="col">Property ID number:</div>
+#     <div class="col">
+#         <strong>27-029-24-24-0203</strong>
+#     </div>
+# The old pattern allowed one optional tag in that gap. The real gap is
+# '</div>\n\t<div class="col">\n\t\t<strong>'.
 _PID_RE = re.compile(
-    r"Property\s+ID\s+number:?\s*</?[^>]*>?\s*([\d]{2}-[\d]{3}-[\d]{2}-[\d]{2}-[\d]{4})",
-    re.IGNORECASE,
-)
-# Rows of the building list: PID then the unit address.
-_ROW_RE = re.compile(
-    r"([\d]{2}-[\d]{3}-[\d]{2}-[\d]{2}-[\d]{4})\s*</a>.*?<td[^>]*>\s*([^<]*?#\s*[^<]+?)\s*</td>",
+    r"Property\s+ID\s+number:\s*</div>.*?<strong>\s*"
+    r"([\d]{2}-[\d]{3}-[\d]{2}-[\d]{2}-[\d]{4})\s*</strong>",
     re.IGNORECASE | re.DOTALL,
 )
+
+# Building list. Keyed on the LINK, not the displayed text, because the href
+# already carries the 13-digit parcel id in core.parcels format -- no
+# hyphen-stripping, no reformatting:
+#     <a href="pidresult.jsp?pid=1911723130112">&nbsp;19-117-23-13-0112</a>
+#     </td><td ...><p> &nbsp;4387
+#        WILSHIRE BLVD #101 </p></td>
+# The address SPANS A NEWLINE and is preceded by &nbsp;, so any pattern
+# matching '#' within one line misses every row.
+_ROW_RE = re.compile(
+    r'href="pidresult\.jsp\?pid=(\d+)".*?</td>\s*<td[^>]*>(.*?)</td>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _clean_cell(text: str) -> str:
+    """Strip tags, unescape entities, collapse whitespace across newlines."""
+    t = re.sub(r"<[^>]+>", " ", text or "")
+    t = html.unescape(t).replace("\xa0", " ")
+    return " ".join(t.split())
 # '1225 Lasalle Ave #604' -> ('1225', 'Lasalle Ave', '604')
 _ADDR_RE = re.compile(r"^(\d+)\s+(.+?)\s*#\s*(.+)$")
 
@@ -186,10 +218,11 @@ async def _resolve_one(
     if not want:
         return None, "unit_has_no_digits"
 
+    # pid from the href is ALREADY the 13-digit core.parcels format.
     matches = [
-        _to_parcel_id(pid)
+        pid
         for pid, addr in _ROW_RE.findall(body)
-        if _digits(addr.split("#")[-1]) == want
+        if _digits(_clean_cell(addr).split("#")[-1]) == want
     ]
     # A single result page (no list) can also come back here.
     if not matches:
@@ -232,13 +265,21 @@ async def run_hennepin_condo_resolver() -> dict[str, int]:
         return stats
 
     timeout = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=30.0)
+    attempted = 0
     async with httpx.AsyncClient(timeout=timeout, headers=_headers(),
                                  follow_redirects=True) as client:
         for ev in events:
-            if max_events and stats["rekeyed"] >= max_events:
+            # The cap bounds ATTEMPTS as well as re-keys. Run #1 was dispatched
+            # with max_events=10 and walked all 113 for ten minutes, because
+            # nothing was re-keyed and the cap only counted successes. A capped
+            # test that ignores its cap when things go wrong is not a test.
+            if max_events and (stats["rekeyed"] >= max_events
+                               or attempted >= max_events * 3):
                 logger.info("Hennepin condo resolver: MAX_EVENTS reached",
-                            cap=max_events)
+                            cap=max_events, attempted=attempted,
+                            rekeyed=stats["rekeyed"])
                 break
+            attempted += 1
 
             addr = ((ev.get("raw_data") or {}).get("address") or "").strip()
             m = _ADDR_RE.match(addr)
