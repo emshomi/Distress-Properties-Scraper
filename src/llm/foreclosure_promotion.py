@@ -198,6 +198,58 @@ def _pid_digits(value: Any) -> Optional[str]:
     return digits if len(digits) >= 6 else None
 
 
+# Certificate-of-title and document numbers that some notices append to a PID.
+# 'Torrens' registrations print as '08.032.21.11.0036 COT# 77608', and the
+# trailing 77608 is NOT part of the parcel identifier -- digits-only over the
+# whole string yields '080322111003677608', which matches nothing. Measured
+# 2026-08-15 on washington source_id 1544378.
+_PID_NOISE_RE = re.compile(
+    r"\b(?:COT|CERT|C\.?O\.?T\.?|DOC|TORRENS)\s*#?\s*\d+",
+    re.IGNORECASE,
+)
+
+# A notice may cover SEVERAL parcels, listed with ';', ',' or the word 'and'.
+_PID_SPLIT_RE = re.compile(r"\s*(?:;|,|\band\b)\s*", re.IGNORECASE)
+
+
+def split_pids(value: Any) -> list[str]:
+    """Every parcel identifier a notice's PID field names, in printed order.
+
+    One Minnesota foreclosure notice can cover MANY parcels. Measured
+    2026-08-15 across mnpublicnotice:
+
+        washington 26-003536FC -- THIRTEEN parcels, twelve addresses on
+            Keibler Ct and 211th St, Forest Lake, one bid of $261,140.77
+        washington 26-003550FC -- four Meadowridge Trail parcels
+        martin 058273-F1       -- '1228 & 1224 N Prairie Ave', two houses
+
+    Before this, _pid_digits() ran over the WHOLE field, so
+    '150063915; 150063922' became one 18-digit string, matched nothing, and
+    the notice fell back to a synthetic stub. Thirteen distressed properties
+    were represented to subscribers as a single row.
+
+    Returns [] when nothing usable is found, so a caller can keep the existing
+    synthetic-stub behaviour unchanged.
+    """
+    if value is None:
+        return []
+    text = _PID_NOISE_RE.sub(" ", str(value))
+    out: list[str] = []
+    for part in _PID_SPLIT_RE.split(text):
+        part = part.strip()
+        if part and _pid_digits(part):
+            out.append(part)
+    # Preserve printed order, drop repeats (a notice can list one parcel twice).
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in out:
+        d = _pid_digits(p)
+        if d and d not in seen:
+            seen.add(d)
+            unique.append(p)
+    return unique
+
+
 def _synthetic_pid(
     county: Optional[str],
     source_id: str,
@@ -280,6 +332,7 @@ def derive_source_id(extracted: dict[str, Any]) -> str:
 def build_promotion_rows(
     extracted: dict[str, Any],
     resolved_parcel_id: Optional[str] = None,
+    package: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Given an ai.extracted_foreclosures record (as a dict), build the target
     rows. Returns {'source_id', 'parcel_row', 'distress_event', 'sheriff_sale'}.
@@ -362,6 +415,34 @@ def build_promotion_rows(
         f"Redemption: {redemption}."
     )
 
+    # PACKAGE SALES (added 2026-08-15).
+    #
+    # When one notice covers several parcels, each parcel becomes its own event
+    # so a subscriber searching that city SEES ALL OF THEM -- washington
+    # 26-003536FC is thirteen Forest Lake properties that appeared as one row.
+    #
+    # But the bid is ONE figure for the WHOLE package. Copying $261,140.77 onto
+    # each of thirteen parcels would fabricate thirteen equity spreads, the same
+    # class of error as writing a county's $0 into emv_total. So event_value is
+    # NULL on a package member and the total is carried in raw_data._package
+    # instead. Deal math needs event_value, so it correctly declines to compute
+    # -- market value, coordinates and imagery are all still real and still
+    # shown.
+    pkg_size = int((package or {}).get("size") or 1)
+    is_package = pkg_size > 1
+    if is_package:
+        raw_data["_package"] = {
+            "size": pkg_size,
+            "index": (package or {}).get("index"),
+            "total_bid": amount_due,
+            "parcel_ids": (package or {}).get("parcel_ids"),
+            "note": (
+                f"Part of a package sale of {pkg_size} properties sold together"
+                f" for {_money_str(amount_due)}. No individual price was"
+                f" published for this parcel."
+            ),
+        }
+
     distress_event = {
         "parcel_id": effective_pid,
         # ADDED 2026-08-10. signals.distress_events has a COMPOSITE foreign
@@ -376,7 +457,8 @@ def build_promotion_rows(
         "event_type": "sheriff_sale",
         "event_subtype": "scheduled",
         "event_date": sale_date,
-        "event_value": amount_due,
+        # NULL on a package member -- see the _package note above.
+        "event_value": None if is_package else amount_due,
         "source": source,
         "source_id": source_id,
         "severity": "medium",
@@ -391,7 +473,7 @@ def build_promotion_rows(
         "sale_time": _parse_sale_time(extracted.get("sale_time")),
         "sale_location": extracted.get("sale_location"),
         "opening_bid": None,
-        "total_debt": amount_due,
+        "total_debt": None if is_package else amount_due,
         "foreclosing_law_firm": extracted.get("attorney_firm"),
         "lender_name": mortgagee,
         "redemption_period_months": _parse_redemption_months(redemption),
