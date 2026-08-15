@@ -1,0 +1,42 @@
+-- MIGRATION_parcels_norm_pin_index_2026-08-15.sql
+--
+-- Expression index on a digits-only parcel_id, so a PIN can be matched across
+-- punctuation differences without a sequential scan.
+--
+-- ============================================================
+-- WHY
+-- ============================================================
+-- signals.distress_with_parcel.eff_parcel_id for mnpublicnotice events carries
+-- the PIN AS THE NOTICE PRINTS IT, which is not the format core.parcels stores.
+-- 192 of 247 mnpublicnotice sheriff_sale events point at a parcel id that does
+-- not exist:
+--     washington  02.028.21.41.0032   (118,595 parcels loaded)
+--     st_louis    010-0735-00115      (184,571 loaded)
+--     dakota      01-18064-03-030     (167,504 loaded)
+--     anoka       06-31-24-21-0026    (139,425 loaded)
+--
+-- The counties ARE loaded. This is punctuation, not a spine gap. Tested on
+-- washington: stripping non-digits resolved 6 of 10 to a real parcel with a
+-- real address (1510 COTTAGE DR, CITY OF STILLWATER).
+--
+-- ============================================================
+-- WHY AN INDEX IS REQUIRED, NOT OPTIONAL
+-- ============================================================
+-- regexp_replace(r.parcel_id, ...) on the LEFT of a comparison defeats every
+-- index. The statewide match query TIMED OUT: 192 events each sequential-
+-- scanning their county (washington 118k, st_louis 184k).
+--
+-- THE OPERAND ORDER HERE MUST MATCH THE QUERY EXACTLY. Postgres matches
+-- expression indexes by exact expression. On 2026-08-15
+-- idx_parcels_norm_address was silently unused for hours because queries wrote
+-- regexp_replace(upper(address), ...) while the index held
+-- upper(regexp_replace(address, ...)) -- 13,130ms vs 18ms, a 730x difference.
+-- Any query using this index must write EXACTLY:
+--     regexp_replace(parcel_id, '[^0-9]', '', 'g')
+--
+-- CONCURRENTLY so the daily scrapers are not blocked. It cannot run inside a
+-- transaction block, so there is no BEGIN/COMMIT and it must be the only
+-- statement executed.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_parcels_norm_pin
+    ON core.parcels (county_code, regexp_replace(parcel_id, '[^0-9]', '', 'g'));
