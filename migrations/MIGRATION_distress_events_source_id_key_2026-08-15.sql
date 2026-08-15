@@ -1,0 +1,71 @@
+-- MIGRATION_distress_events_source_id_key_2026-08-15.sql
+--
+-- Add a unique index on the PUBLISHER's identity for a distress event:
+--     (county_code, source, source_id, event_date)
+--
+-- ============================================================
+-- WHY THE EXISTING KEY FAILS
+-- ============================================================
+-- distress_events_dedup_key is
+--     (county_code, parcel_id, event_type, event_date, source)
+-- and it CONTAINS parcel_id -- a value WE mint and WE rewrite.
+--
+-- When a sheriff notice publishes no PIN, the scraper mints
+-- 'HENNEPIN-FC-<saleRecordNumber>' so the event can be stored at all. When we
+-- later resolve the real parcel and re-key the event, the scraper's NEXT run
+-- regenerates the placeholder, finds no conflict, and inserts a second copy.
+--
+-- Measured 2026-08-15, all three within hours of a re-key:
+--     hennepin_sheriff  373 duplicates (11:18 run) -- merged
+--     anoka_sheriff      23 duplicates (12:00 run) -- deleted
+--     mnpublicnotice      1 duplicate -- the scraper's OWN id FORMAT changed
+--         between 08-08 and 08-13: 'DAKOTA-FC-MN25506' became
+--         'DAKOTA-FC-025372701220-2026-09-29'. Same notice, same $284,929.33,
+--         same date; a different generated string, so no conflict.
+--
+-- Anoka runs daily at ~13:00 UTC. Without this index the cleanup repeats every
+-- day, forever.
+--
+-- ============================================================
+-- WHY THESE FOUR COLUMNS
+-- ============================================================
+-- source_id is the PUBLISHER's identifier -- sheriff sale record number, 311
+-- case number, public-notice id. We never mint it and never rewrite it.
+-- Measured: 0 NULLs across all 9,249 events, and 0 NULL county_code.
+--
+-- event_date STAYS. Dakota postponements are real: 60 violations across 120
+-- rows, ALL differing only on event_date. Dropping it would collapse a
+-- rescheduled sale into its original and lose the new date -- the most
+-- time-sensitive field the product publishes.
+--
+-- event_type is NOT included. A publisher id is already type-specific; adding
+-- it would let the same notice re-enter under a different label.
+--
+-- ============================================================
+-- NULLS NOT DISTINCT, DELIBERATELY
+-- ============================================================
+-- 628 events carry a NULL event_date -- 483 ramsey_tax_roll and 142
+-- hennepin_tax_roll, where delinquency has a YEAR and no event date. Both
+-- currently show ZERO violations, so they already dedup correctly among
+-- themselves, and NULLS NOT DISTINCT keeps that true.
+--
+-- Under the Postgres default (NULLS DISTINCT) every NULL-date row would be
+-- unique to itself and re-insert on every run. That is EXACTLY the 2026-08-07
+-- incident: a NULL county_code under a NULLS-DISTINCT assumption accumulated
+-- 1,451 duplicates in 24 hours and broke mpls_vbr and saint_paul_vacant.
+--
+-- ============================================================
+-- THE OLD INDEX STAYS
+-- ============================================================
+-- distress_events_dedup_key is NOT dropped here. It is still the ON CONFLICT
+-- target in event_writer.py; dropping it before that code changes would make
+-- PostgREST reject every batch -- and the except there swallows a failed batch
+-- into a warning while the run still reports counts, so it would go unnoticed
+-- on the daily sheriff feeds. Two indexes coexist safely; the old one is
+-- removed only after the writer has moved and been verified.
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS
+    distress_events_source_identity_key
+    ON signals.distress_events
+       (county_code, source, source_id, event_date)
+    NULLS NOT DISTINCT;
