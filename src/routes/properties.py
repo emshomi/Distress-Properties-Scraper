@@ -1770,13 +1770,14 @@ def _apply_imagery_flags(shaped_rows: list[dict[str, Any]]) -> None:
     """
     need: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for s in shaped_rows:
-        pid = s.get("parcel_id")
-        if not pid:
+        # _lookup_key, NOT s["parcel_id"]. core.parcel_imagery is keyed by the
+        # REAL parcel; a synthetic HENNEPIN-FC-* stub matches nothing, which
+        # is why no Hennepin row ever showed a camera while its detail panel
+        # rendered the photograph.
+        _k = _lookup_key(s)
+        if not _k:
             continue
-        county = _county_slug(s.get("county")) or ""
-        if not county:
-            continue
-        need.setdefault((county, pid), []).append(s)
+        need.setdefault(_k, []).append(s)
     if not need:
         return
 
@@ -1813,6 +1814,50 @@ def _apply_imagery_flags(shaped_rows: list[dict[str, Any]]) -> None:
             s["imagery_available"] = True
 
 
+def _lookup_key(s: dict[str, Any]) -> tuple[str, str] | None:
+    """The (county_slug, parcel_id) a shaped row should be LOOKED UP by.
+
+    DEFECT FIXED 2026-08-15. Both parcel-enrichment passes below keyed on
+    s["parcel_id"], which on a foreclosure row is frequently a SYNTHETIC STUB
+    — 'HENNEPIN-FC-2602023', 'DAKOTA-FC-2026-14' — minted when the sheriff
+    notice carried no PIN. 189 of 624 Hennepin foreclosures (30%) are in that
+    state.
+
+    A stub is worse than a missing id. It EXISTS in core.parcels, so the join
+    succeeds and returns a row carrying no lat, no lng and no value. Nothing
+    fails, nothing logs, and the page renders em-dashes as though the county
+    published nothing.
+
+    Measured symptoms, all one cause:
+      * 197 of 624 Hennepin foreclosures had NULL coordinates
+      * the camera glyph never appeared on ANY Hennepin row — core
+        .parcel_imagery is keyed by the real parcel, so the stub matched
+        nothing and imagery_available was never set. The DETAIL panel
+        resolves through eff_parcel_id and DID show the photograph, so the
+        table said "no image" about a property that visibly had one.
+      * two prior sessions changed the glyph's CSS twice. The element was
+        never in the DOM — correctly, given the flag it was handed.
+
+    _shape_property_row already resolves the real parcel and stores it as
+    _eff_key (see _effective_parcel_id). It is the same key the detail route
+    and signals.distress_with_parcel use. Preferring it here makes the three
+    paths agree.
+
+    Falls back to (county, parcel_id) when there is no _eff_key, which is the
+    pre-existing behaviour for every row that already worked.
+    """
+    eff = s.get("_eff_key")
+    if isinstance(eff, (tuple, list)) and len(eff) == 2 and eff[0] and eff[1]:
+        return (str(eff[0]), str(eff[1]))
+    pid = s.get("parcel_id")
+    if not pid:
+        return None
+    county = _county_slug(s.get("county")) or ""
+    if not county:
+        return None
+    return (county, str(pid))
+
+
 def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
     """Fill owner/owner_mailing (from core.owners) AND parcel foundation
     fields (from core.parcels) on shaped rows whose SOURCE published
@@ -1843,9 +1888,10 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
                 or s.get("property_type_name") is None
                 or s.get("address") is None):
             continue
-        pid = s.get("parcel_id")
-        if not pid:
+        _k = _lookup_key(s)
+        if not _k:
             continue
+        county, pid = _k
         # COMPOSITE KEY. Minnesota parcel IDs are NOT unique across counties.
         #
         # DEFECT FIXED 2026-08-10. This looked up core.parcels by parcel_id
@@ -1869,12 +1915,9 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
         # rows). Filtering on parcel_id alone also cannot use the
         # (county_code, parcel_id) primary key, so it scanned 2.66M rows.
         #
-        # The event row's PIN is used unchanged -- only the county condition
-        # is added, so this can only REMOVE wrong matches, never introduce
-        # new ones.
-        county = _county_slug(s.get("county")) or ""
-        if not county:
-            continue
+        # The county condition can only REMOVE wrong matches, never introduce
+        # new ones. The PIN now comes from _lookup_key, which prefers the
+        # RESOLVED parcel over a synthetic stub — see that function.
         val_need.setdefault((county, pid), []).append(s)
     if val_need:
         # CHUNKED — READ BEFORE CHANGING (2026-08-12).
