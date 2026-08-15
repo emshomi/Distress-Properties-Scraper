@@ -1,0 +1,102 @@
+name: Hennepin Condo Resolver
+# Manual + weekly. Re-keys hennepin_sheriff foreclosure events that are stuck
+# on a HENNEPIN-FC-* placeholder because the notice carries a UNIT number.
+#
+# WHY
+# The sheriff notice publishes '1225 Lasalle Ave #604'. core.parcels, loaded
+# from the county GIS parcel roll, stores only '1225 LASALLE AVE' -- 138 rows,
+# no unit number anywhere. The event cannot be matched, so it keeps its
+# placeholder. That placeholder EXISTS in core.parcels, so every join succeeds
+# and returns a row with no lat, no emv_total, no owner: the product renders
+# em-dashes as though the county published nothing. 113 events are in that
+# state.
+#
+# Hennepin publishes the answer through a DIFFERENT endpoint than the parcel
+# roll we load. Verified by hand 2026-08-15: house + street + unit POSTed to
+# addrresult.jsp returns PID 27-029-24-24-0203, and that parcel is ALREADY in
+# core.parcels with emv_total $118,000 and coordinates. Only the mapping was
+# missing -- this job writes parcel_id and nothing else.
+#
+# WHY WEEKLY, NOT DAILY
+# New condo foreclosures arrive at the rate the sheriff publishes them, a
+# handful a week, and the job is polite (1.5s/parcel) rather than fast. Offset
+# from the daily sheriff jobs (12:00-12:20 UTC) and from hennepin-foreclosure
+# -enrichment (2nd of the month, 14:00) so nothing overlaps.
+#
+# max_events DEFAULTS TO 10, NOT UNCAPPED
+# This POSTs to a county site behind an F5 load balancer and WRITES parcel_id
+# on live foreclosure events. A dispatch that accepts the defaults should be a
+# capped test; the full run has to be typed on purpose. Capped runs caught
+# three separate defects in seconds each on the Washington and Dakota loaders
+# where a full run would have taken 30+ minutes to fail the same way.
+#
+# The SCHEDULED run is uncapped: inputs.max_events is empty on a cron trigger
+# and MAX_EVENTS parses empty as 0.
+#
+# THE LOG IS NOT THE MEASUREMENT. Verify with a query against
+# signals.distress_events.
+on:
+  workflow_dispatch:
+    inputs:
+      max_events:
+        description: 'Events to RE-KEY. 10 = capped test. 0 = uncapped (~113).'
+        required: false
+        default: '10'
+  schedule:
+    # Wednesdays 15:00 UTC = 9:00am Central (standard) / 10:00am (DST).
+    - cron: '0 15 * * 3'
+jobs:
+  resolve:
+    name: Resolve Hennepin condo units to real parcels
+    runs-on: ubuntu-latest
+    # ~113 events, up to 2 POSTs each at 1.5s pacing, plus retries.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Hennepin condo resolver
+        env:
+          # --- Cap on events RE-KEYED (see header) ---
+          MAX_EVENTS: ${{ inputs.max_events }}
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (config may require these even though unused here) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: this is a standalone job, not a registered
+          #     scraper, so nothing needs enabling. All left false. ---
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+        run: |
+          echo "=== Hennepin condo resolver (PINS address search) ==="
+          python -m scripts.run_hennepin_condo_resolver github_actions
