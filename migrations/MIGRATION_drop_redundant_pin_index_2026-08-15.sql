@@ -1,0 +1,34 @@
+-- MIGRATION_drop_redundant_pin_index_2026-08-15.sql
+--
+-- Drop idx_parcels_norm_pin. It duplicates an index that already existed.
+--
+-- ============================================================
+-- WHAT HAPPENED
+-- ============================================================
+-- MIGRATION_parcels_norm_pin_index_2026-08-15.sql created
+--     (county_code, regexp_replace(parcel_id, '[^0-9]', '', 'g'))
+-- to support digits-only PIN matching.
+--
+-- idx_parcels_county_pid_digits ALREADY existed, added 2026-08-10 alongside
+-- core.parcel_pid_lookup and _resolve_spine_parcel() in admin.py:
+--     (county_code, regexp_replace(parcel_id, '\D', '', 'g'))
+--
+-- '\D' and '[^0-9]' are semantically identical for ASCII, but Postgres matches
+-- expression indexes by EXACT EXPRESSION, so these are two separate indexes
+-- doing one job. 103 MB of storage plus write amplification on every insert
+-- and update to a 2.66M-row table, permanently, for no benefit.
+--
+-- The existing one is kept because parcel_pid_lookup and _resolve_spine_parcel
+-- are already written against '\D'. Any future digits-only match should use
+-- that view or write the '\D' form.
+--
+-- The lesson: check for an existing index before creating one. The evidence
+-- was already in the repo -- admin.py names both parcel_pid_lookup and
+-- idx_parcels_county_pid_digits in a docstring, with the same 2026-08-10
+-- measurement (exact match 47 of 217, digits-only 185) that was re-derived
+-- from scratch today.
+--
+-- CONCURRENTLY so writes are not blocked. Cannot run inside a transaction
+-- block, so no BEGIN/COMMIT and it must be the only statement run.
+
+DROP INDEX CONCURRENTLY IF EXISTS core.idx_parcels_norm_pin;
