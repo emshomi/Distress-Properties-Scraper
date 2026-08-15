@@ -1048,18 +1048,58 @@ _EXTRACTORS: dict[str, Any] = {
 # its own overlay entry.
 
 
+# Placeholder parcel ids minted by the sheriff scrapers when a notice
+# publishes no PIN: 'HENNEPIN-FC-2602022', 'ANOKA-FC-...', 'DAKOTA-FC-...'.
+# A stored parcel_id NOT matching this shape is a real parcel.
+_SYNTHETIC_PARCEL_RE = _re.compile(r"-FC-", _re.IGNORECASE)
+
+
 def _effective_parcel_id(source: str, raw: dict, row: dict) -> Optional[str]:
     """Compute the SAME parcel key the overlay view groups on.
 
-    Sheriff rows store a synthetic parcel_id (case number); their real
-    parcel id lives in raw_data.detail.gis_pid (present only on enriched
-    rows). Every other source's stored parcel_id is already the real one.
-    Returns None when no real parcel id is resolvable (honest em-dash).
+    Sheriff rows MAY store a synthetic parcel_id (case number) when the notice
+    published no PIN. Where that is so, the real parcel id lives in
+    raw_data.detail.gis_pid. Every other source's stored parcel_id is already
+    the real one. Returns None when no real parcel id is resolvable (honest
+    em-dash).
+
+    === FIXED 2026-08-15: A STORED REAL parcel_id NOW WINS ===
+    This previously returned detail.gis_pid for EVERY foreclosure source,
+    unconditionally, on the assumption that a sheriff row's parcel_id is always
+    synthetic. That assumption stopped being true the moment we started
+    re-keying events onto their real parcels:
+
+        418 hennepin events re-keyed from raw_data.detail.gis_pid
+        131 washington events re-keyed from the id embedded in the stub
+        100 hennepin CONDO events resolved via the county's PINS unit search
+
+    The condo rows are the ones that exposed it: they have NO detail.gis_pid at
+    all -- the unit was resolved from house+street+unit, and the result written
+    straight to parcel_id. So this returned None, and BOTH callers guard with
+    `if eff_pid else None`:
+
+        shaped["enrichment"] = _load_parcel_enrichment(...) if eff_pid else None
+        shaped["imagery"]    = _load_parcel_imagery(...)    if eff_pid else None
+
+    Measured on 1225 Lasalle Ave #604 (source_id 2602022): parcel_id
+    2702924240203, core.parcel_imagery holds status ok with pano_id
+    55HFqg48y8l4tPGHTH3yEA, and the API returned "imagery": null and
+    "enrichment": null. The camera glyph showed in the TABLE -- the list path
+    goes through _lookup_key, which was fixed this morning and already prefers
+    a real stored key -- while the detail panel showed no photograph. Same
+    contradiction, same cause, opposite code path.
+
+    Order matters: a REAL stored parcel_id is the most authoritative thing we
+    have, because something already resolved it and wrote it down. gis_pid is
+    the fallback for rows still sitting on a placeholder.
     """
+    stored = row.get("parcel_id")
     if source in _FORECLOSURE_SOURCES:
+        if stored and not _SYNTHETIC_PARCEL_RE.search(str(stored)):
+            return stored
         detail = raw.get("detail") or {}
         return detail.get("gis_pid")
-    return row.get("parcel_id")
+    return stored
 
 def _owner_key(raw: dict) -> Optional[str]:
     """Compute the SAME owner key the owner-summary view groups on.
