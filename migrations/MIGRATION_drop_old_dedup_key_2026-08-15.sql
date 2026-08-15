@@ -1,0 +1,42 @@
+-- MIGRATION_drop_old_dedup_key_2026-08-15.sql
+--
+-- Drop distress_events_dedup_key.
+--
+-- ============================================================
+-- WHY IT MUST GO, NOT JUST BE UNUSED
+-- ============================================================
+-- MIGRATION_distress_events_source_id_key_2026-08-15.sql deliberately KEPT the
+-- old index, reasoning that dropping it before event_writer.py moved would
+-- break the writer. That reasoning was BACKWARDS and the first scraper run
+-- proved it.
+--
+-- ON CONFLICT suppresses violations on the ONE index it names. Every OTHER
+-- unique index on the table still raises. So once the writer said
+--     ON CONFLICT (county_code, source, source_id, event_date)
+-- the insert was checked against the new index for conflict handling and then
+-- still violated the old one:
+--
+--     23505: Key (county_code, parcel_id, event_type, event_date, source)
+--            =(anoka, 113124310224, sheriff_sale, 2026-09-24, anoka_sheriff)
+--            already exists.
+--
+-- anoka_sheriff run #104, 2026-08-15: fetched=259 new=0 failed=259, exit 1.
+-- Nothing was lost -- the batch rolled back and existing rows were untouched
+-- -- and the runner failed loudly rather than swallowing it, because
+-- run_anoka_sheriff treats an all-failed batch as fatal.
+--
+-- ============================================================
+-- THE OLD KEY IS STRICTLY WEAKER
+-- ============================================================
+-- (county_code, parcel_id, event_type, event_date, source) contains parcel_id
+-- -- a value WE mint and WE rewrite. It permits exactly the duplicates
+-- removed today: re-key an event onto its real parcel, the scraper
+-- regenerates the placeholder, no conflict, second copy inserted. 373
+-- hennepin + 23 anoka + 1 mnpublicnotice, all within hours of a re-key.
+--
+-- distress_events_source_identity_key keys on what the PUBLISHER assigns and
+-- we never change. Nothing the old index protected is left unprotected.
+--
+-- CONCURRENTLY so the daily scrapers are not blocked while it drops.
+
+DROP INDEX CONCURRENTLY IF EXISTS signals.distress_events_dedup_key;
