@@ -431,6 +431,25 @@ def build_promotion_rows(
     pkg_size = int((package or {}).get("size") or 1)
     is_package = pkg_size > 1
     if is_package:
+        # === THE UNIQUE KEY FORCES A DISTINCT source_id PER MEMBER ===
+        # distress_events_source_identity_key is
+        #     (county_code, source, source_id, event_date) NULLS NOT DISTINCT
+        # and every member of a package shares all four. Without a suffix the
+        # first insert succeeds and the second raises 23505.
+        #
+        # The suffix is the PARCEL'S OWN DIGITS, never a loop index: Minnesota
+        # requires a notice to run six consecutive weeks (Minn. Stat. 580.03)
+        # and a republication may list the parcels in a different ORDER. An
+        # index-based suffix would shift between runs and mint a fresh event
+        # every week -- exactly the 24% inflation measured on 2026-08-10.
+        #
+        # This does not weaken the key. For a package notice the publisher's
+        # identity for a GIVEN PARCEL genuinely is notice-plus-parcel, and the
+        # suffix is derived from what the county published, not from anything
+        # we rewrite.
+        _member_digits = _pid_digits(real_pid)
+        if _member_digits:
+            source_id = f"{source_id}#{_member_digits}"
         raw_data["_package"] = {
             "size": pkg_size,
             "index": (package or {}).get("index"),
