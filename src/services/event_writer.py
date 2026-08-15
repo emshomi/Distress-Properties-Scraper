@@ -3,7 +3,8 @@ Event writer service.
 
 Writes DistressEventInsert rows to signals.distress_events with
 deduplication. The dedup key is
-(county_code, parcel_id, event_type, event_date, source).
+(county_code, source, source_id, event_date) -- the PUBLISHER's identity for
+the event, not anything we generate.
 
 Writes happen in batches of 500 to balance throughput vs. timeout risk.
 """
@@ -56,9 +57,46 @@ def write_events_dedup(events: Iterable[DistressEventInsert]) -> tuple[int, int]
     Insert events into signals.distress_events, skipping duplicates.
 
     Dedup uses the unique index
-        (county_code, parcel_id, event_type, event_date, source)
+        distress_events_source_identity_key
+        (county_code, source, source_id, event_date)
     in the underlying table. Postgres' ON CONFLICT DO NOTHING returns 0
     rows for the conflicting ones, which we count as duplicates.
+
+    === WHY THE KEY MOVED OFF parcel_id (2026-08-15) ===
+    The old key was (county_code, parcel_id, event_type, event_date, source).
+    It CONTAINED parcel_id -- a value WE mint and WE rewrite.
+
+    When a sheriff notice publishes no PIN, the scraper mints
+    'HENNEPIN-FC-<saleRecordNumber>' so the event can be stored at all. When
+    the real parcel is later resolved and the event re-keyed, the scraper's
+    NEXT run regenerates the placeholder, finds no conflict, and inserts a
+    SECOND COPY of the same sale.
+
+    Measured 2026-08-15, each within hours of a re-key:
+        hennepin_sheriff  373 duplicates (11:18 run)
+        anoka_sheriff      23 duplicates (12:00 run)
+        mnpublicnotice      1 duplicate -- and that one had no re-key at all:
+            the scraper's OWN id format changed between 08-08 and 08-13,
+            'DAKOTA-FC-MN25506' becoming
+            'DAKOTA-FC-025372701220-2026-09-29'. Same notice, same
+            $284,929.33, same date, different generated string, no conflict.
+
+    Those duplicates are what a subscriber saw as blank rows: the copy sits on
+    a placeholder parcel with no lat, no emv_total and no owner, beside its
+    complete twin.
+
+    source_id is the PUBLISHER's identifier -- a sheriff sale record number, a
+    311 case number, a public-notice id. We never mint it and never rewrite
+    it. Measured: 0 NULL source_id and 0 NULL county_code across all 9,249
+    events.
+
+    event_date STAYS in the key. Dakota postponements are real -- 60
+    violations across 120 rows differing ONLY on event_date. Dropping it would
+    collapse a rescheduled sale into its original and lose the new date.
+
+    event_type is deliberately NOT in the key: a publisher id is already
+    type-specific, and including it would let the same notice re-enter under a
+    different label.
 
     county_code is DERIVED HERE when the caller has not set it, so no scraper
     needs changing. See _fill_county_codes.
@@ -96,21 +134,27 @@ def write_events_dedup(events: Iterable[DistressEventInsert]) -> tuple[int, int]
                 signals_table("distress_events")
                 .upsert(
                     payload,
-                    # county_code added 2026-08-06 to match the rebuilt
-                    # distress_events_dedup_key. The index gained county_code
-                    # when core.parcels moved to a composite PK, because two
-                    # counties' events for the same PIN were collapsing into
-                    # one — 51,662 nine-char PINs are shared across MN
-                    # counties. A stale conflict target matches no unique
-                    # index, so PostgREST rejects the whole batch; the except
-                    # below swallows it into a warning and the run still
-                    # reports counts, which is how this would have gone
-                    # unnoticed on the DAILY sheriff feeds.
+                    # MUST name an EXISTING unique index. A stale conflict
+                    # target matches none, so PostgREST rejects the whole
+                    # batch; the except below swallows that into a warning
+                    # while the run still reports counts -- which is how it
+                    # would go unnoticed on the DAILY sheriff feeds.
                     #
-                    # The index is NULLS NOT DISTINCT, so rows that do not yet
-                    # carry county_code still dedup correctly among themselves.
-                    # See the docstring for why they should carry it.
-                    on_conflict="county_code,parcel_id,event_type,event_date,source",
+                    # Backed by distress_events_source_identity_key, created
+                    # 2026-08-15 CONCURRENTLY and verified indisvalid.
+                    # distress_events_dedup_key still exists and is NOT used;
+                    # it is dropped only after this change is verified in
+                    # production.
+                    #
+                    # NULLS NOT DISTINCT on both. 628 events carry a NULL
+                    # event_date (483 ramsey_tax_roll, 142 hennepin_tax_roll --
+                    # delinquency has a YEAR, not an event date) and dedup
+                    # correctly among themselves only because of it. Under the
+                    # Postgres default every one would be unique to itself and
+                    # re-insert on every run: exactly the 2026-08-07 incident,
+                    # where a NULL county_code accumulated 1,451 duplicates in
+                    # 24 hours and broke mpls_vbr and saint_paul_vacant.
+                    on_conflict="county_code,source,source_id,event_date",
                     ignore_duplicates=True,
                 )
                 .execute()
