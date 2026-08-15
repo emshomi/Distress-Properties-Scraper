@@ -333,6 +333,7 @@ def build_promotion_rows(
     extracted: dict[str, Any],
     resolved_parcel_id: Optional[str] = None,
     package: Optional[dict[str, Any]] = None,
+    member_address: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Given an ai.extracted_foreclosures record (as a dict), build the target
     rows. Returns {'source_id', 'parcel_row', 'distress_event', 'sheriff_sale'}.
@@ -375,6 +376,29 @@ def build_promotion_rows(
 
     address = extracted.get("property_address") or "address not stated"
     city = extracted.get("city") or ""
+
+    # === A PACKAGE MEMBER MUST CARRY ITS OWN ADDRESS ===
+    # extracted['property_address'] on a package notice is the notice's FULL
+    # LIST, e.g. '21184 Keibler Ct. N., Forest Lake, MN; 21148 Keibler Ct. N.,
+    # ...' -- twelve addresses. Written to raw_data.address it makes every one
+    # of thirteen members display all twelve of its siblings, which is what the
+    # 2026-08-15 migration produced before this was fixed.
+    #
+    # member_address is supplied by the CALLER, which has the DB (this module
+    # stays pure) and already looks the parcel up in _resolve_spine_parcel.
+    # {'address': ..., 'city': ...}; either may be None.
+    #
+    # A member whose parcel has NO address keeps an EMPTY address rather than
+    # inheriting the list. One Forest Lake parcel is in that state, and the
+    # notice prints 12 addresses for 13 parcels, so positional alignment cannot
+    # be trusted to fill it. The county's own list is kept in
+    # _package.notice_addresses, visible but not presented as this property's
+    # address.
+    notice_addresses = None
+    if package:
+        notice_addresses = address
+        address = (member_address or {}).get("address") or ""
+        city = (member_address or {}).get("city") or ""
     sale_date = extracted.get("sale_date")
     amount_due = extracted.get("amount_due")
     mortgagor = extracted.get("mortgagor") or "not stated"
@@ -455,6 +479,8 @@ def build_promotion_rows(
             "index": (package or {}).get("index"),
             "total_bid": amount_due,
             "parcel_ids": (package or {}).get("parcel_ids"),
+            # What the county actually printed, preserved verbatim.
+            "notice_addresses": notice_addresses,
             "note": (
                 f"Part of a package sale of {pkg_size} properties sold together"
                 f" for {_money_str(amount_due)}. No individual price was"
