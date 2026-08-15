@@ -1,0 +1,62 @@
+name: Hennepin EMV Backfill
+# Repairs core.parcels.emv_total for hennepin: 385,962 rows.
+#
+# WHY (2026-08-15)
+# Hennepin holds 448,719 parcels. emv_total -- the column the API, deal math and
+# every product surface read -- is populated on 39,631 (8.8%).
+# estimated_market_value, a LEGACY column nothing displays, is populated on
+# 443,610 (98.9%). The values loaded; they went to the wrong column. Compare
+# washington 100.0%, dakota 99.9%, chisago 99.5%, anoka 98.7%.
+#
+# Visible symptom: a Hennepin foreclosure opens with no market value, no deal
+# math, no owner mailing, no homestead. It reads as a parcel-matching failure
+# and is NOT one -- no_parcel_row is ZERO across all 29 county/source
+# combinations measured. Every event joins to a parcel. The parcel is empty in
+# the column that gets read.
+#
+# WHY A RUNNER AND NOT THE SQL EDITOR
+# The editor's gateway timed out on the whole UPDATE, again at 50,000 rows and
+# again at 20,000. 5,000 succeeded. Bisecting further is pointless: EXPLAIN
+# ANALYZE shows the SELECT is an Index Scan returning 20,000 rows in 630ms.
+# Reading is fast; the cost is the WRITE against 3.7GB of indexes. psycopg2
+# connects directly with no gateway in front of it.
+#
+# SAFE TO RE-RUN. The predicate stops matching once a row is written, so a run
+# that dies half way costs a re-run and never a double-apply. Every batch
+# commits independently.
+#
+# REQUIRES audit.hennepin_emv_backfill_20260815 to exist -- 285 of these rows
+# are OVERWRITES of stale values and the prior state lives only there. The
+# script exits 1 if it is missing.
+#
+# THE LOG IS NOT THE MEASUREMENT. Verify with a query against core.parcels.
+on:
+  workflow_dispatch:
+    inputs:
+      max_rows:
+        description: 'Rows to write. 5000 = smoke test. 0 = all (~385,962).'
+        required: false
+        default: '5000'
+jobs:
+  backfill:
+    name: Backfill hennepin emv_total
+    runs-on: ubuntu-latest
+    # ~386k row updates plus index maintenance. Generous because the script is
+    # self-resuming: a timeout costs a re-run, not a restart.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: pip install psycopg2-binary
+      - name: Backfill emv_total
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MAX_ROWS: ${{ inputs.max_rows }}
+        run: |
+          python scripts/run_hennepin_emv_backfill.py
