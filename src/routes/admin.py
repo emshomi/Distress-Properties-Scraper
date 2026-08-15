@@ -269,8 +269,14 @@ async def list_extractions(status: str = "pending") -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to list extractions.")
 
 
-def _resolve_spine_parcel(extracted: dict[str, Any]) -> Optional[str]:
-    """The REAL core.parcels.parcel_id for this notice, or None.
+def _resolve_spine_parcel(extracted: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The REAL core.parcels row for this notice, or None.
+
+    CHANGED 2026-08-15: returns the ROW ({parcel_id, address, city}) rather
+    than the id alone. A PACKAGE notice's extracted['property_address'] is the
+    notice's FULL LIST of addresses -- twelve of them for washington
+    26-003536FC -- so each member needs ITS OWN address, and only this function
+    has the DB to look it up. build_promotion_rows stays pure.
 
     ADDED 2026-08-10. Every mnpublicnotice foreclosure was hung off a
     SYNTHETIC parcel built from the notice id, never the actual parcel — so
@@ -301,7 +307,7 @@ def _resolve_spine_parcel(extracted: dict[str, Any]) -> Optional[str]:
     try:
         hit = (
             core_table("parcel_pid_lookup")
-            .select("parcel_id")
+            .select("parcel_id, address, city")
             .eq("county_code", county_code)
             .eq("pid_digits", digits)
             .limit(2)
@@ -319,7 +325,7 @@ def _resolve_spine_parcel(extracted: dict[str, Any]) -> Optional[str]:
         # 0 = not in the spine (beltrami and redwood have NO spine at all).
         # 2+ = ambiguous within one county; never guess.
         return None
-    return rows[0].get("parcel_id")
+    return rows[0]
 
 
 def _as_date(value: Any) -> Optional[date]:
@@ -567,11 +573,23 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
             # Resolve the notice's PID against the county spine BEFORE building.
             # build_promotion_rows stays pure (no DB), so the lookup happens here
             # and the answer is passed in. See _resolve_spine_parcel().
-            resolved_pid = _resolve_spine_parcel(extracted_member)
+            resolved_row = _resolve_spine_parcel(extracted_member)
+            resolved_pid = (resolved_row or {}).get("parcel_id")
             built = build_promotion_rows(
                 extracted_member,
                 resolved_parcel_id=resolved_pid,
                 package=package,
+                # Only a package member needs this; build_promotion_rows
+                # ignores it otherwise. A member with no resolved parcel gets
+                # an EMPTY address rather than the notice's whole list.
+                member_address=(
+                    {
+                        "address": (resolved_row or {}).get("address"),
+                        "city": (resolved_row or {}).get("city"),
+                    }
+                    if package
+                    else None
+                ),
             )
             source_id = built["source_id"]
             effective_pid = built["parcel_id"]
