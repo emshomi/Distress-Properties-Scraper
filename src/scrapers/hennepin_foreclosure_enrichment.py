@@ -52,6 +52,7 @@ any writes; per-row update failures are counted and logged, never fatal.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from src.db.supabase_client import core_table, signals_table
@@ -64,6 +65,25 @@ _SOURCE = "hennepin_sheriff"
 # Cursor-paged reads (mirrors ramsey_tax_roll convention).
 _READ_PAGE_SIZE = 1000
 _MAX_PAGES = 600  # ~448K parcels / 1000 = ~449 pages; headroom.
+
+
+def _max_events() -> int:
+    """Cap on events UPDATED in one run. 0 = uncapped.
+
+    ADDED 2026-08-15, when this job started writing parcel_id as well as
+    raw_data. A capped first run is the discipline that caught three separate
+    defects in seconds on the Washington and Dakota loaders (2026-08-14) where
+    a full run would have taken 30+ minutes to fail the same way -- and this
+    one re-keys LIVE foreclosure events, so a wrong match is a wrong property
+    on a subscriber's screen.
+
+    Counts rows actually WRITTEN, not rows examined: no_match and multi_match
+    cost nothing and shouldn't consume the budget.
+    """
+    try:
+        return max(0, int(os.environ.get("MAX_EVENTS", "0")))
+    except ValueError:
+        return 0
 
 
 def _norm_addr(s: Any) -> str:
@@ -256,7 +276,8 @@ async def run_hennepin_foreclosure_enrichment() -> dict[str, int]:
     events = await _load_foreclosure_events()
     if not events:
         logger.info("Hennepin enrichment: no foreclosure events; nothing to do")
-        return {"events": 0, "enriched": 0, "no_match": 0,
+        return {"events": 0, "enriched": 0, "rekeyed": 0,
+                "rekey_collision": 0, "no_match": 0,
                 "multi_match": 0, "failed": 0}
 
     index = await _build_address_index()
@@ -268,7 +289,15 @@ async def run_hennepin_foreclosure_enrichment() -> dict[str, int]:
     rekeyed = 0
     rekey_collision = 0
 
+    cap = _max_events()
+    if cap:
+        logger.info("Hennepin enrichment: capped run", max_events=cap)
+
     for ev in events:
+        if cap and (enriched + failed) >= cap:
+            logger.info("Hennepin enrichment: MAX_EVENTS reached", cap=cap)
+            break
+
         raw = ev.get("raw_data") or {}
         addr = _norm_addr(raw.get("address"))
         matches = index.get(addr, []) if addr else []
