@@ -11,6 +11,11 @@ name: Hennepin Foreclosure Enrichment
 # re-running simply rewrites the same enrichment.
 on:
   workflow_dispatch:
+    inputs:
+      max_events:
+        description: 'Events to WRITE. 25 = capped test. 0 = uncapped (all).'
+        required: false
+        default: '25'
   schedule:
     # 2nd of the month, 14:00 UTC = 8:00am Central (standard) / 9:00am (DST).
     # Offset a day after ramsey-tax (1st @ 13:30) and well clear of the daily
@@ -37,6 +42,17 @@ jobs:
           pip install -r requirements.txt
       - name: Run Hennepin foreclosure enrichment
         env:
+          # --- Cap on rows WRITTEN (2026-08-15) ---
+          # This job now writes distress_events.parcel_id as well as raw_data,
+          # re-keying a foreclosure off its HENNEPIN-FC-* placeholder onto the
+          # real assessor parcel. That is a live product change per row, so a
+          # manual dispatch defaults to a CAPPED test -- going full-run has to
+          # be typed on purpose.
+          #
+          # The SCHEDULED run is uncapped: inputs.max_events is empty on a
+          # cron trigger, and MAX_EVENTS parses an empty or invalid value as 0
+          # (uncapped). Verified in _max_events().
+          MAX_EVENTS: ${{ inputs.max_events }}
           # --- Required: database ---
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
