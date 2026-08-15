@@ -333,6 +333,40 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         mkt_val = _safe_decimal(attributes.get("MKT_VAL_TOT"))
         cleaned_raw = _clean_raw_data(attributes)
 
+        # DEFECT FIXED 2026-08-15 -- THE LOADER WROTE VALUE TO THE WRONG COLUMN.
+        #
+        # MKT_VAL_TOT went ONLY to estimated_market_value, a legacy column
+        # nothing displays. emv_total -- what signals.distress_with_parcel, the
+        # API and deal math actually read -- was never written.
+        #
+        # Measured before the fix: hennepin had 448,719 parcels with emv_total
+        # on 39,631 (8.8%) and estimated_market_value on 443,610 (98.9%).
+        # Compare washington 100.0%, dakota 99.9%, chisago 99.5%, anoka 98.7%.
+        # The values were loading; they were landing in a column no product
+        # surface reads. A subscriber opened a Hennepin foreclosure and saw no
+        # market value, no deal math, no owner mailing, no homestead.
+        #
+        # Same defect fixed in washington_parcels.py on 2026-08-14 ("values were
+        # going to the LEGACY column nothing displays"). 375,962 rows were
+        # repaired by MIGRATION_hennepin_emv_total_backfill_2026-08-15, and
+        # WITHOUT THIS LOADER CHANGE the next full refresh reverts all of it.
+        #
+        # ZERO IS NOT A VALUE -- IT IS A PARSE FAILURE AT THE COUNTY.
+        # 18,303 hennepin parcels carry MKT_VAL_TOT = 0. That is not $0
+        # property: 13 parcels loaded in May 2026 hold real values against a
+        # CURRENT payload of 0, including 755 INDUSTRIAL BLVD at $14,600,000 and
+        # 2905 LAKE ST E at $1,103,000. The county's own feed is returning zero
+        # for parcels demonstrably worth millions.
+        #
+        # Writing 0 into emv_total would render "$0" where an em-dash belongs
+        # AND feed $0 into _compute_deal_math as a real market value, producing
+        # an equity spread equal to the entire payoff on 18,303 parcels. A
+        # fabricated number is worse than a blank, so zero becomes NULL here.
+        #
+        # estimated_market_value keeps its existing behaviour (zeros included)
+        # -- that column's semantics are not changed by this fix.
+        emv_total = mkt_val if (mkt_val is not None and mkt_val > 0) else None
+
         return {
             "parcel_id": pid,
             "address": address,
@@ -343,6 +377,7 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "year_built": year_built,
             "property_type": property_type,
             "estimated_market_value": mkt_val,
+            "emv_total": emv_total,
             "raw_data": cleaned_raw,
         }
 
@@ -381,6 +416,7 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     year_built=sig.get("year_built"),
                     property_type=sig.get("property_type"),  # type: ignore[arg-type]
                     estimated_market_value=sig.get("estimated_market_value"),
+                    emv_total=sig.get("emv_total"),
                     raw_data=sig.get("raw_data"),
                     data_sources=[self.source_name],
                     last_observed_at=datetime.now(timezone.utc),
