@@ -130,7 +130,33 @@ def _clean_cell(text: str) -> str:
     t = html.unescape(t).replace("\xa0", " ")
     return " ".join(t.split())
 # '1225 Lasalle Ave #604' -> ('1225', 'Lasalle Ave', '604')
-_ADDR_RE = re.compile(r"^(\d+)\s+(.+?)\s*#\s*(.+)$")
+_ADDR_UNIT_RE = re.compile(r"^(\d+)\s+(.+?)\s*#\s*(.+)$")
+
+# '3500 Portland Ave S' -> ('3500', 'Portland Ave S'). No unit.
+#
+# ADDED 2026-08-15. The first version only accepted addresses containing '#',
+# because condos were the known problem. Measured afterwards: of 69 hennepin
+# events still on a placeholder, only 13 are unresolved condos -- 52 carry an
+# ORDINARY address that the internal match still missed.
+#
+# The county's form resolves those too, and its street matching is FUZZIER
+# than ours: it returns 27 CIRCLE WEST for a search of 'Circle W'. That is
+# exactly why an exact normalised join inside the database could never find
+# them and this endpoint can.
+#
+# Verified by hand 2026-08-15:
+#     3500 Portland Ave S  -> 03-028-24-41-0135 (MINNEAPOLIS)
+#     27 Circle W          -> 29-117-21-11-0021 (EDINA, recorded '27 CIRCLE WEST')
+#     11115 Quantico La N  -> TWO parcels, left unresolved on purpose
+_ADDR_PLAIN_RE = re.compile(r"^(\d+)\s+(.+)$")
+
+# Sheriff placeholders that are not addresses at all. 'SALE CARD NOT USED' is
+# published for a cancelled or unused sale record; posting it to the county
+# would be a guaranteed miss and a wasted request.
+_NOT_AN_ADDRESS_RE = re.compile(
+    r"sale\s+card|not\s+used|address\s+(pending|unassigned)|^\s*$",
+    re.IGNORECASE,
+)
 
 
 def _headers() -> dict[str, str]:
@@ -193,11 +219,31 @@ async def _post(client: httpx.AsyncClient, data: dict[str, str]) -> str | None:
 async def _resolve_one(
     client: httpx.AsyncClient, house: str, street: str, unit: str
 ) -> tuple[str | None, str]:
-    """Resolve one unit address to a 13-digit parcel id.
+    """Resolve one address to a 13-digit parcel id. `unit` may be empty.
 
     Returns (parcel_id, how) where `how` records which path produced it, so a
     later query can tell a direct hit from a list match without re-running.
     """
+    # NO UNIT: one POST. A single result is the parcel; a LIST means the
+    # address maps to more than one parcel and must NOT be guessed at.
+    # 11115 Quantico La N returns two parcels (33-120-22-31-0003 and
+    # 33-120-22-32-0027) -- a house on two tax parcels, with nothing on the
+    # page saying which one the foreclosure is against.
+    if not unit:
+        body = await _post(client, {"house": house, "street": street,
+                                    "condo": "", "ps": str(_LIST_PAGE_SIZE)})
+        if not body:
+            return None, "no_response"
+        m = _PID_RE.search(body)
+        if m:
+            return _to_parcel_id(m.group(1)), "direct_no_unit"
+        rows = _ROW_RE.findall(body)
+        if len(rows) == 1:
+            return rows[0][0], "list_single_no_unit"
+        if len(rows) > 1:
+            return None, "ambiguous_address"
+        return None, "address_not_found"
+
     # Path 1: ask for the unit directly.
     body = await _post(client, {"house": house, "street": street,
                                 "condo": unit, "ps": "20"})
@@ -252,10 +298,12 @@ async def run_hennepin_condo_resolver() -> dict[str, int]:
         .like("parcel_id", "HENNEPIN-FC-%")
         .execute()
     )
-    events = [
-        e for e in (resp.data or [])
-        if "#" in ((e.get("raw_data") or {}).get("address") or "")
-    ]
+    # Any event with a usable address, not only condos. See _ADDR_PLAIN_RE.
+    events = []
+    for e in (resp.data or []):
+        a = ((e.get("raw_data") or {}).get("address") or "").strip()
+        if a and not _NOT_AN_ADDRESS_RE.search(a):
+            events.append(e)
     logger.info("Hennepin condo resolver: candidates", count=len(events))
 
     stats = {"candidates": len(events), "resolved": 0, "rekeyed": 0,
@@ -282,17 +330,21 @@ async def run_hennepin_condo_resolver() -> dict[str, int]:
             attempted += 1
 
             addr = ((ev.get("raw_data") or {}).get("address") or "").strip()
-            m = _ADDR_RE.match(addr)
-            if not m:
-                stats["unparsed_address"] += 1
-                continue
-            house, street, unit = m.group(1), m.group(2), m.group(3)
+            m = _ADDR_UNIT_RE.match(addr)
+            if m:
+                house, street, unit = m.group(1), m.group(2), m.group(3)
+            else:
+                m = _ADDR_PLAIN_RE.match(addr)
+                if not m:
+                    stats["unparsed_address"] += 1
+                    continue
+                house, street, unit = m.group(1), m.group(2), ""
 
             parcel_id, how = await _resolve_one(client, house, street, unit)
             await asyncio.sleep(_PACE_SECONDS)
 
             if not parcel_id:
-                if how == "ambiguous_in_building":
+                if how in ("ambiguous_in_building", "ambiguous_address"):
                     stats["ambiguous"] += 1
                 else:
                     stats["not_found"] += 1
