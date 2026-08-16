@@ -67,13 +67,28 @@ class DistressEventInsert(BaseModel):
     """
     Payload for inserting a distress_events row.
 
-    Dedup key is (county_code, parcel_id, event_type, event_date, source) —
-    the event writer skips inserts that match an existing key.
+    Dedup key is (county_code, source, source_id, event_date), enforced by the
+    unique index distress_events_source_identity_key with NULLS NOT DISTINCT.
+    The event writer upserts with ignore_duplicates=True against it.
 
-    county_code gained its place in that key on 2026-08-06, when core.parcels
-    moved to a composite (county_code, parcel_id) primary key: Minnesota PINs
-    are not globally unique, and without the county two counties' events for
-    the same PIN collapsed into one.
+    CORRECTED 2026-08-16. This docstring named the OLD key,
+    (county_code, parcel_id, event_type, event_date, source), which was
+    replaced on 2026-08-15. The old key contained parcel_id -- a value WE mint
+    and WE rewrite -- so re-keying an event to its real parcel let the next
+    scraper run regenerate the placeholder, find no conflict, and insert a
+    second copy: 373 duplicates on hennepin_sheriff and 23 on anoka_sheriff,
+    each within hours of a re-key. See src/services/event_writer.py, which
+    carries the full account.
+
+    Leaving the stale text here was not harmless. On 2026-08-16 it was read as
+    authoritative while diagnosing 41 duplicate anoka_sheriff rows and pointed
+    at the wrong fix; the correct behaviour was already documented in
+    event_writer.py and the two disagreed.
+
+    event_date STAYS in the key on purpose: a postponed sale is a genuinely new
+    published fact, and collapsing it into the original would lose the new
+    date. Superseding the earlier row is handled by the trg_events_supersede
+    trigger on signals.distress_events, not by the dedup key.
 
     All field names match Supabase column names exactly. Note that
     monetary amounts use `event_value` (not `amount`) to match the
