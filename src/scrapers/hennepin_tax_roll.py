@@ -88,7 +88,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
 
-from src.db.supabase_client import core_table
+from src.db.supabase_client import core_table, signals_table
 from src.models.signal import DistressEventInsert
 from src.scrapers.base_scraper import BaseScraper
 from src.services.event_writer import write_events_dedup
@@ -131,6 +131,63 @@ _ADDR_UNASSIGNED = "ADDRESS UNASSIGNED"
 # which is ~4,251 of 448K — small, but page defensively.
 _READ_PAGE_SIZE = 1000
 _MAX_PAGES = 200
+
+# ============================================================
+# RETIREMENT (de-listing) — added 2026-08-16
+# ============================================================
+# THE PROBLEM THIS SOLVES
+# write_events_dedup is ON CONFLICT DO NOTHING: it inserts and never
+# retires. So this table was the union of every parcel that has EVER been
+# tax-distressed since the first mine, not the set that is distressed NOW.
+#
+# Measured 2026-08-16, before this existed:
+#   tax_delinquent  4,113 stored   3,112 still true   1,001 NOT true
+#   tax_forfeit       142 stored     137 still true       5 NOT true
+# 1,006 of 4,255 events — 23.6% — described properties the county's own
+# roll says are current. A subscriber filtering Hennepin tax-delinquent
+# got a thousand dead leads. Olmsted showed the same shape at 49%.
+#
+# WHY THE RETIREMENT LIVES IN THIS FILE AND NOT A SEPARATE JOB
+# The retirement predicate MUST be the exact inverse of the mining
+# predicate. In one file they cannot drift; in two files they can, and a
+# drifted predicate retires live events or keeps dead ones — worse than
+# doing nothing. This scraper owns the source's truth end to end:
+# mine -> insert -> retire.
+#
+# THE ESCALATION CASE (this is why "not in the set" is not enough)
+# 46 delinquent events had parcels that have since FORFEITED. A naive
+# "no longer delinquent -> cured" rule stamps all 46 as cured — recording
+# that the owner paid, when they lost the property to the State. Verified
+# 2026-08-16: all 46 have delq_year NULL and FORFEIT_LAND_IND='T', with
+# delinquency years 2018-2024 (never 2025 — consistent with Minnesota's
+# ~3-year clock). They include 2629 Lake St E at $332,500 EMV.
+#
+# RESOLUTION MAPPING, each branch backed by a measured count:
+#   tax_delinquent, parcel now forfeited      ->  'forfeited'       (46)
+#   tax_delinquent, parcel qualifies for none ->  'cured'          (955)
+#   tax_forfeit,    parcel qualifies for none ->  'source_removed'   (5)
+#
+# 'source_removed', NOT 'sold', for the forfeit case. Forfeited land
+# usually leaves the roll via county auction, but it can also be conveyed
+# to a city or reclassified. We observed a disappearance, not a sale.
+# Same principle as event_value being NULL above: never assert a fact the
+# source did not publish.
+#
+# NOTHING IS EVER DELETED. resolved_at + resolution are stamped; the row,
+# its dates and its raw_data stay exactly as written. A cured delinquency
+# is itself an outcome signal for the ML labels.
+_RETIRE_PAGE_SIZE = 500
+
+# Safety cap on a single run's retirements. The known backlog is ~1,006;
+# anything beyond this means the mining predicate returned far less than
+# it should (an empty fetch would otherwise retire the entire source), so
+# stop and report rather than mass-retire on a bad read.
+_RETIRE_MAX_PER_RUN = 2000
+
+# Skip retirement entirely when the mine came back suspiciously small.
+# A partial county load or a failed page would otherwise look exactly
+# like "everybody paid their taxes".
+_RETIRE_MIN_MINED = 100
 
 _FORFEIT_TITLE = "Tax-forfeited land (state)"
 _FORFEIT_DESC = (
@@ -492,16 +549,182 @@ class HennepinTaxRollScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         self, signals: list[DistressEventInsert]
     ) -> tuple[int, int, int]:
         if not signals:
+            # An empty mine is NOT evidence that everyone paid. Retiring on
+            # a zero-row read would wipe the source. Report and stop.
+            logger.warning(
+                "Hennepin tax-roll mined zero parcels — skipping retirement",
+                source=self.source_name,
+            )
             return 0, 0, 0
 
         new_events, failed_events = write_events_dedup(signals)
+
+        retired = self._retire_stale(signals)
+
         logger.info(
             "Hennepin tax-roll write complete",
             source=self.source_name,
             events_new=new_events,
+            events_retired=retired,
             failed=failed_events,
         )
-        return new_events, 0, failed_events
+        # retired counts as records_updated — the first thing in this fleet
+        # that makes that field mean something. It has been 0 everywhere.
+        return new_events, retired, failed_events
+
+    # ---- Retire events the county roll no longer supports ----
+
+    def _retire_stale(self, signals: list[DistressEventInsert]) -> int:
+        """Stamp resolved_at/resolution on events this mine did not produce.
+
+        The mined signals ARE the current truth: every parcel that qualifies
+        right now produced one. So any UNRESOLVED event from this source whose
+        parcel is absent from that set has stopped being true, and the bucket
+        the parcel now sits in says why.
+
+        See the module constants for the resolution mapping and the measured
+        counts behind each branch. Never raises: a retirement failure must not
+        fail a run that has already written its events correctly.
+        """
+        if len(signals) < _RETIRE_MIN_MINED:
+            logger.warning(
+                "Hennepin tax-roll mine too small to retire against",
+                source=self.source_name,
+                mined=len(signals),
+                minimum=_RETIRE_MIN_MINED,
+            )
+            return 0
+
+        # Parcels that currently qualify, split by which bucket they are in.
+        # A parcel in EITHER set is still distressed; which set decides the
+        # resolution for a delinquent event that moved.
+        forfeit_now: set[str] = set()
+        delq_now: set[str] = set()
+        for sig in signals:
+            if sig.event_type == "tax_forfeit":
+                forfeit_now.add(sig.parcel_id)
+            elif sig.event_type == "tax_delinquent":
+                delq_now.add(sig.parcel_id)
+        qualifying = forfeit_now | delq_now
+
+        try:
+            stored = self._read_unresolved_events()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Hennepin tax-roll could not read events for retirement",
+                source=self.source_name,
+                error=f"{type(e).__name__}: {e}",
+            )
+            return 0
+
+        # Bucket the retirements by resolution so each is one UPDATE rather
+        # than one per row.
+        to_retire: dict[str, list[int]] = {}
+        for row in stored:
+            pid = row.get("parcel_id")
+            etype = row.get("event_type")
+            eid = row.get("id")
+            if pid is None or eid is None:
+                continue
+            if pid in qualifying and not (
+                etype == "tax_delinquent" and pid in forfeit_now
+            ):
+                continue  # still true, leave it alone
+
+            if etype == "tax_delinquent":
+                # THE ESCALATION CASE. Order matters: check forfeiture BEFORE
+                # concluding the debt was paid.
+                resolution = "forfeited" if pid in forfeit_now else "cured"
+            elif etype == "tax_forfeit":
+                # Left the roll. We saw a disappearance, not a sale.
+                resolution = "source_removed"
+            else:
+                continue
+
+            to_retire.setdefault(resolution, []).append(eid)
+
+        total = sum(len(v) for v in to_retire.values())
+        if total == 0:
+            logger.info(
+                "Hennepin tax-roll retirement: nothing to retire",
+                source=self.source_name,
+            )
+            return 0
+
+        if total > _RETIRE_MAX_PER_RUN:
+            logger.error(
+                "Hennepin tax-roll retirement ABORTED — count above cap",
+                source=self.source_name,
+                would_retire=total,
+                cap=_RETIRE_MAX_PER_RUN,
+                mined=len(signals),
+                hint="A partial county load looks exactly like mass curing.",
+            )
+            return 0
+
+        stamped_at = datetime.now(timezone.utc).isoformat()
+        retired = 0
+        for resolution, ids in to_retire.items():
+            for i in range(0, len(ids), _RETIRE_PAGE_SIZE):
+                chunk = ids[i:i + _RETIRE_PAGE_SIZE]
+                try:
+                    resp = (
+                        signals_table("distress_events")
+                        .update({
+                            "resolved_at": stamped_at,
+                            "resolution": resolution,
+                        })
+                        # is_ null guards idempotency: a second run cannot
+                        # re-stamp, and cannot overwrite an earlier, more
+                        # specific resolution with a later generic one.
+                        .is_("resolved_at", "null")
+                        .in_("id", chunk)
+                        .execute()
+                    )
+                    n = len(resp.data or [])
+                    retired += n
+                    logger.info(
+                        "Hennepin tax-roll retired events",
+                        source=self.source_name,
+                        resolution=resolution,
+                        requested=len(chunk),
+                        stamped=n,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Hennepin tax-roll retirement chunk failed",
+                        source=self.source_name,
+                        resolution=resolution,
+                        chunk=len(chunk),
+                        error=f"{type(e).__name__}: {e}",
+                    )
+
+        return retired
+
+    def _read_unresolved_events(self) -> list[dict[str, Any]]:
+        """Page every UNRESOLVED event this source has written."""
+        out: list[dict[str, Any]] = []
+        last_id = 0
+        for _ in range(_MAX_PAGES):
+            resp = (
+                signals_table("distress_events")
+                .select("id, parcel_id, event_type")
+                .eq("source", self.source_name)
+                .eq("county_code", self.county_code)
+                .is_("resolved_at", "null")
+                .gt("id", last_id)
+                .order("id")
+                .limit(_READ_PAGE_SIZE)
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                break
+            out.extend(rows)
+            last_id = rows[-1]["id"]
+            if len(rows) < _READ_PAGE_SIZE:
+                break
+        return out
 
 
 __all__ = ["HennepinTaxRollScraper"]
