@@ -25,6 +25,7 @@ UNHEALTHY_THRESHOLD is now 1, so both consumers mean the same thing by
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from src.db.supabase_client import audit_table
@@ -51,6 +52,45 @@ from src.utils.logger import logger
 # A brief false alarm costs a second glance. A silent window costs the thing
 # this table exists to prevent.
 UNHEALTHY_THRESHOLD: int = 1
+
+# Share of a run's records that may fail before a PARTIAL run is treated as
+# unhealthy rather than as a run with minor drops.
+#
+# MUST MATCH _MINOR_DROP_FRACTION in scripts/health_alert.py. Two files judge
+# the same fact and the 2026-08-02 note above this constant is about exactly
+# that hazard: when /status and the digest disagree about one source on one
+# set of data, the optimistic one is worse than no signal at all. If you
+# change one, change both.
+_MINOR_DROP_FRACTION: float = 0.05  # 5%
+
+# base_scraper step 7 writes "<N> of <M> records failed" into the note it
+# hands record_partial. Reading the severity back out of that string is not
+# elegant, but the alternative is threading counts through the call and
+# changing base_scraper in the same commit; the note's format is generated
+# three lines above the call site, so the coupling is real either way.
+_DROP_RE = re.compile(r"(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+records failed",
+                      re.IGNORECASE)
+
+
+def _drop_fraction(notes: str | None) -> float | None:
+    """Fraction of records that failed, parsed from a partial-run note.
+
+    Returns None when the note carries no such figure, in which case the
+    caller cannot judge severity and must assume the worse case.
+    """
+    if not notes:
+        return None
+    m = _DROP_RE.search(notes)
+    if not m:
+        return None
+    try:
+        failed = int(m.group(1).replace(",", ""))
+        total = int(m.group(2).replace(",", ""))
+    except ValueError:
+        return None
+    if total <= 0:
+        return None
+    return failed / total
 
 
 # ============================================================
@@ -170,19 +210,64 @@ def record_partial(source_name: str, notes: str | None = None) -> None:
     """
     Mark a partial run — some records succeeded, some failed.
 
-    Partial runs don't increment consecutive_failures but they do update
-    last_successful_run_at because something useful was accomplished.
+    A PARTIAL RUN NO LONGER STAMPS last_successful_run_at (2026-08-16).
+
+    It used to, with the reasoning "something useful was accomplished". The
+    cost of that was not visible until measured: advancing the success
+    timestamp makes last_success NEWER than last_failure, and
+    scripts/health_alert.py reads exactly that comparison to decide whether a
+    row is currently in a failed state. So every severity check it performs —
+    the 5% fraction test, the error signatures, the total-write-failure
+    rule — was UNREACHABLE for any partial run.
+
+    ramsey_parcels lost 57,500 of 163,880 records on 2026-08-01, nearly seven
+    times the threshold, and the digest reported it as "healthy now, but
+    carries an old failure note". The note was that run's own error text.
+
+    What this now records:
+      last_successful_run_at  UNCHANGED — the last run that fully succeeded
+                              is still the last run that fully succeeded
+      last_failed_run_at      NOW — records did fail, and this is what makes
+                              the digest's severity branch reachable
+      consecutive_failures    0 — a partial is not a failed RUN. Incrementing
+                              would make the digest call it broken on the
+                              counter before it ever weighs how much was
+                              lost, and a one-record drop is not a breakage.
+      is_healthy              judged on the drop fraction, so /status and the
+                              digest agree about the same source on the same
+                              data — the principle in this module's header.
+
+    When the note carries no "<N> of <M> records failed" figure there is
+    nothing to judge, so the run is treated as unhealthy. A partial run whose
+    severity is unknown should not read as fine.
     """
+    existing = get_health(source_name)
+    frac = _drop_fraction(notes)
+    is_healthy = frac is not None and frac <= _MINOR_DROP_FRACTION
+
     now = datetime.now(timezone.utc)
     payload = SourceHealthUpdate(
         source_name=source_name,
-        last_successful_run_at=now,
+        # Carried through explicitly rather than omitted. record_failure does
+        # the same: _upsert drops None fields via exclude_none, and relying on
+        # a PostgREST upsert to leave an unlisted column alone is a guess this
+        # codebase has already been bitten by.
+        last_successful_run_at=existing.last_successful_run_at if existing else None,
+        last_failed_run_at=now,
         consecutive_failures=0,
-        is_healthy=True,
-        notes=notes or "partial success — see scraper_errors for details",
+        is_healthy=is_healthy,
+        notes=notes or "partial success — some record writes failed",
         updated_at=now,
     )
     _upsert(payload)
+
+    if not is_healthy:
+        logger.warning(
+            "Partial run recorded as unhealthy",
+            source=source_name,
+            drop_fraction=round(frac, 4) if frac is not None else None,
+            threshold=_MINOR_DROP_FRACTION,
+        )
 
 
 __all__ = [
