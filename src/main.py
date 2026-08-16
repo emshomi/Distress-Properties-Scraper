@@ -32,6 +32,7 @@ from src.routes import (
     trigger,
 )
 from src.scheduler.cron import start_scheduler, stop_scheduler
+from src.services.audit_logger import sweep_orphaned_runs
 from src.utils.errors import ServiceError, error_envelope
 from src.utils.logger import logger
 
@@ -76,9 +77,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Startup:
       1. Log service starting
       2. Validate Supabase connectivity (fail-soft)
-      3. Start the APScheduler
+      3. Close orphaned scraper runs left by the previous process
+      4. Start the APScheduler
     Shutdown:
       1. Stop the APScheduler
+
+    STEP 3 SITS BETWEEN 2 AND 4 DELIBERATELY. It needs Supabase, so it
+    cannot precede the ping. And it must precede the scheduler: the sweep
+    treats every status='running' row as orphaned, which is only true
+    while no job of THIS process has started. Move it after
+    start_scheduler and a cron job firing during the sweep would have its
+    brand-new run row closed as an orphan on its first day.
     """
     # ----- STARTUP -----
     logger.info(
@@ -97,6 +106,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             error_type=type(e).__name__,
             error_message=str(e),
             hint="Scrapers will fail until Supabase is reachable",
+        )
+
+    # Close scraper runs the PREVIOUS process never finished.
+    #
+    # BaseScraper writes finish_run at step 8 and updates source_health at
+    # step 9. Neither runs if the process dies mid-scrape — a Railway
+    # redeploy, an OOM kill, a container recycle. The row then stays
+    # status='running' with zeroed counters forever, source_health is never
+    # touched, and the daily digest keeps reporting the source HEALTHY.
+    #
+    # Measured 2026-08-16: 20 such rows across 7 sources, oldest from
+    # 2026-05-27. parcel_enrich_mngeo had 8 of them, three on consecutive
+    # nights, while appearing in the HEALTHY list of every digest.
+    #
+    # Fail-soft like the two steps around it: an audit sweep must never
+    # stop the service from starting.
+    try:
+        sweep = sweep_orphaned_runs(reason="service restart")
+        logger.info(
+            "Orphaned run sweep finished",
+            found=sweep.get("found"),
+            closed=sweep.get("closed"),
+            close_failed=sweep.get("close_failed"),
+            marked_unhealthy=sweep.get("marked_unhealthy"),
+        )
+    except Exception as e:
+        logger.exception(
+            "Orphaned run sweep failed — service will start anyway",
+            error_type=type(e).__name__,
         )
 
     try:
