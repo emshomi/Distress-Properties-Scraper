@@ -19,9 +19,34 @@ can trust:
     - consecutive_failures > 0                  (actively failing)
     - notes contains an error signature         (404, failed, error, timeout,
       unavailable, unexpected status, invalid)
-    - last_successful_run_at older than STALE_DAYS
+    - last success older than its own cadence   (expected_interval_days * 1.5)
 
   HEALTHY otherwise.
+
+STALE REQUIRES A CADENCE (2026-08-16)
+-------------------------------------
+A source with no expected_interval_days is not late — it has nothing to be
+late against. 52 of the 79 rows are MnGeo county parcel loaders, and
+.github/workflows/mngeo-parcels.yml is workflow_dispatch ONLY, deliberately:
+"A schedule would start re-loading counties that have not been verified
+once." They run when dispatched. NULL is correct data, not missing data.
+
+Judging them against a flat 3-day default produced 57 of the 58 STALE lines
+in the 2026-08-15 digest, all reading "no cadence set; default 3d". A digest
+that cries wolf 57 times a morning is a digest nobody reads — which is how
+parcel_enrich_mngeo hung three nights running while listed as HEALTHY.
+
+Those rows are now reported as UNSCHEDULED: counted, named, and excluded
+from staleness. They are NOT hidden. Suppressing them silently would repeat
+the ramsey_sheriff failure, where a source nobody looked at sat wrong for
+ten weeks.
+
+THE RISK THIS CREATES, AND THE GUARD FOR IT
+A NEW scraper with a real cron but no expected_interval_days would land in
+UNSCHEDULED and never be watched. So any unscheduled source whose last
+success is older than _UNSCHEDULED_REVIEW_DAYS is listed separately with
+its age. A dispatch-only loader drifting past a quarter is worth a look;
+a scheduled source that landed here by mistake shows up the same way.
 
 This is intentionally conservative: it would rather flag a borderline source
 than let a silent failure hide (the exact thing that let scrapers rot for weeks).
@@ -37,14 +62,11 @@ ENV VARS (set as GitHub Actions repo secrets)
   ALERT_EMAIL_TO               where the digest is sent
   ALERT_EMAIL_FROM             verified Resend sender (e.g. noreply@govire.com)
 
-Optional:
-  HEALTH_STALE_DAYS            fallback days without success before "stale"
-                               (default 3). Per-source cadence OVERRIDES this:
-                               if audit.source_health.expected_interval_days is
-                               set for a row, its stale threshold is
-                               ceil(interval * 1.5), min 2 days — so a monthly
-                               scraper isn't nagged 27 days a month and a daily
-                               one is flagged within ~2 days. (2026-07-07)
+HEALTH_STALE_DAYS is NO LONGER READ (2026-08-16). It was the flat fallback
+for a missing cadence, and there is no longer a fallback: staleness comes
+from the row's own expected_interval_days or it is not assessed. The
+variable is still set in .github/workflows/health-alert.yml and can be
+removed from there; leaving it does nothing.
 
 Exit code is always 0 on a completed run (a broken *scraper* is not a failure
 of this *alert*). It exits non-zero only if it cannot reach Supabase or Resend,
@@ -77,6 +99,15 @@ _ERROR_SIGNATURES = (
 # If notes match "<N> of <M> records failed" and N is at or below this fraction
 # of M, treat it as a healthy run with minor drops rather than a break.
 _MINOR_DROP_FRACTION = 0.05  # 5%
+
+# An UNSCHEDULED source (no expected_interval_days) is never called stale —
+# it runs on dispatch and has no cadence to miss. But one that has not run in
+# this long is worth an eye, and this is the guard against a genuinely
+# scheduled source landing in that bucket by mistake and going unwatched.
+# 90 days: longer than the longest real cadence in the fleet (hennepin_parcels
+# and anoka_parcels at 92-day quarterly, whose thresholds are 138), so a
+# quarterly loader cannot trip it just by being quarterly.
+_UNSCHEDULED_REVIEW_DAYS = 90.0
 
 
 def _env(name: str, required: bool = True, default: str | None = None) -> str | None:
@@ -123,8 +154,11 @@ def _fetch_health(supabase_url: str, service_key: str) -> list[dict]:
     return resp.json()
 
 
-def _classify(row: dict, stale_days: int) -> tuple[str, str]:
-    """Return (state, reason). state is 'broken' | 'stale' | 'healthy'.
+def _classify(row: dict) -> tuple[str, str]:
+    """Return (state, reason).
+
+    state is one of: 'broken' | 'stale' | 'check' | 'shelved'
+                   | 'unscheduled' | 'unscheduled_review' | 'healthy'.
 
     Key subtlety: the `notes` field is NOT cleared on a successful run -- it
     holds whatever message was last written, success or failure. So a stale
@@ -207,35 +241,43 @@ def _classify(row: dict, stale_days: int) -> tuple[str, str]:
         return "check", f"healthy now, but carries a failure note: {notes[:90]}"
 
     # Stale: succeeded, recovered, but not recently — judged against THIS
-    # source's expected cadence when known (daily scrapers within ~2 days,
-    # weekly within ~10, monthly within ~46, quarterly loads within ~138),
-    # falling back to the flat HEALTH_STALE_DAYS when no cadence is recorded.
-    interval = row.get("expected_interval_days")
-    if isinstance(interval, (int, float)) and interval > 0:
-        threshold = max(2.0, float(interval) * 1.5)
-        cadence_note = f"expected every {int(interval)}d"
-    else:
-        threshold = float(stale_days)
-        cadence_note = f"no cadence set; default {stale_days}d"
+    # source's expected cadence (daily scrapers within ~2 days, weekly within
+    # ~10, monthly within ~46, quarterly loads within ~138).
+    #
+    # NO CADENCE = NOT STALE. There is no flat fallback any more; see the
+    # module docstring. A dispatch-only source cannot be late.
     age_days = (_now() - last_ok).total_seconds() / 86400.0
+    interval = row.get("expected_interval_days")
+
+    if not isinstance(interval, (int, float)) or interval <= 0:
+        if age_days > _UNSCHEDULED_REVIEW_DAYS:
+            return "unscheduled_review", (
+                f"no cadence recorded and last success {age_days:.0f} days ago"
+            )
+        return "unscheduled", "dispatch-only; no cadence recorded"
+
+    threshold = max(2.0, float(interval) * 1.5)
     if age_days > threshold:
         return "stale", (
-            f"last success {age_days:.1f} days ago ({cadence_note})"
+            f"last success {age_days:.1f} days ago "
+            f"(expected every {int(interval)}d)"
         )
 
     return "healthy", "ok"
 
 
-def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
+def _build_digest(rows: list[dict]) -> tuple[str, str, bool]:
     """Return (subject, body, any_problem)."""
     broken: list[tuple[str, str]] = []
     stale: list[tuple[str, str]] = []
     check: list[tuple[str, str]] = []
     shelved: list[str] = []
+    unscheduled: list[str] = []
+    unscheduled_review: list[tuple[str, str]] = []
     healthy: list[str] = []
 
     for row in sorted(rows, key=lambda r: r.get("source_name", "")):
-        state, reason = _classify(row, stale_days)
+        state, reason = _classify(row)
         name = row.get("source_name", "?")
         if state == "broken":
             broken.append((name, reason))
@@ -245,13 +287,19 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
             check.append((name, reason))
         elif state == "shelved":
             shelved.append(name)
+        elif state == "unscheduled":
+            unscheduled.append(name)
+        elif state == "unscheduled_review":
+            unscheduled_review.append((name, reason))
         else:
             healthy.append(name)
 
     # Shelved sources are excluded from the active total -- they're
     # intentionally retired, not part of the live fleet being monitored.
+    # UNSCHEDULED sources ARE part of the fleet and stay in the total:
+    # they are live, they just have no cadence to be late against.
     total = len(rows) - len(shelved)
-    any_problem = bool(broken or stale)
+    any_problem = bool(broken or stale or unscheduled_review)
 
     lines: list[str] = []
     lines.append(f"Govire scraper health digest -- "
@@ -261,7 +309,8 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
                  f"Broken: {len(broken)}   "
                  f"Stale: {len(stale)}   "
                  f"Check: {len(check)}   "
-                 f"Healthy: {len(healthy)}")
+                 f"Healthy: {len(healthy)}   "
+                 f"Unscheduled: {len(unscheduled) + len(unscheduled_review)}")
     lines.append("")
 
     if broken:
@@ -283,8 +332,22 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
             lines.append(f"  - {name}: {reason}")
         lines.append("")
 
+    if unscheduled_review:
+        lines.append("UNSCHEDULED - REVIEW (no cadence recorded, and quiet "
+                     "for a long time; check whether it SHOULD have one):")
+        for name, reason in unscheduled_review:
+            lines.append(f"  - {name}: {reason}")
+        lines.append("")
+
     if healthy:
         lines.append(f"HEALTHY ({len(healthy)}): " + ", ".join(healthy))
+        lines.append("")
+
+    if unscheduled:
+        lines.append(
+            f"UNSCHEDULED ({len(unscheduled)}) - dispatch-only, not judged "
+            f"for staleness: " + ", ".join(unscheduled)
+        )
         lines.append("")
 
     if shelved:
@@ -302,6 +365,9 @@ def _build_digest(rows: list[dict], stale_days: int) -> tuple[str, str, bool]:
     elif stale:
         subject = f"[Govire health] {len(stale)} stale " \
                   f"({len(healthy)}/{total} healthy)"
+    elif unscheduled_review:
+        subject = f"[Govire health] {len(unscheduled_review)} unscheduled " \
+                  f"needing review ({len(healthy)}/{total} healthy)"
     else:
         subject = f"[Govire health] All {total} sources healthy"
 
@@ -342,8 +408,6 @@ def main() -> int:
     resend_key = _env("RESEND_API_KEY")
     to_addr = _env("ALERT_EMAIL_TO")
     from_addr = _env("ALERT_EMAIL_FROM")
-    stale_days = int(_env("HEALTH_STALE_DAYS", required=False, default="3"))
-
     rows = _fetch_health(supabase_url, service_key)
     if not rows:
         # No rows at all is itself suspicious -- report it rather than stay silent.
@@ -353,7 +417,7 @@ def main() -> int:
         _send_email(resend_key, to_addr, from_addr, subject, body)
         return 0
 
-    subject, body, _ = _build_digest(rows, stale_days)
+    subject, body, _ = _build_digest(rows)
     print(body, flush=True)  # also visible in the Actions run log
     _send_email(resend_key, to_addr, from_addr, subject, body)
     return 0
