@@ -1,0 +1,86 @@
+name: Probe Source
+
+# MANUAL ONLY. Run this BEFORE writing a scraper against any new source.
+#
+# WHY THIS EXISTS
+# ---------------
+# On 2026-08-16 mpls_vbr was repointed to a Tableau CSV that had been
+# "verified" by downloading it in Chrome, twice, an hour apart. Byte-identical
+# results proved the FILE was stable and proved nothing about whether a Python
+# client could obtain it. The deployed scraper got 403 on its first scheduled
+# run and the stale-but-working source it replaced had to be restored.
+#
+# A browser download is not evidence of scraper access. Neither is a curl from
+# a laptop: Railway and Actions run from datacenter ranges that some sources
+# block outright (mnpublicnotice does exactly this). The only honest test is
+# the client we will actually use, from the network we will actually use.
+#
+# HOW TO USE
+# ----------
+# Actions -> Probe Source -> Run workflow -> paste the candidate URL.
+# Read the SUMMARY block at the end of the log:
+#
+#   tier 1 passes  -> write a normal httpx scraper
+#   only tier 2    -> httpx is fine, carry the browser headers
+#   only tier 3    -> the source fingerprints TLS; curl_cffi is required.
+#                     That is a deliberate choice to look like a browser --
+#                     check the source's terms before adopting it.
+#   none pass      -> do NOT write the scraper. Playwright (Chromium ships in
+#                     the image), a local residential-IP runner, or ask the
+#                     publisher for a real feed.
+#
+# NO SECRETS ARE PASSED. This job only makes an outbound HTTP request; it
+# never touches Supabase. Keeping credentials out means a probe can be run
+# against any URL without thinking about what it might reach.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: >-
+          Full URL to probe, including https://. Example:
+          https://tableau.minneapolismn.gov/views/Workbook/View.csv
+        required: true
+        type: string
+      impersonate:
+        description: >-
+          curl_cffi browser target for tier 3. "chrome" tracks the newest
+          available. Others: chrome131, safari18_4, chrome131_android.
+        required: false
+        default: chrome
+        type: string
+
+jobs:
+  probe:
+    name: Probe ${{ inputs.url }}
+    runs-on: ubuntu-latest
+    # A probe that hangs is a probe nobody waits for. Three requests at a
+    # 45s client timeout cannot legitimately exceed this.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install HTTP clients only
+        # NOT the full requirements.txt. This job needs two libraries; pulling
+        # playwright, pdfplumber and the rest would add minutes for nothing.
+        # Versions match requirements.txt: httpx is pinned there, curl_cffi is
+        # not (>=0.7.0) -- 0.16.0 was the resolved version on 2026-08-16.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "httpx==0.27.2" "curl_cffi>=0.7.0"
+          python -c "import curl_cffi, httpx; print('curl_cffi', curl_cffi.__version__, '| httpx', httpx.__version__)"
+
+      - name: Probe
+        env:
+          PROBE_URL: ${{ inputs.url }}
+          PROBE_IMPERSONATE: ${{ inputs.impersonate }}
+        # The script always exits 0: a 403 is the finding, not a failure, and
+        # a red X would bury it. Read the log, not the badge.
+        run: python -m scripts.probe_source
