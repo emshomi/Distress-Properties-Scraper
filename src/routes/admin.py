@@ -361,7 +361,7 @@ _HOUSE_NO_RE = re.compile(r"^\s*(\d+)\s")
 # digit and the letters of '1ST', so \bST\b never matches it. Verified, not
 # assumed.
 #
-# NOT YET HANDLED: abbreviated directionals. '8344 Onigum Rd NW' and
+# Abbreviated directionals ARE now handled; see _DIRECTIONALS below. Was:
 # '8344 Onigum Road Northwest' still differ. Canonicalising NORTHWEST -> NW
 # would be safe (it preserves N != S rather than erasing it) but has not been
 # measured, and an unmeasured widening of this rule is how the first version
@@ -374,33 +374,76 @@ _STREET_TYPE_RE = re.compile(
 )
 
 
+# Directionals, mapped to the county's abbreviated form rather than removed.
+#
+# CHANGED 2026-08-16. The previous version left directionals ALONE, on the
+# reasoning that stripping them could silently attach a foreclosure to the
+# wrong house: with '100 Main St N' in the notice and only '100 Main St S' in
+# the spine, deletion yields exactly ONE match and nothing can detect it.
+#
+# That reasoning was right about DELETION and wrong to stop there. Mapping
+# NORTHWEST -> NW is not deletion: it PRESERVES the distinction while
+# reconciling the spelling. 'N' and 'S' still differ; 'NE' and 'NW' still
+# differ. Verified on both pairs before shipping.
+#
+# Measured across the 517 remaining stubs carrying a house number: 257 resolve
+# uniquely under this rule that did not before (19 counties), and ambiguity
+# rises only from 6 to 8 -- and an ambiguous stub is refused by the caller,
+# which requires exactly one distinct match.
+#
+# ORDER MATTERS. Compounds are replaced BEFORE simples, or 'NORTHEAST' is
+# mangled into 'N EAST' by the NORTH rule firing first. Python dicts preserve
+# insertion order, so this literal is the substitution order.
+_DIRECTIONALS = {
+    "NORTHEAST": "NE",
+    "NORTHWEST": "NW",
+    "SOUTHEAST": "SE",
+    "SOUTHWEST": "SW",
+    "NORTH": "N",
+    "SOUTH": "S",
+    "EAST": "E",
+    "WEST": "W",
+}
+
+_DIRECTIONAL_RE = re.compile(
+    r"\b(" + "|".join(_DIRECTIONALS) + r")\b",
+    re.IGNORECASE,
+)
+
+
 def _addr_key(value: Any) -> str:
-    """Comparison key for an address: uppercase alphanumerics with
-    street-type words removed.
+    """Comparison key for an address: uppercase alphanumerics, street-type
+    words removed, directionals canonicalised to their abbreviation.
 
     '315 1st Street South, Brook Park, Minnesota 55007' and
     '315 1st Street South' produce the same key ON PURPOSE -- only the first
     comma segment is ever passed in.
 
-    CHANGED 2026-08-16. Was alphanumerics only, which could not match a
-    notice that spells a street type out against a county that abbreviates
-    it. Found live on Hennepin: the notice read '7345 Ridgeway Road' while
-    core.parcels holds '7345 RIDGEWAY RD' -- '7345RIDGEWAYROAD' vs
-    '7345RIDGEWAYRD', no match, and a synthetic stub would have been minted
-    even though the real parcel was sitting there.
+    CHANGED 2026-08-16 (twice). Originally alphanumerics only, which could
+    not match a notice that spells a street type out against a county that
+    abbreviates it -- found live on Hennepin, where the notice read
+    '7345 Ridgeway Road' against core.parcels' '7345 RIDGEWAY RD'. Street
+    types were normalised first (132 stubs recovered), then directionals
+    (a further 257).
 
-    Measured across the 649 remaining stubs carrying a house number:
-    132 resolve uniquely under this rule and did not before, 6 are ambiguous
-    (genuine duplicate addresses in the spine -- the caller returns None on
-    those, unchanged), 511 have no spine parcel at all.
+    Verified pairs, run before shipping rather than reasoned about:
+        '8344 Onigum Road Northwest' == '8344 ONIGUM RD NW'      -> match
+        '5195 194TH ST W'            == '5195 194th Street West' -> match
+        '1221 1st Avenue Northwest'  == '1221 1ST AVE NW'        -> match
+        '100 Main St N'              vs '100 Main St S'          -> DIFFER
+        '100 Main St NE'             vs '100 Main St NW'         -> DIFFER
 
-    Order matters and mirrors the SQL the measurement used: punctuation
-    becomes a SPACE first (so 'ST.' can be recognised as a word), then street
-    types are dropped, then all whitespace is removed.
+    Order of operations mirrors the SQL the measurement used: punctuation
+    becomes a SPACE first (so 'ST.' is recognisable as a word), then street
+    types are dropped, then directionals are canonicalised, then all
+    whitespace is removed.
     """
-    text = re.sub(r"[^A-Za-z0-9]", " ", str(value or ""))
+    text = re.sub(r"[^A-Za-z0-9]", " ", str(value or "")).upper()
     text = _STREET_TYPE_RE.sub(" ", text)
-    return re.sub(r"\s+", "", text).upper()
+    text = _DIRECTIONAL_RE.sub(
+        lambda m: " " + _DIRECTIONALS[m.group(1).upper()] + " ", text
+    )
+    return re.sub(r"\s+", "", text)
 
 
 def _resolve_spine_parcel_by_address(
