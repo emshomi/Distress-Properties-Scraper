@@ -187,20 +187,64 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
             return value[:10]
         return None
 
+    @staticmethod
+    def _signal_event_date(sig: Any) -> Any:
+        """Get a signal's event date, whether it carries one or projects one.
+
+        FIXED 2026-08-16, hours after source_freshness first shipped.
+
+        The original read `getattr(sig, "event_date", None)` and stopped
+        there. That is right for scrapers whose parse() returns
+        DistressEventInsert, and WRONG for every scraper whose parse()
+        returns a TYPED signal — VbrListingInsert, the vacant-registration
+        models — because those gain their event_date later, inside
+        to_event(), during write().
+
+        Measured the same day: saint_paul_vacant reported
+        source_dated_signals=0 against 384 parsed signals, while
+        signals.distress_events held 384 rows for it with ZERO null
+        event_dates and a newest of 2025-06-30. The dates were always
+        there; this function was looking in the wrong place.
+
+        That silently covered roughly a third of the fleet — saint_paul_vacant,
+        mpls_vbr, and the typed-signal scrapers — every one reporting "no
+        dates" as though it had none. A freshness monitor that omits a third
+        of what it claims to watch is the same failure as the 57 stale digest
+        lines: complete-looking and quietly blind.
+
+        to_event() is called defensively. It is not on every signal type, and
+        on some it may do real work; a failure here must cost nothing, so the
+        signal is simply treated as undated.
+        """
+        direct = getattr(sig, "event_date", None)
+        if direct is not None:
+            return direct
+
+        to_event = getattr(sig, "to_event", None)
+        if callable(to_event):
+            try:
+                return getattr(to_event(), "event_date", None)
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
     def source_freshness(self, signals: list[SIGNAL]) -> dict[str, Any]:
         """Summarise the date range the SOURCE served on this run.
 
-        Reads `event_date` off each parsed signal. Signals without one — the
-        parcel loaders, which carry no event date at all — yield nulls, which
-        is honest: those sources have no freshness signal to report and must
-        be judged some other way.
+        Reads each signal's event date via _signal_event_date, which handles
+        both the direct attribute and the to_event() projection — see there
+        for why the direct read alone was not enough.
+
+        Signals with no date either way — the parcel loaders, which carry no
+        event date at all — yield nulls, which is honest: those sources have
+        no freshness signal to report and must be judged some other way.
 
         Override in a subclass whose signal type dates itself differently.
         Must never raise; the caller guards it as well, belt and braces.
         """
         dates: list[str] = []
         for sig in signals:
-            d = self._to_date_str(getattr(sig, "event_date", None))
+            d = self._to_date_str(self._signal_event_date(sig))
             if d:
                 dates.append(d)
 
