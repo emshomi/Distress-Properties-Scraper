@@ -15,9 +15,47 @@ The base class provides the run() lifecycle:
      threads so the synchronous write path cannot block the API event loop.
   3. Open audit.scraper_runs row
   4. Call fetch() → parse() → write()
-  5. Close the run with final counts
-  6. Update source_health
-  7. Release the lock
+  5. Record SOURCE FRESHNESS from what the source actually served
+  6. Close the run with final counts
+  7. Update source_health
+  8. Release the lock
+
+=== SOURCE FRESHNESS (step 5, added 2026-08-16) ===
+Everything else in this file answers "did the scraper run?". None of it
+answers "is the source still producing?" — and on 2026-08-16 six sources
+were found frozen while reporting HEALTHY in every daily digest, three of
+them for over a year (mpls_vbr 653 days, hennepin_tax_roll 592,
+saint_paul_vacant 412).
+
+Three measures were tried against the events table and all three failed:
+
+  event_date gap analysis   — broken by registry sources, where event_date
+                              is a historical attribute, not a publication
+                              date. mpls_vbr's records start in 1998, so
+                              its largest "gap" is 4,929 days and a 653-day
+                              silence scores as normal.
+  records_new               — counts write calls that did not raise, not
+                              rows changed. mpls_vbr reports 311 new every
+                              run against a table holding 311 rows total.
+  observed_at               — records when WE last touched a row. The VBR
+                              cleanup on 2026-08-07 rewrote all 311 rows
+                              and reset the signal on a source that has
+                              published nothing since 2024.
+
+Every measure derived from our own table is contaminated by our own writes.
+The one thing that is not is the SOURCE'S OWN CONTENT. So this records the
+newest date present in what the source served on THIS run, per run, into
+audit.scraper_runs.metadata.
+
+A frozen source is then one whose source_max_date STOPS MOVING across runs.
+No migration of ours can touch that number, because it is computed from the
+fetched payload and never read back from the database. dakota_sheriff has
+served a maximum of 2026-05-28 since May; hennepin_sheriff's advances every
+few days. That difference is the signal.
+
+Failure here must NEVER fail a scrape: a monitoring feature that can break
+the fleet is worse than no monitoring. The whole block is wrapped, and on
+any error the run proceeds exactly as it did before.
 """
 
 from __future__ import annotations
@@ -26,7 +64,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, ClassVar, Generic, TypeVar
 
 from src.config import settings
@@ -134,6 +172,54 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
         Returns (records_new, records_updated, records_failed).
         """
 
+    # ----- SOURCE FRESHNESS -----
+
+    @staticmethod
+    def _to_date_str(value: Any) -> str | None:
+        """Coerce a date/datetime/ISO-string to a plain YYYY-MM-DD string."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, str) and len(value) >= 10:
+            return value[:10]
+        return None
+
+    def source_freshness(self, signals: list[SIGNAL]) -> dict[str, Any]:
+        """Summarise the date range the SOURCE served on this run.
+
+        Reads `event_date` off each parsed signal. Signals without one — the
+        parcel loaders, which carry no event date at all — yield nulls, which
+        is honest: those sources have no freshness signal to report and must
+        be judged some other way.
+
+        Override in a subclass whose signal type dates itself differently.
+        Must never raise; the caller guards it as well, belt and braces.
+        """
+        dates: list[str] = []
+        for sig in signals:
+            d = self._to_date_str(getattr(sig, "event_date", None))
+            if d:
+                dates.append(d)
+
+        if not dates:
+            return {
+                "source_max_date": None,
+                "source_min_date": None,
+                "source_dated_signals": 0,
+                "source_signals_parsed": len(signals),
+            }
+
+        return {
+            # ISO strings sort lexicographically, so min/max are correct.
+            "source_max_date": max(dates),
+            "source_min_date": min(dates),
+            "source_dated_signals": len(dates),
+            "source_signals_parsed": len(signals),
+        }
+
     # ----- LIFECYCLE -----
 
     async def run(
@@ -202,6 +288,7 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
             run_id=run_id,
         )
 
+        signals: list[SIGNAL] = []
         records_fetched = 0
         records_new = 0
         records_updated = 0
@@ -252,7 +339,33 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
                 error_type=type(e).__name__,
             )
 
-        # 8. Close audit run
+        # 8. Source freshness — see the module docstring for why this exists
+        #    and why it is computed from the PARSED SIGNALS rather than from
+        #    anything already in the database.
+        #
+        #    Guarded in its own try/except and deliberately placed AFTER the
+        #    main try block: this is monitoring, and monitoring must not be
+        #    able to fail a scrape. On any error the run reports exactly what
+        #    it would have reported before this existed.
+        final_metadata = dict(run_metadata)
+        try:
+            final_metadata.update(self.source_freshness(signals))
+        except Exception as freshness_error:  # noqa: BLE001
+            logger.warning(
+                "Source freshness capture failed — run unaffected",
+                scraper=self.source_name,
+                run_id=run_id,
+                error_type=type(freshness_error).__name__,
+                error=str(freshness_error),
+            )
+
+        # 9. Close audit run
+        #
+        #    final_metadata carries the ORIGINAL run_metadata keys as well as
+        #    the freshness ones. finish_run writes the metadata column whole,
+        #    so passing only the new keys would erase `trigger` and
+        #    `trigger_source` — and those are what proved the ramsey_parcels
+        #    collision on 2026-08-01 came from two GitHub Actions runners.
         duration = time.monotonic() - start_time
 
         if run_id is not None:
@@ -265,9 +378,10 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
                 records_failed=records_failed,
                 error_message=error_message,
                 duration_seconds=duration,
+                metadata=final_metadata,
             )
 
-        # 9. Update source health
+        # 10. Update source health
         if status == "success":
             source_health_tracker.record_success(self.source_name)
         elif status == "partial":
@@ -283,6 +397,7 @@ class BaseScraper(ABC, Generic[RAW, SIGNAL]):
             records_new=records_new,
             records_updated=records_updated,
             records_failed=records_failed,
+            source_max_date=final_metadata.get("source_max_date"),
         )
 
         return RunResult(
