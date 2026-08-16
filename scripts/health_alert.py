@@ -199,6 +199,21 @@ def _classify(row: dict) -> tuple[str, str]:
         if notes_lc.startswith("all ") and "failed" in notes_lc:
             return "broken", f"total write failure: {notes[:100]}"
         # Fractional drop -- only broken if a large fraction failed.
+        #
+        # THE SUB-THRESHOLD EXIT IS LOAD-BEARING (2026-08-16). Before it, a
+        # small drop fell past this test, past the error signatures (which
+        # deliberately exclude the bare word "failed"), and landed on the
+        # catch-all `return "broken"` at the bottom of this branch. That was
+        # harmless only because record_partial() stamped a partial run as a
+        # clean SUCCESS, so no partial ever reached here at all.
+        #
+        # Once record_partial stops claiming success -- the next change, and
+        # the reason this one ships first -- every partial DOES reach here.
+        # parcel_enrich_mngeo has 10 partial runs at 0.2% (15 of 6,223); a
+        # daily scraper would have gone BROKEN on a fifteen-record drop.
+        #
+        # A minor drop is real and worth seeing, so it reports as "check"
+        # rather than vanishing into "healthy". One line, not an alarm.
         m = re.search(r"(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+records failed", notes_lc)
         if m:
             n = int(m.group(1).replace(",", ""))
@@ -206,6 +221,10 @@ def _classify(row: dict) -> tuple[str, str]:
             frac = n / total
             if frac > _MINOR_DROP_FRACTION:
                 return "broken", f"{n}/{total} records failed ({frac:.0%})"
+            return "check", (
+                f"last run dropped {n} of {total} records ({frac:.1%}) — "
+                f"under the {_MINOR_DROP_FRACTION:.0%} threshold"
+            )
         # Error signatures.
         for sig in _ERROR_SIGNATURES:
             if sig in notes_lc:
