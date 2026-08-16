@@ -1,99 +1,130 @@
 """
 Minneapolis Vacant Building Registration (VBR) + Condemned scraper.
 
-Source: the CITY OF MINNEAPOLIS's own ArcGIS org (`afSMGVsC7QlRK1kZ`),
-service `VBR_October2025`, layer 0 (`VBR_Oct2025_Geocoded`).
+Source: the City of Minneapolis's own Tableau Server, the same list the City
+publishes to residents on the Vacant & Condemned Property Dashboard.
 
-    https://services.arcgis.com/afSMGVsC7QlRK1kZ/ArcGIS/rest/services/VBR_October2025/FeatureServer/0
+    https://tableau.minneapolismn.gov/views/MinneapolisVacantCondemnedPropertyInventory/DailyVBRcondemnedpropertylist.csv
 
-=== SOURCE CHANGED 2026-08-07 — READ THIS BEFORE TOUCHING THE URL ===
-This scraper previously read a GreenInfoNetwork-hosted copy
-(`services1.arcgis.com/4ZKi1B1zTblbwgWB/.../VBR_MPLS/FeatureServer/0`)
-described in its own docstring as "a COMPLETE SNAPSHOT ... as of roughly
-early-to-mid 2023," with only ~11 of 309 records carrying a 2024+ date. That
-docstring also claimed the live registry was "subscription-locked — pursue
-via an open-data / MGDPA request to the City."
+=== SOURCE CHANGED 2026-08-16 — READ THIS BEFORE TOUCHING THE URL ===
+This scraper previously read the City ArcGIS service
+`services.arcgis.com/afSMGVsC7QlRK1kZ/.../VBR_October2025/FeatureServer/0`,
+adopted 2026-08-07 on the strength of `hasStaticData: false` and a
+`dataLastEditDate` of 2025-10-22.
 
-**It was not locked.** The City publishes it directly. Verified 2026-08-07:
-`hasStaticData: false`, `dataLastEditDate` 2025-10-22, 311 records.
+**That service reports itself live and is not.** Measured 2026-08-16 from
+signals.vacant_registrations: 311 rows, newest `date_entered_registry`
+2024-10-31 — twenty-one months stale. The City's own published list on the
+same day held **414 rows, newest 2026-08-12**. The 08-07 change moved from a
+2023 snapshot to a 2024 one. `hasStaticData` is a claim about the service,
+not a measurement of the data in it; check the newest RECORD, not the flag.
 
-**The reason for the switch is NOT the record count** — 311 vs 309 is
-essentially the same population. It is these two fields:
+Endpoint stability was verified before adopting it: two pulls an hour apart
+returned byte-identical files (md5 ede44fdf82a53e95f7b3dbb1f23f88c7, 33,881
+bytes, 415 lines) with no browser session in between.
 
-    USER_Day_of_Con1_Date   condemnation date
-    USER_Day_of_RA_Date     raze / demolition order date
+=== WHY A CSV AND NOT AN API ===
+Minneapolis retired its machine-readable publication of this registry. The
+data now lives only behind Tableau, and the platform moved to MinneapolisData
+(data.minneapolismn.gov) on 2026-08-13. The catalog there lists the vacant
+registry as a Hub Page wrapping this dashboard — Feature Service (0), Map
+Service (0). Tableau Server's `.csv` view export is the only machine-readable
+door, and it is unauthenticated.
 
-**49 of 311 records carry one or both** (measured 2026-08-07). Govire had
-ZERO condemnation and ZERO demolition signals before this change. The old
-feed exposed `Day_of_RA` and this scraper never read it — the field appeared
-only in the docstring.
+The City's Regulatory Services VIOLATIONS feed is behind the same wall and is
+NOT solved: `/views/OpenDataRegulatoryServices-Violations/ViolationDetails.csv`
+returns a single aggregate (`Number of Records`), `/vudcsv/` 404s server-wide,
+and `PropertySearch.csv?Address=<addr>` returns a per-address COUNT only
+(verified: 167 for 2309 HAYES ST NE, matching the dashboard). Row-level
+violations need a request to MapIT Minneapolis, not another URL variant.
 
-Two sibling services promised the same content and are BOTH DEAD, do not
-revisit them:
-  * `Condemned_by_Boarding`      hasStaticData: true, last edit 2016-04-08
-  * `PropertiesDueForWrecking`   a 2020 geocoding artifact, no parcel id
+=== TWO FIELD MISREADINGS FIXED HERE ===
+The City's own legend, printed on the VBR Properties view:
 
-**Check `hasStaticData` and `dataLastEditDate` before trusting ANY service on
-this org.** Most of its ~700 services are one-off analyst uploads, not
-maintained feeds. Three were rejected on that basis in one session.
+    VBR  - Date entered in the Vacant Building Registration program.
+           If no condemned date the building is vacant but not condemned.
+    CONB - Date the building was condemned for BEING BOARDED.
+    CON1 - Date the building was condemned for LACK OF MAINTENANCE.
+    RA   - Date the RESTORATION AGREEMENT was signed.
 
-=== WHAT WAS LOST IN THE SWITCH (accept knowingly) ===
-The old feed had a free-text `Property_s` status ("Vacant+Restoration
-Agreement", "Boarded", "Condemned") which drove a `boarded` flag. The new
-service has NO status field. `boarded` can no longer be determined and is
-always False. Condemnation is now derived from a DATE being present, which is
-more reliable than string-matching "board"/"condemn" in free text.
+1. **RA is a Restoration Agreement, not a raze order.** The previous
+   docstring called `USER_Day_of_RA_Date` the "raze / demolition order date"
+   and classified those properties as `condemned=True`, registry_type
+   "Raze Order Issued". A Restoration Agreement is the owner COMMITTING TO
+   REPAIR — the opposite signal — and because raze outranked condemnation in
+   the old severity ladder it overwrote the property's real status. Two
+   Hennepin rows carried that label on 2026-08-16. This CSV does not publish
+   RA at all, so the misreading has no input here; it is recorded so nobody
+   reintroduces it from another source.
 
-The old feed also carried `Owner_Addr` (owner mailing address, an
-absentee-owner signal). The new service has no equivalent. Owner NAME is
-still present as `USER_Full_Name`.
+2. **`boarded` IS determinable — it is CONB.** The previous docstring said
+   "boarded can no longer be determined and is always False. Do not infer
+   it." CONB is the City's own field for condemned-for-being-boarded. 117 of
+   311 rows carried a CONB date while every one of them reported
+   `boarded = false`, against a boarded_building event type holding 9,990
+   rows from other sources and zero from Minneapolis.
 
-=== FIELDS ON THE NEW SERVICE ===
-    USER_APN                 12-digit Hennepin PID (normalizer pads to 13)
-    USER_Display             property street address
-    USER_Full_Name           owner name
-    USER_Day_of_VBR_Date     date entered VBR registry, e.g. "12/8/2023"
-    USER_Day_of_Con1_Date    condemnation date (often "")
-    USER_Day_of_Conb_Date    secondary condemnation date (often "")
-    USER_Day_of_RA_Date      raze / demolition order date (often "")
-    USER_Wards               city council ward
-    USER_Neighborhoods_Desc  neighborhood name
-    Match_addr / StAddr      geocoder output (fallbacks for address)
+=== COLUMNS ON THE CSV ===
+    Address           property street address
+    APN               Hennepin PID — 12 OR 13 chars (see below)
+    blank             junk column, trailing space in the header, ignored
+    CON1              condemned for lack of maintenance, "" when absent
+    CONB              condemned for being boarded, "" when absent
+    Neighborhood      neighborhood name
+    Property Owner    owner name
+    VBR Date          date entered the registry, populated on all 414 rows
+    Ward              city council ward
 
-All USER_* date fields are STRINGS in `%m/%d/%Y` form, and are `""` rather
-than null when absent. `_parse_text_date` handles both.
+Dates are `%m/%d/%y` — TWO-DIGIT years ("08/12/26"). Python maps 00-68 to
+2000-2068, which covers the observed range (2006-12-12 .. 2026-08-12).
 
-There are NO Latitude/Longitude attribute fields. The layer's native spatial
-reference is `wkid 103734` (Minnesota county coords, in FEET) — but
-`BaseArcGISScraper._fetch_page` always sends `outSR=4326`, so
-`feature.geometry` comes back as WGS84 lat/lng. Coordinates therefore come
-from geometry ONLY. The Minnesota sanity bounds below are the backstop: if
-outSR handling ever changes, coords become NULL rather than storing 500000ft
-as a latitude.
+**PARSE BY COLUMN NAME, NEVER BY POSITION.** The CSV alphabetises its columns
+and the dashboard does not, so the two disagree on order. The header also
+carries a junk `blank ` column with a trailing space.
+
+**THE CSV DROPS LEADING ZEROS ON THE APN.** 155 of 414 come back 12 chars
+against 13 in the dashboard's own Excel export. Zero-padding the CSV values
+reconciles the two sets exactly — 0 differences in either direction. The
+normalizer's 12-to-13 left-pad (fixed 2026-07-08) is what makes this endpoint
+safe to use; without it 155 properties would take synthetic ids.
+
+=== NO COORDINATES ===
+The CSV carries no geometry. That is acceptable because core.parcels holds
+448,087 Hennepin parcels with coordinates and parcel_resolver fills in rather
+than overwrites: 20 of 20 sampled APNs from this CSV were already present
+WITH coordinates on 2026-08-16. A property genuinely absent from the spine
+gets a parcel row without lat/lng rather than a wrong one.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, ClassVar
 
+import httpx
+
+from src.config import settings
 from src.models.parcel import ParcelUpsert
 from src.models.signal import VbrListingInsert
-from src.scrapers.base_arcgis_scraper import BaseArcGISScraper
+from src.scrapers.base_scraper import BaseScraper
 from src.services.event_writer import (
     write_events_dedup,
     write_typed_signals_dedup,
 )
 from src.services.parcel_resolver import resolve_parcel
+from src.utils.errors import ParseError, SourceUnavailableError
 from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
 from src.utils.logger import logger
 
 
-# ----- City of Minneapolis VBR feature service (layer 0) -----
-_FEATURE_SERVICE_URL = (
-    "https://services.arcgis.com/afSMGVsC7QlRK1kZ"
-    "/ArcGIS/rest/services/VBR_October2025/FeatureServer/0"
+# ----- City of Minneapolis Tableau view, CSV export -----
+_CSV_URL = (
+    "https://tableau.minneapolismn.gov/views"
+    "/MinneapolisVacantCondemnedPropertyInventory"
+    "/DailyVBRcondemnedpropertylist.csv"
 )
 
 # Minneapolis VBR annual fee (2024+ schedule). Applied to active registrations.
@@ -101,22 +132,45 @@ _VBR_ANNUAL_FEE = Decimal("7228.70")
 # Prolonged Vacancy Enforcement monthly citation (post-2-year vacancy).
 _PVE_MONTHLY_FINE = Decimal("2000.00")
 
-# The USER_* date fields arrive as "12/8/2023". The long-form month-name
-# formats are retained from the old feed in case the City changes shape.
-_DATE_FORMATS = ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y")
+# The CSV uses two-digit years. The long forms are kept as a cheap hedge
+# against the City changing the view's date formatting.
+_DATE_FORMATS = (
+    "%m/%d/%y", "%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y",
+)
+
+# Header names as the CSV emits them. Read by NAME; see the docstring.
+_COL_ADDRESS = "Address"
+_COL_APN = "APN"
+_COL_CON1 = "CON1"
+_COL_CONB = "CONB"
+_COL_NEIGHBORHOOD = "Neighborhood"
+_COL_OWNER = "Property Owner"
+_COL_VBR_DATE = "VBR Date"
+_COL_WARD = "Ward"
+
+# Every column the parse depends on. A missing one means the City changed the
+# view, and continuing would write hundreds of half-empty rows that look like
+# real records. Fail the run instead.
+_REQUIRED_COLUMNS = (
+    _COL_ADDRESS, _COL_APN, _COL_CON1, _COL_CONB, _COL_VBR_DATE,
+)
 
 
-def _parse_text_date(raw: Any) -> date | None:
-    """Parse the source's string dates ("12/8/2023") into a date.
-
-    Returns None for blanks, whitespace-only, or unparseable values. The new
-    service uses EMPTY STRINGS rather than nulls for absent dates, which this
-    handles via the `if not s` guard.
-    """
+def _clean(raw: Any) -> str | None:
+    """Trim to a non-empty string, or None. The CSV uses "" for absent."""
     if raw is None:
         return None
     s = str(raw).strip()
-    if not s:
+    return s or None
+
+
+def _parse_text_date(raw: Any) -> date | None:
+    """Parse the CSV's string dates ("08/12/26") into a date.
+
+    Returns None for blanks, whitespace-only, or unparseable values.
+    """
+    s = _clean(raw)
+    if s is None:
         return None
     for fmt in _DATE_FORMATS:
         try:
@@ -126,124 +180,152 @@ def _parse_text_date(raw: Any) -> date | None:
     return None
 
 
-def _classify_from_dates(
-    condemned_date: date | None,
-    raze_date: date | None,
-) -> tuple[bool, bool, str]:
-    """Derive (boarded, condemned, label) from the presence of dates.
+class MplsVacantBuildingScraper(BaseScraper[dict[str, Any], VbrListingInsert]):
+    """Minneapolis VBR + condemned buildings — City of Minneapolis CSV source."""
 
-    The City's service has NO status text field, so classification is by date
-    presence. This is MORE reliable than the old free-text matching: a date
-    is unambiguous, whereas "Vacant+Restoration Agreement" required guessing.
-
-    `boarded` is always False — the new service carries nothing that
-    identifies a boarded-but-not-condemned property. Do not infer it.
-
-    Severity order matters: a raze order supersedes a condemnation, because
-    the City has moved from "you cannot occupy this" to "this is coming down."
-    """
-    if raze_date is not None:
-        return False, True, "Raze Order Issued"
-    if condemned_date is not None:
-        return False, True, "Condemned"
-    return False, False, "Registered Vacant"
-
-
-class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
-    """Minneapolis VBR + condemned buildings — City of Minneapolis source."""
-
-    # ---- Required class config ----
     source_name: ClassVar[str] = "mpls_vbr"
     signal_type: ClassVar[str] = "vbr_listing"
     county_code: ClassVar[str] = "hennepin"  # Minneapolis is in Hennepin County
-    feature_service_url: ClassVar[str] = _FEATURE_SERVICE_URL
 
-    # This layer's object-id field is "ObjectID", not the "OBJECTID" default.
-    # Only consulted by keyset pagination (unused here at 311 records), but
-    # wrong values are a trap for whoever enables it later.
-    objectid_field: ClassVar[str] = "ObjectID"
+    # ---- Fetch ----
 
-    # All ~311 records are relevant.
-    where_clause: ClassVar[str] = "1=1"
+    async def fetch(self, trigger: str) -> list[dict[str, Any]]:
+        """Download the City's VBR list and return it as dict rows."""
+        try:
+            async with httpx.AsyncClient(
+                timeout=settings.scraper_request_timeout_seconds,
+                follow_redirects=True,
+                headers={"User-Agent": "DistressProperties/1.0"},
+            ) as client:
+                resp = await client.get(_CSV_URL)
+        except httpx.HTTPError as e:
+            raise SourceUnavailableError(
+                f"Minneapolis VBR CSV request failed: {e}",
+                source=self.source_name,
+            ) from e
 
-    # Coordinates come from geometry ONLY — this service has no lat/lng
-    # attribute fields. The base class requests outSR=4326.
-    return_geometry: ClassVar[bool] = True
+        if resp.status_code != 200:
+            raise SourceUnavailableError(
+                f"Minneapolis VBR CSV returned {resp.status_code}",
+                source=self.source_name,
+                context={"body": resp.text[:300]},
+            )
 
-    # ---- Feature parsing ----
+        # utf-8-sig: Tableau prefixes a BOM, which would otherwise become part
+        # of the first header name and break the Address lookup silently.
+        text = resp.content.decode("utf-8-sig", errors="replace")
+        rows = list(csv.DictReader(io.StringIO(text)))
 
-    async def parse_feature(
-        self,
-        attributes: dict[str, Any],
-        geometry: dict[str, Any] | None,
-    ) -> VbrListingInsert | None:
-        """Convert one VBR feature into a VbrListingInsert signal."""
-        address = (
-            attributes.get("USER_Display")
-            or attributes.get("Match_addr")
-            or attributes.get("StAddr")
+        if not rows:
+            raise ParseError(
+                "Minneapolis VBR CSV contained no rows",
+                source=self.source_name,
+            )
+
+        missing = [c for c in _REQUIRED_COLUMNS if c not in (rows[0] or {})]
+        if missing:
+            raise ParseError(
+                f"Minneapolis VBR CSV is missing required columns: {missing}",
+                source=self.source_name,
+                context={"headers": list((rows[0] or {}).keys())},
+            )
+
+        logger.info(
+            "Minneapolis VBR fetch complete",
+            source=self.source_name,
+            rows=len(rows),
+            headers=list((rows[0] or {}).keys()),
         )
-        if not address or not str(address).strip():
-            # No address → not actionable as a property lead; skip silently.
+        return rows
+
+    # ---- Parse ----
+
+    async def parse(
+        self, raw_records: list[dict[str, Any]]
+    ) -> list[VbrListingInsert]:
+        """Convert CSV rows into VbrListingInsert signals."""
+        signals: list[VbrListingInsert] = []
+        skipped_no_address = 0
+        skipped_no_apn = 0
+        skipped_no_vbr_date = 0
+
+        for row in raw_records:
+            sig = self._parse_row(row)
+            if sig is not None:
+                signals.append(sig)
+                continue
+            # Cheap re-check purely for the counters; _parse_row logs nothing
+            # per row because 414 warnings would drown the run log.
+            if _clean(row.get(_COL_ADDRESS)) is None:
+                skipped_no_address += 1
+            elif _clean(row.get(_COL_APN)) is None:
+                skipped_no_apn += 1
+            else:
+                skipped_no_vbr_date += 1
+
+        logger.info(
+            "Minneapolis VBR parsed",
+            source=self.source_name,
+            signals=len(signals),
+            skipped_no_address=skipped_no_address,
+            skipped_no_apn=skipped_no_apn,
+            skipped_no_vbr_date=skipped_no_vbr_date,
+        )
+        return signals
+
+    def _parse_row(self, row: dict[str, Any]) -> VbrListingInsert | None:
+        """One CSV row to one signal, or None when it is not usable."""
+        address = _clean(row.get(_COL_ADDRESS))
+        if address is None:
             return None
 
         # --- Parcel ID ---
-        # USER_APN is a 12-digit Hennepin PID (e.g. "102824110109"). The
-        # normalizer left-pads to 13 — Hennepin PIDs legitimately begin with 0
-        # for section numbers 01-09, so a 12-digit input is unambiguous.
-        # Verified against 117 of 118 rows on the previous feed.
-        parcel_id: str | None = None
-        raw_apn = attributes.get("USER_APN")
-        if raw_apn and str(raw_apn).strip():
-            pid, _err = safe_normalize_parcel_id("hennepin", str(raw_apn))
-            if pid is not None:
-                parcel_id = pid
-
+        # The CSV drops leading zeros on 155 of 414 APNs; the normalizer
+        # left-pads 12 to 13. NO SYNTHETIC FALLBACK: the 2026-07-09 session
+        # spent itself deleting 118 MPLS-VBR-* synthetic ids and the rows they
+        # spawned across three tables. A row without a usable APN is skipped.
+        raw_apn = _clean(row.get(_COL_APN))
+        if raw_apn is None:
+            return None
+        parcel_id, _err = safe_normalize_parcel_id("hennepin", raw_apn)
         if parcel_id is None:
-            oid = attributes.get("ObjectID")
-            parcel_id = f"MPLS-VBR-{oid}" if oid is not None else None
-            if parcel_id is None:
-                return None
+            return None
 
         # --- Dates ---
-        vbr_date = _parse_text_date(attributes.get("USER_Day_of_VBR_Date"))
-        con1_date = _parse_text_date(attributes.get("USER_Day_of_Con1_Date"))
-        conb_date = _parse_text_date(attributes.get("USER_Day_of_Conb_Date"))
-        raze_date = _parse_text_date(attributes.get("USER_Day_of_RA_Date"))
+        vbr_date = _parse_text_date(row.get(_COL_VBR_DATE))
+        con1_date = _parse_text_date(row.get(_COL_CON1))
+        conb_date = _parse_text_date(row.get(_COL_CONB))
 
-        # Either condemnation field counts; take the earlier one when both are
-        # present, since that is when the property actually became condemned.
+        # date_entered_registry is the third column of the dedup index
+        # (county_code, parcel_id, date_entered_registry). It is NULLS NOT
+        # DISTINCT, so a NULL row dedups only against other NULL rows and
+        # never matches the real row for the same property. All 414 rows
+        # carry a VBR Date; a row without one is a shape change, so skip it.
+        if vbr_date is None:
+            return None
+
+        # Either condemnation counts; take the earlier, which is when the
+        # property actually became condemned.
         con_candidates = [d for d in (con1_date, conb_date) if d is not None]
         con_date = min(con_candidates) if con_candidates else None
 
-        # --- Status classification (by date presence — see docstring) ---
-        boarded, condemned, label = _classify_from_dates(con_date, raze_date)
+        # CONB is the City's own "condemned for being boarded" — see the
+        # docstring. This is the field the previous source read as absent.
+        boarded = conb_date is not None
+        condemned = con_date is not None
+        label = "Condemned" if condemned else "Registered Vacant"
 
         # --- Years on registry + PVE eligibility (>= 2 yrs vacant) ---
         years_on_registry: float | None = None
         monthly_pve: Decimal | None = None
-        if vbr_date is not None:
-            days = (date.today() - vbr_date).days
-            if days >= 0:
-                years_on_registry = round(days / 365.25, 1)
-                if years_on_registry >= 2.0:
-                    monthly_pve = _PVE_MONTHLY_FINE
+        days = (date.today() - vbr_date).days
+        if days >= 0:
+            years_on_registry = round(days / 365.25, 1)
+            if years_on_registry >= 2.0:
+                monthly_pve = _PVE_MONTHLY_FINE
 
         return VbrListingInsert(
             parcel_id=parcel_id,
-            # ADDED 2026-08-10. VbrListingInsert gained an optional
-            # county_code field the same day; to_event() now projects it into
-            # signals.distress_events, where the composite FK
-            # (county_code, parcel_id) -> core.parcels and the dedup key
-            # (county_code, parcel_id, event_type, event_date, source) BOTH
-            # need it. A NULL leaves both unenforced -- NULL is never equal
-            # to anything -- so the event points at no parcel and cannot
-            # collide with a duplicate.
-            #
-            # Note the write() step below already sets county_code on the
-            # TYPED signals.vbr_listings rows (see the ClassVar comment
-            # there); this is the same value on the EVENT projection, which
-            # was missed.
             county_code=self.county_code,
             city="Minneapolis",
             registry_type=label,
@@ -253,31 +335,21 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             monthly_pve_fine=monthly_pve,
             is_active=True,
             raw_data={
-                "attributes": attributes,
-                "geometry": geometry,
-                "owner_name": str(attributes.get("USER_Full_Name") or "").strip()
-                or None,
-                "neighborhood": str(
-                    attributes.get("USER_Neighborhoods_Desc") or ""
-                ).strip()
-                or None,
-                "ward": str(attributes.get("USER_Wards") or "").strip() or None,
-                # Explicit escalation dates. These are the whole reason this
-                # scraper moved to the City's own service — 49 of 311 records
-                # carry at least one of them.
+                "attributes": dict(row),
+                "geometry": None,  # CSV carries none; see the docstring
+                "owner_name": _clean(row.get(_COL_OWNER)),
+                "neighborhood": _clean(row.get(_COL_NEIGHBORHOOD)),
+                "ward": _clean(row.get(_COL_WARD)),
                 "condemned_date": con_date.isoformat() if con_date else None,
                 "condemned_date_con1": con1_date.isoformat() if con1_date else None,
                 "condemned_date_conb": conb_date.isoformat() if conb_date else None,
-                "raze_order_date": raze_date.isoformat() if raze_date else None,
+                # raze_order_date is deliberately absent. The field the old
+                # source called a raze order was the Restoration Agreement.
                 "_source": self.source_name,
-                "_data_vintage": "city_vbr_october2025",
+                "_data_vintage": "city_tableau_daily_vbr",
             },
             observed_at=datetime.now(timezone.utc),
             source=self.source_name,
-            # Stable identity: the parcel id (or the MPLS-VBR-{oid} synthetic
-            # when no APN exists). Never use a row index as source_id — on the
-            # old feed FID was a layer ROW INDEX and gave 12 ids shared across
-            # 480 duplicate rows.
             registration_number=parcel_id,
             boarded=boarded,
             condemned=condemned,
