@@ -342,14 +342,65 @@ _ADDR_LIST_RE = re.compile(r";|\s&\s|\band\b", re.IGNORECASE)
 _HOUSE_NO_RE = re.compile(r"^\s*(\d+)\s")
 
 
+# Street-type words, in BOTH the spelled-out and abbreviated form a notice or
+# an assessor may use. Removed from BOTH sides before comparison, so
+# 'Ridgeway Road' and 'RIDGEWAY RD' compare equal.
+#
+# DIRECTIONALS ARE DELIBERATELY ABSENT. Stripping N/S/E/W was measured
+# 2026-08-16 and is not worth what it costs. An ambiguity this code can SEE
+# (two spine parcels matching one stub) is already handled -- the caller
+# requires exactly one match and returns None otherwise. The dangerous case is
+# invisible: if a notice reads '100 Main St N' and the spine holds only
+# '100 Main St S', collapsing the directional yields EXACTLY ONE match, the
+# WRONG house, and nothing can detect it. Minnesota addressing leans on
+# directionals (Minneapolis is built on NE/NW/SE/SW quadrants).
+#
+# 'Road' and 'Rd' name the same street. 'N' and 'S' name different streets.
+#
+# \b cannot fire inside an ordinal: there is no word boundary between the
+# digit and the letters of '1ST', so \bST\b never matches it. Verified, not
+# assumed.
+#
+# NOT YET HANDLED: abbreviated directionals. '8344 Onigum Rd NW' and
+# '8344 Onigum Road Northwest' still differ. Canonicalising NORTHWEST -> NW
+# would be safe (it preserves N != S rather than erasing it) but has not been
+# measured, and an unmeasured widening of this rule is how the first version
+# of it shipped broken.
+_STREET_TYPE_RE = re.compile(
+    r"\b(?:ROAD|RD|STREET|ST|AVENUE|AVE|DRIVE|DR|LANE|LN|COURT|CT"
+    r"|BOULEVARD|BLVD|PLACE|PL|CIRCLE|CIR|TERRACE|TER|PARKWAY|PKWY"
+    r"|HIGHWAY|HWY|TRAIL|TRL|PATH|WAY)\b",
+    re.IGNORECASE,
+)
+
+
 def _addr_key(value: Any) -> str:
-    """Uppercase alphanumerics only, for address comparison.
+    """Comparison key for an address: uppercase alphanumerics with
+    street-type words removed.
 
     '315 1st Street South, Brook Park, Minnesota 55007' and
-    '315 1st Street South' normalise differently ON PURPOSE -- only the first
-    comma segment is passed in, so both arrive as '3151STSTREETSOUTH'.
+    '315 1st Street South' produce the same key ON PURPOSE -- only the first
+    comma segment is ever passed in.
+
+    CHANGED 2026-08-16. Was alphanumerics only, which could not match a
+    notice that spells a street type out against a county that abbreviates
+    it. Found live on Hennepin: the notice read '7345 Ridgeway Road' while
+    core.parcels holds '7345 RIDGEWAY RD' -- '7345RIDGEWAYROAD' vs
+    '7345RIDGEWAYRD', no match, and a synthetic stub would have been minted
+    even though the real parcel was sitting there.
+
+    Measured across the 649 remaining stubs carrying a house number:
+    132 resolve uniquely under this rule and did not before, 6 are ambiguous
+    (genuine duplicate addresses in the spine -- the caller returns None on
+    those, unchanged), 511 have no spine parcel at all.
+
+    Order matters and mirrors the SQL the measurement used: punctuation
+    becomes a SPACE first (so 'ST.' can be recognised as a word), then street
+    types are dropped, then all whitespace is removed.
     """
-    return re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
+    text = re.sub(r"[^A-Za-z0-9]", " ", str(value or ""))
+    text = _STREET_TYPE_RE.sub(" ", text)
+    return re.sub(r"\s+", "", text).upper()
 
 
 def _resolve_spine_parcel_by_address(
