@@ -17,6 +17,7 @@ Routes:
 from __future__ import annotations
 
 import os
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
@@ -321,11 +322,114 @@ def _resolve_spine_parcel(extracted: dict[str, Any]) -> Optional[dict[str, Any]]
         )
         return None
     rows = hit.data or []
-    if len(rows) != 1:
-        # 0 = not in the spine (beltrami and redwood have NO spine at all).
-        # 2+ = ambiguous within one county; never guess.
+    if len(rows) == 1:
+        return rows[0]
+    # 0 = digits did not match. 2+ = ambiguous within one county; never guess.
+    # Ambiguity is fatal, but a MISS gets one more attempt, by address.
+    if len(rows) > 1:
         return None
-    return rows[0]
+    return _resolve_spine_parcel_by_address(county_code, extracted)
+
+
+# Address text that is a LIST rather than one property. A package notice's
+# property_address is every address the notice covers -- twelve of them for
+# washington 26-003536FC -- and resolving a member against that list would
+# attach a foreclosure to somebody else's house. Detected, never resolved.
+_ADDR_LIST_RE = re.compile(r";|\s&\s|\band\b", re.IGNORECASE)
+
+# Leading house number. No house number, no address match: a street name alone
+# is not an identity.
+_HOUSE_NO_RE = re.compile(r"^\s*(\d+)\s")
+
+
+def _addr_key(value: Any) -> str:
+    """Uppercase alphanumerics only, for address comparison.
+
+    '315 1st Street South, Brook Park, Minnesota 55007' and
+    '315 1st Street South' normalise differently ON PURPOSE -- only the first
+    comma segment is passed in, so both arrive as '3151STSTREETSOUTH'.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
+
+
+def _resolve_spine_parcel_by_address(
+    county_code: str,
+    extracted: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Last-resort spine match on the property address.
+
+    ADDED 2026-08-16. Digits-only matching CANNOT work in several counties
+    because the notice and the spine use different identifier systems, not
+    different formatting of one system. Measured live in dakota: the spine
+    holds '1702822570082' for 1251 Macarthur Ave while the notice prints
+    '42-334-00-01-040'. There is no transformation between those strings, so
+    every dakota notice minted a synthetic stub -- 8 of 8 in the sample, and
+    still happening on 2026-08-13, three days after the digits resolver
+    shipped.
+
+    Measured on the 1,420 stubs already in core.parcels: address resolved 628
+    of them uniquely, 3 ambiguously, where digits had resolved almost none.
+    This uses the SAME rule as that backfill so the live path and the
+    migration agree.
+
+    Deliberately strict, because a wrong parcel attaches a foreclosure to
+    someone else's property:
+      * package/list addresses are refused outright (see _ADDR_LIST_RE)
+      * a leading house number is required
+      * the house number narrows the query IN SQL, then the full normalised
+        address must match EXACTLY
+      * more than one hit returns None
+    """
+    raw_addr = extracted.get("property_address")
+    if not raw_addr:
+        return None
+    # Only the first comma segment: the rest is city/state/zip, which the
+    # spine stores in its own columns.
+    head = str(raw_addr).split(",")[0]
+    if _ADDR_LIST_RE.search(head):
+        # A list of addresses, not one address. Never resolve these.
+        return None
+    house = _HOUSE_NO_RE.match(head)
+    if not house:
+        return None
+    key = _addr_key(head)
+    if not key:
+        return None
+    try:
+        hit = (
+            core_table("parcels")
+            .select("parcel_id, address, city")
+            .eq("county_code", county_code)
+            .ilike("address", f"{house.group(1)} %")
+            .limit(50)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning(
+            "address spine lookup failed - falling back to synthetic PID",
+            county=county_code,
+            error_type=type(e).__name__,
+        )
+        return None
+    # The house-number filter is a NARROWING device only; equality is decided
+    # here on the normalised string. limit(50) caps the scan -- a house number
+    # shared by more than 50 streets in one county would be ambiguous anyway.
+    matches = [
+        r for r in (hit.data or [])
+        if _addr_key(str(r.get("address") or "").split(",")[0]) == key
+    ]
+    # Distinct parcels, not distinct rows: one parcel can appear twice.
+    distinct = {r.get("parcel_id"): r for r in matches}
+    if len(distinct) != 1:
+        return None
+    resolved = next(iter(distinct.values()))
+    logger.info(
+        "spine parcel resolved by ADDRESS (digits missed)",
+        county=county_code,
+        parcel_id=resolved.get("parcel_id"),
+        notice_pid=extracted.get("parcel_id"),
+    )
+    return resolved
 
 
 def _as_date(value: Any) -> Optional[date]:
