@@ -109,6 +109,79 @@ _MINOR_DROP_FRACTION = 0.05  # 5%
 # quarterly loader cannot trip it just by being quarterly.
 _UNSCHEDULED_REVIEW_DAYS = 90.0
 
+# ============================================================
+# DATA FRESHNESS — added 2026-08-16
+# ============================================================
+# Everything above answers "did the SCRAPER run?". None of it answers "is the
+# SOURCE still producing?" — and on 2026-08-16 eight sources were found
+# frozen while every one reported HEALTHY here, three of them for over a
+# year. dakota_sheriff had been silent 80 days with 15 successful runs in 30.
+#
+# src/scrapers/base_scraper.py now records, on EVERY run, the newest
+# event_date present in what the source actually served, into
+# audit.scraper_runs.metadata.source_max_date. That number is computed from
+# the fetched payload and never read back from our tables, so no migration or
+# re-key of ours can contaminate it — three earlier metrics failed exactly
+# that way (event_date gap analysis, records_new, observed_at).
+#
+# A frozen source is one whose source_max_date STOPS MOVING. This section
+# compares it against the source's own cadence.
+#
+# TWO SOURCES ARE EXEMPT, AND BOTH ARE DECLARED IN DATA, NOT NAMED HERE:
+#   date_semantics = 'semantic'  event_date encodes something other than
+#                                publication, so its max cannot indicate
+#                                staleness. hennepin_tax_roll is the
+#                                confirmed case: event_date is 1 January of
+#                                the delinquency YEAR, so its max sits at
+#                                2025-01-01 until parcels with
+#                                EARLIEST_DELQ_YR='26' appear.
+#   date_semantics = 'none'      the source carries no dates at all.
+#
+# Declared on audit.source_health rather than name-matched here, because a
+# hardcoded list drifts and monitoring behaviour hidden in a string is how
+# the SHELVED-prefix trap bit on 2026-08-16.
+#
+# Sources reporting NO dates are listed separately, never silently dropped.
+# A freshness monitor blind to part of the fleet is the failure it exists to
+# prevent — the same shape as 57 stale lines hiding one real one.
+
+# How far past its own cadence a source's DATA may fall before it is frozen.
+# Wider than the staleness multiplier (1.5) because publishers are lumpier
+# than schedulers.
+_FRESHNESS_MULTIPLIER = 3.0
+
+# Minimum window for a source with a PUBLICATION cadence recorded. Set from
+# measured behaviour: Dakota's 16 months of history show every month
+# populated (5-17 sales, median ~11) with a worst observed gap of 33 days.
+# 60 clears that comfortably and still catches the real stoppage at 80.
+_FRESHNESS_MIN_DAYS = 60.0
+
+# WHY publication_interval_days EXISTS SEPARATELY FROM expected_interval_days
+#
+# expected_interval_days is how often the SCRAPER RUNS. It is not how often
+# the PUBLISHER PUBLISHES, and using it for freshness is a category error
+# that produced two false positives in test on 2026-08-16:
+#
+#   ramsey_tfl        scraper weekly (7d); Ramsey publishes tax-forfeit
+#                     auction lists ~2x/year. Flagged frozen at 157 days
+#                     while behaving exactly as designed.
+#   fillmore_probate  scraper weekly (7d); Fillmore is a small county whose
+#                     probate volume is lumpy — 11 notices in one month, 2
+#                     in another. Flagged frozen at 112 days.
+#
+# Both were diagnosed HEALTHY hours earlier. Shipping this would have put
+# two known-false lines in the daily email, which is precisely how 57 false
+# stale lines came to hide one real failure for ten weeks.
+#
+# So freshness is judged on publication_interval_days when it is declared,
+# and a source without one is reported as UNJUDGED rather than guessed at.
+# An honest "cannot judge" beats a confident wrong answer.
+
+
+# Forward-dated sources (anoka_sheriff publishes to 2027-02-15, mnpublicnotice
+# and postbulletin_legal carry future sale dates) would otherwise always look
+# fresh. Freshness is judged on the newest date that has ACTUALLY OCCURRED.
+
 
 def _env(name: str, required: bool = True, default: str | None = None) -> str | None:
     val = os.environ.get(name, default)
@@ -152,6 +225,108 @@ def _fetch_health(supabase_url: str, service_key: str) -> list[dict]:
               flush=True)
         sys.exit(2)
     return resp.json()
+
+
+def _fetch_source_max_dates(supabase_url: str, service_key: str) -> dict[str, str]:
+    """Newest source_max_date each scraper has reported, from audit.scraper_runs.
+
+    Same self-contained REST approach as _fetch_health: no app code imported,
+    so a bug in the app cannot hide a failure in the monitor.
+
+    PostgREST cannot order by a nested JSON key portably, so this pulls the
+    recent run rows and reduces in Python. Bounded by a row cap rather than a
+    date window: a source that runs monthly would fall outside a 30-day
+    window and vanish from the report, which is precisely the source most
+    worth watching.
+    """
+    url = f"{supabase_url}/rest/v1/scraper_runs"
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Accept-Profile": "audit",
+    }
+    params = {
+        "select": "scraper_name,started_at,metadata",
+        "order": "started_at.desc",
+        "limit": "3000",
+    }
+    try:
+        resp = httpx.get(url, headers=headers, params=params, timeout=60)
+    except httpx.HTTPError as e:
+        print(f"WARNING: could not read scraper_runs for freshness: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return {}
+    if resp.status_code != 200:
+        print(f"WARNING: scraper_runs returned {resp.status_code} — "
+              f"freshness section omitted", flush=True)
+        return {}
+
+    newest: dict[str, str] = {}
+    for row in resp.json():
+        name = row.get("scraper_name")
+        meta = row.get("metadata") or {}
+        smd = meta.get("source_max_date")
+        if not name or not smd:
+            continue
+        # Rows arrive newest-first, but a source's most RECENT run is not
+        # necessarily the one that saw the newest data — a partial fetch can
+        # report an older max. Keep the highest value seen.
+        if name not in newest or smd > newest[name]:
+            newest[name] = smd
+    return newest
+
+
+def _freshness_state(row: dict, source_max_date: str | None) -> tuple[str, str]:
+    """Return (state, reason) for one source's DATA freshness.
+
+    States: 'fresh' | 'frozen' | 'exempt' | 'unjudged' | 'unknown'.
+    """
+    semantics = (row.get("date_semantics") or "").strip().lower()
+    if semantics in ("semantic", "none"):
+        return "exempt", f"date_semantics={semantics}"
+
+    if not source_max_date:
+        # Either it has not run since freshness capture shipped, or it
+        # genuinely produces no dates. Both mean "cannot judge", and both
+        # get said out loud rather than assumed healthy.
+        return "unknown", "no source_max_date reported yet"
+
+    # source_max_date is a bare YYYY-MM-DD (base_scraper._to_date_str), so
+    # _parse_ts returns a NAIVE datetime and comparing it to an aware now()
+    # raises TypeError. Caught in test 2026-08-16: in production that
+    # exception would have been swallowed and the whole freshness section
+    # would have silently disappeared — the exact blindness this section
+    # exists to prevent. Normalise to UTC instead of catching.
+    d = _parse_ts(source_max_date)
+    if d is None:
+        return "unknown", f"unparseable source_max_date {source_max_date!r}"
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+
+    now = _now()
+    if d > now:
+        # Forward-dated: scheduled sales, published notices. Cannot be stale.
+        return "fresh", f"newest data {source_max_date} (future-dated)"
+
+    age_days = (now - d).total_seconds() / 86400.0
+
+    # PUBLICATION cadence, never the scraper's. See the constants above.
+    interval = row.get("publication_interval_days")
+    if not (isinstance(interval, (int, float)) and interval > 0):
+        return "unjudged", (
+            f"newest data {source_max_date}, "
+            f"{age_days:.0f} days old — no publication_interval_days declared"
+        )
+
+    threshold = max(_FRESHNESS_MIN_DAYS, float(interval) * _FRESHNESS_MULTIPLIER)
+    cadence = f"publishes every ~{int(interval)}d"
+
+    if age_days > threshold:
+        return "frozen", (
+            f"newest data {source_max_date}, {age_days:.0f} days old "
+            f"({cadence}, threshold {threshold:.0f}d)"
+        )
+    return "fresh", f"newest data {source_max_date} ({age_days:.0f}d)"
 
 
 def _classify(row: dict) -> tuple[str, str]:
@@ -285,7 +460,10 @@ def _classify(row: dict) -> tuple[str, str]:
     return "healthy", "ok"
 
 
-def _build_digest(rows: list[dict]) -> tuple[str, str, bool]:
+def _build_digest(
+    rows: list[dict],
+    source_max_dates: dict[str, str] | None = None,
+) -> tuple[str, str, bool]:
     """Return (subject, body, any_problem)."""
     broken: list[tuple[str, str]] = []
     stale: list[tuple[str, str]] = []
@@ -294,10 +472,24 @@ def _build_digest(rows: list[dict]) -> tuple[str, str, bool]:
     unscheduled: list[str] = []
     unscheduled_review: list[tuple[str, str]] = []
     healthy: list[str] = []
+    frozen: list[tuple[str, str]] = []
+    undated: list[str] = []
+    smd = source_max_dates or {}
 
     for row in sorted(rows, key=lambda r: r.get("source_name", "")):
         state, reason = _classify(row)
         name = row.get("source_name", "?")
+
+        # Freshness is INDEPENDENT of run health: a source can run perfectly
+        # every day and serve data that stopped moving a year ago. That is
+        # exactly the case this section exists for, so it is judged for every
+        # source that is not shelved, including the ones reporting HEALTHY.
+        if state != "shelved":
+            f_state, f_reason = _freshness_state(row, smd.get(name))
+            if f_state == "frozen":
+                frozen.append((name, f_reason))
+            elif f_state in ("unknown", "unjudged"):
+                undated.append(name)
         if state == "broken":
             broken.append((name, reason))
         elif state == "stale":
@@ -318,7 +510,9 @@ def _build_digest(rows: list[dict]) -> tuple[str, str, bool]:
     # UNSCHEDULED sources ARE part of the fleet and stay in the total:
     # they are live, they just have no cadence to be late against.
     total = len(rows) - len(shelved)
-    any_problem = bool(broken or stale or unscheduled_review)
+    # frozen counts as a problem: a source serving year-old data is a defect
+    # in the product even when its scraper is green.
+    any_problem = bool(broken or stale or unscheduled_review or frozen)
 
     lines: list[str] = []
     lines.append(f"Govire scraper health digest -- "
@@ -329,8 +523,16 @@ def _build_digest(rows: list[dict]) -> tuple[str, str, bool]:
                  f"Stale: {len(stale)}   "
                  f"Check: {len(check)}   "
                  f"Healthy: {len(healthy)}   "
-                 f"Unscheduled: {len(unscheduled) + len(unscheduled_review)}")
+                 f"Unscheduled: {len(unscheduled) + len(unscheduled_review)}   "
+                 f"Frozen: {len(frozen)}")
     lines.append("")
+
+    if frozen:
+        lines.append("FROZEN (the scraper runs; the SOURCE has stopped "
+                     "producing — start looking for a replacement):")
+        for name, reason in frozen:
+            lines.append(f"  - {name}: {reason}")
+        lines.append("")
 
     if broken:
         lines.append("BROKEN (needs attention):")
@@ -362,6 +564,14 @@ def _build_digest(rows: list[dict]) -> tuple[str, str, bool]:
         lines.append(f"HEALTHY ({len(healthy)}): " + ", ".join(healthy))
         lines.append("")
 
+    if undated:
+        lines.append(
+            f"NO FRESHNESS SIGNAL ({len(undated)}) - not yet reporting a "
+            f"source_max_date, so data freshness cannot be judged: "
+            + ", ".join(undated)
+        )
+        lines.append("")
+
     if unscheduled:
         lines.append(
             f"UNSCHEDULED ({len(unscheduled)}) - dispatch-only, not judged "
@@ -378,7 +588,10 @@ def _build_digest(rows: list[dict]) -> tuple[str, str, bool]:
 
     body = "\n".join(lines)
 
-    if broken:
+    if frozen:
+        subject = f"[Govire health] {len(frozen)} FROZEN, {len(broken)} broken " \
+                  f"({len(healthy)}/{total} healthy)"
+    elif broken:
         subject = f"[Govire health] {len(broken)} BROKEN, {len(stale)} stale " \
                   f"({len(healthy)}/{total} healthy)"
     elif stale:
@@ -436,7 +649,11 @@ def main() -> int:
         _send_email(resend_key, to_addr, from_addr, subject, body)
         return 0
 
-    subject, body, _ = _build_digest(rows)
+    # Never fatal: a freshness read that fails degrades the section to
+    # "unknown" rather than losing the whole digest.
+    source_max_dates = _fetch_source_max_dates(supabase_url, service_key)
+
+    subject, body, _ = _build_digest(rows, source_max_dates)
     print(body, flush=True)  # also visible in the Actions run log
     _send_email(resend_key, to_addr, from_addr, subject, body)
     return 0
