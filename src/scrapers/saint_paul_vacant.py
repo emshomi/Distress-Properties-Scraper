@@ -1,8 +1,48 @@
 """
 Saint Paul DSI (Department of Safety and Inspections) Vacant Buildings scraper.
 
-Source: Saint Paul Open Information portal (ArcGIS Hub)
-URL: https://information.stpaul.gov/datasets/vacant-buildings-3
+Source: the City of Saint Paul's operational GIS service (PAULIE), layer 53.
+
+=== SOURCE CHANGED 2026-08-16 — READ THIS BEFORE TOUCHING THE URL ===
+This scraper previously read the standalone `VacantBuildings` FeatureServer,
+published via the Saint Paul Open Information Hub. That service is a
+TOMBSTONE: `hasStaticData: true`, `lastEditDate 2025-07-01`. Our newest event
+was 2025-06-30 — we were exactly in sync with a service the City had stopped
+editing thirteen months earlier.
+
+The live data moved into `PAULIE`, Saint Paul's 54-layer operational service
+(Address Points, Parcel Boundaries, the DSI inspection areas, Principal
+Zoning...). Layer 53 is "Vacant Buildings": `hasStaticData: false`,
+`dataLastEditDate` 2026-08-13, 392 records.
+
+It is the SAME TABLE, confirmed by structure rather than by name — an
+identical field list including the `LONGGITUDE` typo, plus editor tracking
+(CreationDate / EditDate / Editor) the old service lacked. Its index is named
+PAULIE_VACANT_BUILDINGS2.
+
+WHEN A CITY'S DEDICATED DATASET GOES STATIC, LOOK FOR THE OPERATIONAL
+SERVICE. The standalone item is left behind as a marker; the data keeps
+moving somewhere else in the org. Search the org, not the catalog:
+  arcgis.com/sharing/rest/search?q=orgid:9meaaHE3uiba0zr8 <term>
+
+Verified before this change (2026-08-16), NOT after: the /query endpoint was
+probed from a GitHub Actions runner via scripts/probe_source.py and passed
+tier 1 — plain httpx, 200, no headers or TLS impersonation needed. A browser
+download is not evidence of scraper access; that assumption cost a deploy and
+a revert on mpls_vbr the same morning.
+
+=== WHAT THIS RECOVERS, AND WHAT IT DOES NOT ===
+16 registrations postdate our newest event of 2025-06-30. That is the whole
+recoverable gap, because THE CITY STOPPED REGISTERING: 79 rows dated 2025,
+ZERO dated 2026, newest 2025-07-22. The monthly run was steady (10, 9, 11,
+13, 12, 8, 16) and then stops dead. A city of 300,000 has vacant buildings;
+Saint Paul stopped publishing them.
+
+So this repoint is worth doing for three reasons, none of which is volume:
+16 rows recovered, off a static service that can be deleted without warning,
+and onto a maintained layer that will capture new registrations the DAY the
+City resumes — with the freshness monitor watching (publication_interval_days
+is declared as 30 for this source).
 
 Real fields available from the ArcGIS Feature Service:
   - ADDRESS         (text)      property street address
@@ -13,10 +53,20 @@ Real fields available from the ArcGIS Feature Service:
   - DISTRICT        (int)       planning district number
   - CENSUS_TRACT    (text)      census tract code
   - PIN             (text 12)   Ramsey County 12-digit parcel ID
-  - LATITUDE        (float)     decimal latitude
-  - LONGITUDE       (float)     decimal longitude
+  - LATITUDE        (text)      decimal latitude, as a STRING
+  - LONGGITUDE      (text)      decimal longitude, as a STRING.
+                                Note the DOUBLE G. That is the City's own
+                                spelling on both the old service and PAULIE.
+                                This file read `LONGITUDE` until 2026-08-16
+                                and so never found it, silently falling back
+                                to the point geometry.
+  - PROPX / PROPY   (double)    projected coords, unused
+  - CreationDate    (date ms)   editor tracking, new on PAULIE
+  - EditDate        (date ms)   editor tracking, new on PAULIE
+  - Editor          (text)      editor tracking, new on PAULIE
 
-Saint Paul publishes ~384 vacant buildings (as of May 2026). Category 1 is
+Saint Paul publishes 392 vacant buildings (PAULIE layer 53, 2026-08-16;
+the dead service held 384). Category 1 is
 the largest bucket — these are properties registered with DSI but not yet
 boarded or condemned. Categories 2 and 3 are higher-severity distress
 signals worth surfacing prominently.
@@ -44,11 +94,18 @@ from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
 
 
 # ----- Saint Paul ArcGIS Feature Service URL -----
-# Discovered via the ArcGIS Hub "View API Resources" panel for the
-# Vacant Buildings dataset. The /query endpoint is appended by the base class.
+# PAULIE layer 53 = "Vacant Buildings". See the module docstring for why this
+# moved off the standalone VacantBuildings service on 2026-08-16.
+#
+# The layer id is POSITIONAL within the service. If Saint Paul reorders or
+# adds layers, 53 silently becomes something else — the same standing hazard
+# as dakota_sheriff's hardcoded year->layer map. Check the service root
+# before assuming a wrong-shaped payload is a parse bug:
+#   .../PAULIE/FeatureServer?f=json  -> layers[].name should read
+#   "Vacant Buildings" at id 53.
 _FEATURE_SERVICE_URL = (
     "https://services1.arcgis.com/9meaaHE3uiba0zr8"
-    "/arcgis/rest/services/VacantBuildings/FeatureServer/0"
+    "/arcgis/rest/services/PAULIE/FeatureServer/53"
 )
 
 
@@ -211,7 +268,13 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                 raw_attributes = (sig.raw_data or {}).get("attributes") or {}
 
                 lat = raw_attributes.get("LATITUDE")
-                lng = raw_attributes.get("LONGITUDE")
+                # DOUBLE G — the City's own spelling. `LONGITUDE` was read
+                # here until 2026-08-16 and never matched, so lng was always
+                # None and the geometry fallback below did all the work.
+                # Kept as a fallback in case the City ever fixes the typo.
+                lng = raw_attributes.get("LONGGITUDE")
+                if lng is None:
+                    lng = raw_attributes.get("LONGITUDE")
 
                 # Prefer attributes lat/lng; fall back to geometry
                 if (lat is None or lng is None) and raw_geometry:
