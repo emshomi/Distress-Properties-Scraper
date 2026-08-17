@@ -43,8 +43,9 @@ Detail record:  + mortgagee, toWhomSold, finalBidAmount,
             (sheriff_sale / completed_sale). The full detail JSON is stored
             in raw_data so redemptionExpirationDate is preserved for the
             redemption-window UI work.
-  write():  synthesize a stable parcel_id (HENNEPIN-FC-{saleRecordNumber});
-            resolve_parcel + write_events_dedup, mirroring the Anoka scraper.
+  parse():  RESOLVES the spine parcel by address first (2026-08-17); only a
+            genuine miss falls back to HENNEPIN-FC-{saleRecordNumber}.
+  write():  resolve_parcel for UNRESOLVED records only + write_events_dedup.
 
 Severity:
   redemption window still open (future expiration)  -> high  (actionable)
@@ -66,6 +67,10 @@ from src.models.signal import DistressEventInsert
 from src.scrapers.base_scraper import BaseScraper
 from src.services.event_writer import write_events_dedup
 from src.services.parcel_resolver import resolve_parcel
+from src.services.spine_resolver import (
+    SpineLookupUnavailable,
+    resolve_by_address,
+)
 from src.utils.errors import SourceUnavailableError
 from src.utils.logger import logger
 
@@ -339,6 +344,9 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
     ) -> list[DistressEventInsert]:
         signals: list[DistressEventInsert] = []
         today = date.today()
+        resolved_count = 0
+        synthetic_count = 0
+        unresolvable = 0
 
         for r in raw_records:
             record_no = _safe_str(r.get("saleRecordNumber"))
@@ -350,7 +358,6 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 # No usable sale date → cannot form a sheriff_sale event.
                 continue
 
-            parcel_id = f"HENNEPIN-FC-{record_no}"
             redemption_date = _parse_iso_date(
                 r.get("redemptionExpirationDate")
             )
@@ -358,6 +365,54 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             address = _safe_str(r.get("address"))
             city = _safe_str(r.get("city"))
             final_bid = _safe_decimal(r.get("finalBidAmount"))
+
+            # === RESOLVE THE REAL PARCEL BEFORE INVENTING ONE (2026-08-17) ===
+            #
+            # This line used to read, unconditionally:
+            #
+            #     parcel_id = f"HENNEPIN-FC-{record_no}"
+            #
+            # Every sale therefore hung off a synthetic parcel carrying no
+            # market value, no coordinates, no owner and no lot size -- the
+            # em-dash rows. Measured 2026-08-17: this scraper minted 381 stub
+            # parcels in a single run at 11:18, and 377 of those 381 resolve to
+            # exactly ONE real Hennepin parcel by address. The sale record
+            # already carried `address` (read two lines up, stored in raw_data,
+            # passed to ParcelUpsert in write()) -- the county's own address,
+            # against the county's own spine. Nothing looked.
+            #
+            # The address rule lives in src/services/spine_resolver.py so the
+            # approve path, this scraper and the backfill SQL all apply the
+            # same normalisation. Street types are dropped and directionals are
+            # CANONICALISED, never stripped: 'N' and 'S' name different
+            # streets. Ambiguity returns None and keeps the synthetic id -- a
+            # wrong parcel attaches a foreclosure to somebody else's house.
+            resolved = None
+            if address:
+                try:
+                    resolved = resolve_by_address(self.county_code, address)
+                except SpineLookupUnavailable as e:
+                    # The spine could not be QUERIED. That is NOT evidence the
+                    # parcel is absent, and minting a stub on a dropped
+                    # connection is irreversible in practice -- the stub
+                    # acquires events, imagery and listings that must then be
+                    # re-pointed by hand. Skip the record; Hennepin republishes
+                    # the same list daily, so it returns on the next run.
+                    unresolvable += 1
+                    logger.warning(
+                        "Hennepin record skipped — spine unreachable",
+                        source=self.source_name,
+                        record_no=record_no,
+                        error=str(e),
+                    )
+                    continue
+
+            if resolved is not None:
+                parcel_id = resolved["parcel_id"]
+                resolved_count += 1
+            else:
+                parcel_id = f"HENNEPIN-FC-{record_no}"
+                synthetic_count += 1
 
             # Severity from the redemption window: an open (future) redemption
             # period is the actionable window — the prior owner can still
@@ -444,6 +499,17 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 observed_at=datetime.now(timezone.utc),
             ))
 
+        # The number that matters on every run. A rising `synthetic` count
+        # means the spine is drifting from what the Sheriff publishes; a
+        # non-zero `unreachable` means records were DEFERRED, not lost.
+        logger.info(
+            "Hennepin parcel resolution",
+            source=self.source_name,
+            resolved=resolved_count,
+            synthetic=synthetic_count,
+            unreachable=unresolvable,
+            events=len(signals),
+        )
         return signals
 
     # ---- Write (mirror Anoka: resolve parcels + dedup events) ----
@@ -457,6 +523,23 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         unique_parcels: dict[str, ParcelUpsert] = {}
         for ev in signals:
             if ev.parcel_id in unique_parcels:
+                continue
+            # === ONLY SYNTHETIC PARCELS ARE WRITTEN (2026-08-17) ===
+            #
+            # A resolved parcel_id already exists in core.parcels with real
+            # assessor data. Putting it through resolve_parcel would run the
+            # merge in _merge_parcel_payload, whose fill-in semantics write a
+            # value wherever the existing column is NULL -- so the Sheriff's
+            # address would land on a parcel whose assessor address happened
+            # to be empty, and data_sources would gain a source that did not
+            # supply the row. _IMMUTABLE_FIELDS protects the key columns; it
+            # does not protect the rest.
+            #
+            # Same reasoning as build_promotion_rows returning parcel_row=None
+            # on a resolved notice: the spine row is authoritative and the
+            # scraper has nothing to add to it. The distress_events row still
+            # points at it, which is the entire object of the exercise.
+            if not ev.parcel_id.startswith("HENNEPIN-FC-"):
                 continue
             raw = ev.raw_data or {}
             address = _safe_str(raw.get("address"))
@@ -486,7 +569,9 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         logger.info(
             "Hennepin write complete",
             source=self.source_name,
-            parcels=len(unique_parcels),
+            # Stubs minted this run. Was one per sale record before
+            # 2026-08-17; should now be a small remainder.
+            parcels_synthetic=len(unique_parcels),
             events_new=new_events,
             failed=failed_events + parcels_failed,
         )
