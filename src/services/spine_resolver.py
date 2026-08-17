@@ -56,7 +56,7 @@ from typing import Any, Optional
 
 import httpx
 
-from src.db.supabase_client import core_table
+from src.db.supabase_client import core_table, get_client
 from src.utils.logger import logger
 
 
@@ -148,6 +148,17 @@ _NON_DIGIT_RE = re.compile(r"\D")
 def addr_key(value: Any) -> str:
     """Comparison key for an address: uppercase alphanumerics, street-type
     words removed, directionals canonicalised to their abbreviation.
+
+    NOT THE LIVE PATH as of 2026-08-17. resolve_by_address() now compares in
+    SQL via core.addr_key(), because the comparison has to run against EVERY
+    candidate row and PostgREST cannot express the normalisation (see that
+    function for why the 50-row cap was fatal). This stays as the executable
+    reference definition: the five verified pairs below are checked against
+    THIS function, and core.addr_key() must produce the same key for the same
+    input. **A change to either MUST change both.** Two definitions of one
+    rule in two languages is the minimum possible here -- SQL cannot call
+    Python -- but it is still two, and they will drift silently if edited
+    apart.
 
     '315 1st Street South, Brook Park, Minnesota 55007' and
     '315 1st Street South' produce the same key ON PURPOSE -- only the first
@@ -283,17 +294,35 @@ def resolve_by_address(
     for 1251 Macarthur Ave while the notice prints '42-334-00-01-040'. There
     is no transformation between those strings.
 
-    Measured on the 1,420 stubs present 2026-08-16: address resolved 628
-    uniquely, 3 ambiguously, where digits had resolved almost none. Measured
-    again 2026-08-17 on the 527 stubs minted that day by the three sheriff
-    scrapers: 523 resolved uniquely, 3 ambiguous, 1 no match.
+    === THE 50-ROW CAP WAS FATAL — FIXED 2026-08-17 ===
 
-    Deliberately strict:
+    This function used to fetch up to 50 candidate rows by house number and
+    filter them in Python. The cap was defended in a comment reading "a house
+    number shared by more than 50 streets in one county would be ambiguous
+    anyway." That reasoning is wrong: fifty rows sharing a house NUMBER are
+    fifty different STREETS, and exactly one of them is right. The cap
+    truncated the candidate set BEFORE the discriminating comparison ran.
+
+    Measured on the first live Hennepin run: 517 records, 202 unresolved, 95
+    new stubs minted. **95 of 95 had more than 50 candidates** -- minimum 58,
+    maximum 526, because Minneapolis's grid puts the same house number on
+    dozens of parallel avenues. '2417 Colfax Ave S' has 84 candidates at that
+    house number and exactly one Colfax; the row was in the other 34.
+
+    Dakota did not expose this (128 of 170 resolved) because a suburban county
+    has few parallel streets per house number. The defect was county-shaped,
+    which is why the first county to run looked like a success.
+
+    The comparison now runs in SQL, in core.resolve_parcel_by_address(),
+    against every candidate with no cap. Re-measured: **95 of 95 resolve, 0
+    ambiguous, 0 misses.**
+
+    Still deliberately strict, and these checks stay in Python because they
+    are cheap and save a round trip:
       * package/list addresses are refused outright (see _ADDR_LIST_RE)
       * a leading house number is required
-      * the house number narrows the query IN SQL, then the full normalised
-        address must match EXACTLY
-      * more than one distinct parcel returns None
+      * more than one distinct parcel returns None -- a wrong parcel attaches
+        a foreclosure to somebody else's house
 
     Raises SpineLookupUnavailable if the spine could not be queried.
     """
@@ -306,35 +335,29 @@ def resolve_by_address(
     if _ADDR_LIST_RE.search(head):
         # A list of addresses, not one address. Never resolve these.
         return None
-    house = _HOUSE_NO_RE.match(head)
-    if not house:
-        return None
-    key = addr_key(head)
-    if not key:
+    if not _HOUSE_NO_RE.match(head):
         return None
 
     hit = _execute_with_retry(
         lambda: (
-            core_table("parcels")
-            .select("parcel_id, address, city")
-            .eq("county_code", county_code)
-            .ilike("address", f"{house.group(1)} %")
-            .limit(50)
+            get_client()
+            .schema("core")
+            .rpc("resolve_parcel_by_address", {
+                "p_county_code": county_code,
+                "p_address": head,
+            })
             .execute()
         ),
         what="address",
         county_code=county_code,
     )
 
-    # The house-number filter is a NARROWING device only; equality is decided
-    # here on the normalised string. limit(50) caps the scan -- a house number
-    # shared by more than 50 streets in one county would be ambiguous anyway.
-    matches = [
-        r for r in (hit.data or [])
-        if addr_key(str(r.get("address") or "").split(",")[0]) == key
-    ]
-    # Distinct parcels, not distinct rows: one parcel can appear twice.
-    distinct = {r.get("parcel_id"): r for r in matches}
+    # The function applies the house-number narrowing AND the exact key
+    # comparison, then caps at 3 -- a cap on genuine duplicates, not on
+    # candidates. Ambiguity is still refused here rather than there, so the
+    # refusal is logged with the address that caused it.
+    rows = hit.data or []
+    distinct = {r.get("parcel_id"): r for r in rows}
     if len(distinct) != 1:
         if len(distinct) > 1:
             logger.info(
