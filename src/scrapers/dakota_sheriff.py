@@ -42,11 +42,22 @@ FK backbone, so we synthesize a stable ID per record:
 
     parcel_id = "DAKOTA-FC-{year}-{OBJECTID}"
 
-Then we write, mirroring the proven Saint Paul pattern:
-  1. core.parcels row (county=dakota, address/city/lat/lng, raw_data)
+CHANGED 2026-08-17. The synthetic id is now a FALLBACK, not the default. The
+feature carries GeoAddress, and matching it against the Dakota spine resolved
+129 of 129 stubs minted on 2026-08-17 -- every single one. Until then this
+scraper wrote 129 stub parcels per run, each carrying no market value, no
+owner and no lot size, for properties whose real parcel was already in
+core.parcels.
+
+Then we write:
+  1. core.parcels row ONLY when the address did not resolve (a resolved parcel
+     already exists and carries assessor data a stub write would degrade)
   2. signals.distress_events row (event_type='sheriff_sale', dated by SaleDate)
 
-Later, real Dakota parcel IDs can be spatial-joined from the parcels layer.
+A spatial join was investigated 2026-08-17 and is NOT possible:
+core.parcels.geom is geography(Point,4326) -- centroids, not boundaries -- so
+point-in-polygon has nothing to contain the point. Loading parcel polygons is
+a data-acquisition problem, not a query problem. Address is the bridge.
 
 === SEVERITY ===
   Recent='Y' (latest month)  -> high   (freshest opportunity)
@@ -68,6 +79,10 @@ from src.models.signal import DistressEventInsert
 from src.scrapers.base_arcgis_scraper import BaseArcGISScraper, arcgis_date_to_date_only
 from src.services.event_writer import write_events_dedup
 from src.services.parcel_resolver import resolve_parcel
+from src.services.spine_resolver import (
+    SpineLookupUnavailable,
+    resolve_by_address,
+)
 from src.utils.errors import ParseError, SourceUnavailableError
 from src.utils.logger import logger
 
@@ -248,9 +263,6 @@ class DakotaSheriffScraper(BaseArcGISScraper[DistressEventInsert]):
         if objectid is None or year is None:
             return None
 
-        # Synthetic, stable parcel_id (no real PID in this dataset)
-        parcel_id = f"DAKOTA-FC-{year}-{objectid}"
-
         # Sale date (required for a sheriff_sale event)
         sale_date_str = arcgis_date_to_date_only(attributes.get("SaleDate"))
         sale_date: date | None = None
@@ -265,6 +277,43 @@ class DakotaSheriffScraper(BaseArcGISScraper[DistressEventInsert]):
 
         address = _safe_str(attributes.get("GeoAddress"))
         city = _title_case(_safe_str(attributes.get("GeoCity")))
+
+        # === RESOLVE THE REAL PARCEL BEFORE INVENTING ONE (2026-08-17) ===
+        #
+        # Dakota's features carry no PID, so this scraper synthesised one
+        # unconditionally for three months (commit 9389c90, untouched while
+        # every other parcel-resolution fix landed elsewhere). Measured
+        # 2026-08-17: 129 stubs minted in one run at 13:06, and 129 of 129
+        # resolve to exactly ONE real Dakota parcel by GeoAddress.
+        #
+        # Dakota's own metadata labels GeoAddress "Unverified Address", so it
+        # is not authoritative -- which is why resolve_by_address requires an
+        # exact normalised match AND a unique hit. A malformed address missing
+        # is the correct outcome; it keeps the synthetic id and loses nothing.
+        resolved = None
+        if address:
+            try:
+                resolved = resolve_by_address(self.county_code, address)
+            except SpineLookupUnavailable as e:
+                # The spine could not be QUERIED -- not evidence the parcel is
+                # absent. Minting a stub on a dropped connection is
+                # irreversible in practice: the stub accrues events, imagery
+                # and listings that must then be re-pointed by hand. Skip the
+                # feature; Dakota's layers are re-read on every run.
+                logger.warning(
+                    "Dakota feature skipped — spine unreachable",
+                    source=self.source_name,
+                    objectid=objectid,
+                    error=str(e),
+                )
+                return None
+
+        # Synthetic id is the FALLBACK now, not the default.
+        parcel_id = (
+            resolved["parcel_id"]
+            if resolved is not None
+            else f"DAKOTA-FC-{year}-{objectid}"
+        )
         sale_amount = _safe_decimal(attributes.get("SaleAmount"))
         is_recent = _safe_str(attributes.get("Recent")) == "Y"
 
@@ -329,9 +378,25 @@ class DakotaSheriffScraper(BaseArcGISScraper[DistressEventInsert]):
         if not signals:
             return 0, 0, 0
 
-        # --- Step 1: one parcel per synthetic id ---
+        # --- Step 1: one parcel per SYNTHETIC id ---
+        #
+        # CHANGED 2026-08-17. Resolved parcels are skipped entirely. Such a row
+        # already exists in core.parcels with real assessor data, and putting
+        # it through resolve_parcel runs _merge_parcel_payload, whose fill-in
+        # semantics write a value into any column that is currently NULL. The
+        # Sheriff's "Unverified Address" would land on a parcel whose assessor
+        # address happened to be empty, and data_sources would gain a feed that
+        # did not supply the row. _IMMUTABLE_FIELDS protects parcel_id,
+        # county_code and state; it does not protect the rest.
+        #
+        # The lat/lng below is likewise only meaningful for a stub: a resolved
+        # spine parcel carries its own geometry.
+        resolved_count = 0
         unique_parcels: dict[str, ParcelUpsert] = {}
         for ev in signals:
+            if not ev.parcel_id.startswith("DAKOTA-FC-"):
+                resolved_count += 1
+                continue
             if ev.parcel_id in unique_parcels:
                 continue
 
@@ -371,11 +436,19 @@ class DakotaSheriffScraper(BaseArcGISScraper[DistressEventInsert]):
             else:
                 parcels_failed += 1
 
+        # The number that matters on every run. `resolved` counts events
+        # hanging off a REAL Dakota parcel; `synthetic` counts stubs minted.
+        # Before 2026-08-17 the second figure was every record and the first
+        # did not exist. A rising `synthetic` means the spine is drifting from
+        # what the county publishes.
         logger.info(
-            "Dakota sheriff parcels resolved",
+            "Dakota parcel resolution",
             source=self.source_name,
-            parcels_ok=parcels_ok,
-            parcels_failed=parcels_failed,
+            resolved=resolved_count,
+            synthetic=len(unique_parcels),
+            stubs_written=parcels_ok,
+            stubs_failed=parcels_failed,
+            events=len(signals),
         )
 
         # --- Step 2: unified distress_events ---
