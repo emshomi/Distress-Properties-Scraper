@@ -17,7 +17,6 @@ Routes:
 from __future__ import annotations
 
 import os
-import re
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
@@ -31,13 +30,16 @@ from src.db.supabase_client import (
     access_table,
     ai_table,
     signals_table,
-    core_table,
+    get_client,
 )
 from src.llm.foreclosure_promotion import (
     build_promotion_rows,
     split_pids,
     _county_slug as _fc_county_slug,
-    _pid_digits as _fc_pid_digits,
+)
+from src.services.spine_resolver import (
+    SpineLookupUnavailable,
+    resolve_spine_parcel,
 )
 from src.scrapers.startribune_legal import run_startribune_scrape
 from src.scrapers.mnpublicnotice_probe import probe_mnpublicnotice
@@ -273,257 +275,42 @@ async def list_extractions(status: str = "pending") -> dict[str, Any]:
 def _resolve_spine_parcel(extracted: dict[str, Any]) -> Optional[dict[str, Any]]:
     """The REAL core.parcels row for this notice, or None.
 
-    CHANGED 2026-08-15: returns the ROW ({parcel_id, address, city}) rather
-    than the id alone. A PACKAGE notice's extracted['property_address'] is the
-    notice's FULL LIST of addresses -- twelve of them for washington
-    26-003536FC -- so each member needs ITS OWN address, and only this function
-    has the DB to look it up. build_promotion_rows stays pure.
+    Returns the ROW ({parcel_id, address, city}) rather than the id alone. A
+    PACKAGE notice's extracted['property_address'] is the notice's FULL LIST of
+    addresses -- twelve of them for washington 26-003536FC -- so each member
+    needs ITS OWN address, and only a DB lookup can supply it.
+    build_promotion_rows stays pure.
 
-    ADDED 2026-08-10. Every mnpublicnotice foreclosure was hung off a
-    SYNTHETIC parcel built from the notice id, never the actual parcel — so
-    the rows carried no market value, no owner, no coordinates, no equity.
-    That is why a Beltrami row renders as em-dashes while a Hennepin row
-    shows $344,800: there is no parcel record behind it, only a stub named
-    after the notice.
+    MOVED 2026-08-17 to src/services/spine_resolver.py. The rule used to live
+    here, in an HTTP route module, reachable only from the approve path. Every
+    sheriff scraper therefore invented its own synthetic parcel_id: measured
+    2026-08-17, hennepin_sheriff minted 381 stub parcels, dakota_sheriff 129
+    and anoka_sheriff 17 IN ONE DAY, of which 523 of 527 resolve to exactly one
+    real parcel by address. The 760 stubs migrated onto real parcels on 08-16
+    were 529 back within 21 hours. One copy of the rule, callable by
+    everything -- when it changes, the migration SQL changes with it.
 
-    Counties print the same PID in incompatible shapes (wright
-    '155-154-004010', beltrami '83.00180.00', dakota '42-42800-01-071'), so
-    the match is digits-only via core.parcel_pid_lookup, backed by the
-    expression index idx_parcels_county_pid_digits. Measured 2026-08-10:
-    exact match resolved 47 of 217 notices, digits-only resolved 185, and
-    the lookup runs in 0.57ms on an index scan.
-
-    Returns None on ANY doubt — no county, no usable PID, no hit, more than
-    one hit, or an error. The caller then falls back to the synthetic path,
-    which is exactly today's behaviour. A wrong parcel would attach a
-    foreclosure to someone else's property, so silence is the only safe
-    failure here.
+    THE EXCEPTION IS NO LONGER SWALLOWED HERE. The previous version caught
+    every Exception and returned None, sending the caller to the synthetic
+    path. On 2026-08-17 08:54 a PostgREST connection dropped mid-lookup three
+    times (RemoteProtocolError, logged with error_type but read as a digits
+    miss) and minted HENNEPIN-FC-3211821340028-2026-08-26 -- a stub named after
+    the very parcel the failed query would have returned. It also defeated the
+    idempotency guard below, which keys on the effective pid: the guard checked
+    a stub, found no events, inserted, and hit 23505 two seconds later. A
+    transport failure is NOT evidence that a parcel does not exist, so
+    SpineLookupUnavailable propagates to the caller, which returns 503 and
+    mints nothing.
     """
     county_code = _fc_county_slug(extracted.get("county"))
     if not county_code:
         return None
-    digits = _fc_pid_digits(extracted.get("parcel_id"))
-    if not digits:
-        return None
-    try:
-        hit = (
-            core_table("parcel_pid_lookup")
-            .select("parcel_id, address, city")
-            .eq("county_code", county_code)
-            .eq("pid_digits", digits)
-            .limit(2)
-            .execute()
-        )
-    except Exception as e:
-        logger.warning(
-            "spine parcel lookup failed — falling back to synthetic PID",
-            county=county_code,
-            error_type=type(e).__name__,
-        )
-        return None
-    rows = hit.data or []
-    if len(rows) == 1:
-        return rows[0]
-    # 0 = digits did not match. 2+ = ambiguous within one county; never guess.
-    # Ambiguity is fatal, but a MISS gets one more attempt, by address.
-    if len(rows) > 1:
-        return None
-    return _resolve_spine_parcel_by_address(county_code, extracted)
-
-
-# Address text that is a LIST rather than one property. A package notice's
-# property_address is every address the notice covers -- twelve of them for
-# washington 26-003536FC -- and resolving a member against that list would
-# attach a foreclosure to somebody else's house. Detected, never resolved.
-_ADDR_LIST_RE = re.compile(r";|\s&\s|\band\b", re.IGNORECASE)
-
-# Leading house number. No house number, no address match: a street name alone
-# is not an identity.
-_HOUSE_NO_RE = re.compile(r"^\s*(\d+)\s")
-
-
-# Street-type words, in BOTH the spelled-out and abbreviated form a notice or
-# an assessor may use. Removed from BOTH sides before comparison, so
-# 'Ridgeway Road' and 'RIDGEWAY RD' compare equal.
-#
-# DIRECTIONALS ARE DELIBERATELY ABSENT. Stripping N/S/E/W was measured
-# 2026-08-16 and is not worth what it costs. An ambiguity this code can SEE
-# (two spine parcels matching one stub) is already handled -- the caller
-# requires exactly one match and returns None otherwise. The dangerous case is
-# invisible: if a notice reads '100 Main St N' and the spine holds only
-# '100 Main St S', collapsing the directional yields EXACTLY ONE match, the
-# WRONG house, and nothing can detect it. Minnesota addressing leans on
-# directionals (Minneapolis is built on NE/NW/SE/SW quadrants).
-#
-# 'Road' and 'Rd' name the same street. 'N' and 'S' name different streets.
-#
-# \b cannot fire inside an ordinal: there is no word boundary between the
-# digit and the letters of '1ST', so \bST\b never matches it. Verified, not
-# assumed.
-#
-# Abbreviated directionals ARE now handled; see _DIRECTIONALS below. Was:
-# '8344 Onigum Road Northwest' still differ. Canonicalising NORTHWEST -> NW
-# would be safe (it preserves N != S rather than erasing it) but has not been
-# measured, and an unmeasured widening of this rule is how the first version
-# of it shipped broken.
-_STREET_TYPE_RE = re.compile(
-    r"\b(?:ROAD|RD|STREET|ST|AVENUE|AVE|DRIVE|DR|LANE|LN|COURT|CT"
-    r"|BOULEVARD|BLVD|PLACE|PL|CIRCLE|CIR|TERRACE|TER|PARKWAY|PKWY"
-    r"|HIGHWAY|HWY|TRAIL|TRL|PATH|WAY)\b",
-    re.IGNORECASE,
-)
-
-
-# Directionals, mapped to the county's abbreviated form rather than removed.
-#
-# CHANGED 2026-08-16. The previous version left directionals ALONE, on the
-# reasoning that stripping them could silently attach a foreclosure to the
-# wrong house: with '100 Main St N' in the notice and only '100 Main St S' in
-# the spine, deletion yields exactly ONE match and nothing can detect it.
-#
-# That reasoning was right about DELETION and wrong to stop there. Mapping
-# NORTHWEST -> NW is not deletion: it PRESERVES the distinction while
-# reconciling the spelling. 'N' and 'S' still differ; 'NE' and 'NW' still
-# differ. Verified on both pairs before shipping.
-#
-# Measured across the 517 remaining stubs carrying a house number: 257 resolve
-# uniquely under this rule that did not before (19 counties), and ambiguity
-# rises only from 6 to 8 -- and an ambiguous stub is refused by the caller,
-# which requires exactly one distinct match.
-#
-# ORDER MATTERS. Compounds are replaced BEFORE simples, or 'NORTHEAST' is
-# mangled into 'N EAST' by the NORTH rule firing first. Python dicts preserve
-# insertion order, so this literal is the substitution order.
-_DIRECTIONALS = {
-    "NORTHEAST": "NE",
-    "NORTHWEST": "NW",
-    "SOUTHEAST": "SE",
-    "SOUTHWEST": "SW",
-    "NORTH": "N",
-    "SOUTH": "S",
-    "EAST": "E",
-    "WEST": "W",
-}
-
-_DIRECTIONAL_RE = re.compile(
-    r"\b(" + "|".join(_DIRECTIONALS) + r")\b",
-    re.IGNORECASE,
-)
-
-
-def _addr_key(value: Any) -> str:
-    """Comparison key for an address: uppercase alphanumerics, street-type
-    words removed, directionals canonicalised to their abbreviation.
-
-    '315 1st Street South, Brook Park, Minnesota 55007' and
-    '315 1st Street South' produce the same key ON PURPOSE -- only the first
-    comma segment is ever passed in.
-
-    CHANGED 2026-08-16 (twice). Originally alphanumerics only, which could
-    not match a notice that spells a street type out against a county that
-    abbreviates it -- found live on Hennepin, where the notice read
-    '7345 Ridgeway Road' against core.parcels' '7345 RIDGEWAY RD'. Street
-    types were normalised first (132 stubs recovered), then directionals
-    (a further 257).
-
-    Verified pairs, run before shipping rather than reasoned about:
-        '8344 Onigum Road Northwest' == '8344 ONIGUM RD NW'      -> match
-        '5195 194TH ST W'            == '5195 194th Street West' -> match
-        '1221 1st Avenue Northwest'  == '1221 1ST AVE NW'        -> match
-        '100 Main St N'              vs '100 Main St S'          -> DIFFER
-        '100 Main St NE'             vs '100 Main St NW'         -> DIFFER
-
-    Order of operations mirrors the SQL the measurement used: punctuation
-    becomes a SPACE first (so 'ST.' is recognisable as a word), then street
-    types are dropped, then directionals are canonicalised, then all
-    whitespace is removed.
-    """
-    text = re.sub(r"[^A-Za-z0-9]", " ", str(value or "")).upper()
-    text = _STREET_TYPE_RE.sub(" ", text)
-    text = _DIRECTIONAL_RE.sub(
-        lambda m: " " + _DIRECTIONALS[m.group(1).upper()] + " ", text
+    return resolve_spine_parcel(
+        county_code,
+        published_pid=extracted.get("parcel_id"),
+        address=extracted.get("property_address"),
     )
-    return re.sub(r"\s+", "", text)
 
-
-def _resolve_spine_parcel_by_address(
-    county_code: str,
-    extracted: dict[str, Any],
-) -> Optional[dict[str, Any]]:
-    """Last-resort spine match on the property address.
-
-    ADDED 2026-08-16. Digits-only matching CANNOT work in several counties
-    because the notice and the spine use different identifier systems, not
-    different formatting of one system. Measured live in dakota: the spine
-    holds '1702822570082' for 1251 Macarthur Ave while the notice prints
-    '42-334-00-01-040'. There is no transformation between those strings, so
-    every dakota notice minted a synthetic stub -- 8 of 8 in the sample, and
-    still happening on 2026-08-13, three days after the digits resolver
-    shipped.
-
-    Measured on the 1,420 stubs already in core.parcels: address resolved 628
-    of them uniquely, 3 ambiguously, where digits had resolved almost none.
-    This uses the SAME rule as that backfill so the live path and the
-    migration agree.
-
-    Deliberately strict, because a wrong parcel attaches a foreclosure to
-    someone else's property:
-      * package/list addresses are refused outright (see _ADDR_LIST_RE)
-      * a leading house number is required
-      * the house number narrows the query IN SQL, then the full normalised
-        address must match EXACTLY
-      * more than one hit returns None
-    """
-    raw_addr = extracted.get("property_address")
-    if not raw_addr:
-        return None
-    # Only the first comma segment: the rest is city/state/zip, which the
-    # spine stores in its own columns.
-    head = str(raw_addr).split(",")[0]
-    if _ADDR_LIST_RE.search(head):
-        # A list of addresses, not one address. Never resolve these.
-        return None
-    house = _HOUSE_NO_RE.match(head)
-    if not house:
-        return None
-    key = _addr_key(head)
-    if not key:
-        return None
-    try:
-        hit = (
-            core_table("parcels")
-            .select("parcel_id, address, city")
-            .eq("county_code", county_code)
-            .ilike("address", f"{house.group(1)} %")
-            .limit(50)
-            .execute()
-        )
-    except Exception as e:
-        logger.warning(
-            "address spine lookup failed - falling back to synthetic PID",
-            county=county_code,
-            error_type=type(e).__name__,
-        )
-        return None
-    # The house-number filter is a NARROWING device only; equality is decided
-    # here on the normalised string. limit(50) caps the scan -- a house number
-    # shared by more than 50 streets in one county would be ambiguous anyway.
-    matches = [
-        r for r in (hit.data or [])
-        if _addr_key(str(r.get("address") or "").split(",")[0]) == key
-    ]
-    # Distinct parcels, not distinct rows: one parcel can appear twice.
-    distinct = {r.get("parcel_id"): r for r in matches}
-    if len(distinct) != 1:
-        return None
-    resolved = next(iter(distinct.values()))
-    logger.info(
-        "spine parcel resolved by ADDRESS (digits missed)",
-        county=county_code,
-        parcel_id=resolved.get("parcel_id"),
-        notice_pid=extracted.get("parcel_id"),
-    )
-    return resolved
 
 
 def _as_date(value: Any) -> Optional[date]:
@@ -758,6 +545,12 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
         duplicate_count = 0
         postponed_count = 0
         source_id = None
+        # True once signals.promote_extraction() has run for at least one
+        # member. That function marks the extraction approved itself, inside
+        # the same transaction as the inserts, so the standalone update below
+        # is only needed when NOTHING promoted (every member a duplicate or a
+        # postponement).
+        promoted_via_rpc = False
 
         for _idx, _pin in enumerate(pins, start=1):
             # A per-member copy so real_pid, _synthetic_pid and
@@ -833,86 +626,77 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 )
 
             if not already:
-                # parcel_row is None when the PID resolved to a real spine parcel:
-                # that row already exists and carries assessor data a stub would
-                # overwrite. BOTH the county seed and the parcel insert belong
-                # inside this guard.
+                # === ONE TRANSACTION, NOT FOUR HTTP CALLS (2026-08-17) ===
                 #
-                # FIXED 2026-08-13: the county-seed block below read
-                # built["parcel_row"].get(...) OUTSIDE any None check, so every
-                # notice that resolved to a real parcel raised AttributeError and
-                # returned 500. _resolve_spine_parcel (added 2026-08-10) introduced
-                # the None case; this block predates it and was never updated.
-                # It failed on the GOOD notices — a resolved parcel carries address,
-                # value and owner, while the synthetic fallback that still worked
-                # renders as em-dashes. Measured: digits-only resolution hit 185 of
-                # 217 notices, so ~85% of approvals were failing.
+                # This block used to issue four independent PostgREST requests
+                # -- county seed, parcel insert, distress_events insert,
+                # sheriff_sales insert -- and the extraction status update ran
+                # after the loop as a fifth. PostgREST has no multi-statement
+                # transaction, so a failure part-way left the earlier writes
+                # committed.
+                #
+                # Measured live 2026-08-17: two approvals failed at the
+                # extraction-status update AFTER the event insert had
+                # committed. The extraction stayed 'pending', the card
+                # reappeared, the banner said "Approve failed. Try again." --
+                # and the retry hit 23505 on
+                # distress_events_source_identity_key, because the event it was
+                # about to insert already existed. The UI was actively driving
+                # the duplicate.
+                #
+                # signals.promote_extraction() does all of it inside one
+                # plpgsql transaction: a failure anywhere rolls the whole
+                # promotion back, so a retry starts from a clean state. It also
+                # marks the extraction approved, which is why the standalone
+                # update after this loop now only runs when NOTHING promoted.
+                #
+                # parcel_row is None when the PID resolved to a real spine
+                # parcel: that row already exists and carries assessor data a
+                # stub would overwrite. The function skips BOTH the county seed
+                # and the parcel insert in that case -- a resolved parcel's own
+                # FK already guarantees its county is seeded.
                 parcel_row = built["parcel_row"]
 
-                if parcel_row is not None:
-                    # FK chain: distress_events.parcel_id -> core.parcels.parcel_id,
-                    # and core.parcels.county_code -> core.counties.county_code. So
-                    # both the county AND the parcel must exist first.
-                    #
-                    # Ensure the county exists in core.counties BEFORE inserting the
-                    # parcel — statewide notices reference any of MN's 87 counties,
-                    # and a parcel insert for an unseeded county would FK-fail (the
-                    # cause of the earlier approval 500s). Auto-seeding here means
-                    # any new MN county self-heals instead of needing a manual seed.
-                    #
-                    # Not needed when parcel_row is None: no parcel is being
-                    # inserted, and the existing spine parcel's own FK already
-                    # guarantees its county is seeded.
-                    county_code = parcel_row.get("county_code")
-                    if county_code:
-                        county_exists = (
-                            core_table("counties")
-                            .select("county_code")
-                            .eq("county_code", county_code)
-                            .limit(1)
-                            .execute()
-                        )
-                        if not county_exists.data:
-                            # Build a readable name from the raw extraction county,
-                            # e.g. "Saint Louis" -> "Saint Louis County". Slug is
-                            # the FK value.
-                            raw_county = (extracted.get("county") or county_code).strip()
-                            county_name = (
-                                raw_county
-                                if raw_county.lower().endswith("county")
-                                else f"{raw_county} County"
-                            )
-                            core_table("counties").insert({
-                                "county_code": county_code,
-                                "county_name": county_name,
-                                "state": "MN",
-                            }).execute()
-                            logger.info(
-                                "auto-seeded county for extraction promotion",
-                                county_code=county_code,
-                                county_name=county_name,
-                            )
-
-                    # Parcel next (check-then-insert).
-                    pid = parcel_row["parcel_id"]
-                    # COMPOSITE key. Minnesota parcel IDs are NOT unique across
-                    # counties, so a parcel_id-only check can find another
-                    # county's row, skip the insert, and leave the FK unsatisfied.
-                    # Same defect class fixed the same day in
-                    # properties._apply_assessor_owners.
-                    parcel_exists = (
-                        core_table("parcels")
-                        .select("parcel_id")
-                        .eq("county_code", county_code)
-                        .eq("parcel_id", pid)
-                        .limit(1)
-                        .execute()
+                # Readable county name for the auto-seed, e.g. "Saint Louis"
+                # -> "Saint Louis County". Statewide notices reference any of
+                # MN's 87 counties, and an unseeded county FK-fails the parcel
+                # insert -- the cause of the earlier approval 500s.
+                _raw_county = (
+                    extracted.get("county")
+                    or (parcel_row or {}).get("county_code")
+                    or ""
+                ).strip()
+                _county_name = (
+                    (
+                        _raw_county
+                        if _raw_county.lower().endswith("county")
+                        else f"{_raw_county} County"
                     )
-                    if not parcel_exists.data:
-                        core_table("parcels").insert(parcel_row).execute()
+                    if _raw_county
+                    else None
+                )
 
-                signals_table("distress_events").insert(built["distress_event"]).execute()
-                signals_table("sheriff_sales").insert(built["sheriff_sale"]).execute()
+                rpc_result = (
+                    get_client()
+                    .schema("signals")
+                    .rpc("promote_extraction", {
+                        "p_extraction_id": payload.id,
+                        "p_county_code": (parcel_row or {}).get("county_code"),
+                        "p_county_name": _county_name,
+                        "p_parcel_row": parcel_row,
+                        "p_distress_event": built["distress_event"],
+                        "p_sheriff_sale": built["sheriff_sale"],
+                    })
+                    .execute()
+                )
+                promoted_via_rpc = True
+                logger.info(
+                    "extraction member promoted in one transaction",
+                    extraction_id=payload.id,
+                    parcel_id=effective_pid,
+                    resolved=resolved_pid is not None,
+                    rpc=rpc_result.data,
+                )
 
 
             # Tally per member. `already` and `postponed` are set by the body
@@ -930,12 +714,17 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
 
         
 
-        ts = datetime.now(timezone.utc).isoformat()
-        ai_table("extracted_foreclosures").update({
-            "review_status": "approved",
-            "reviewed_at": ts,
-            "promoted_at": ts,
-        }).eq("id", payload.id).execute()
+        # The RPC already stamped this row inside the promotion transaction.
+        # Only a notice where EVERY member was a duplicate or a postponement
+        # reaches here unstamped -- nothing was inserted, so there is nothing
+        # for this update to be atomic with.
+        if not promoted_via_rpc:
+            ts = datetime.now(timezone.utc).isoformat()
+            ai_table("extracted_foreclosures").update({
+                "review_status": "approved",
+                "reviewed_at": ts,
+                "promoted_at": ts,
+            }).eq("id", payload.id).execute()
 
         logger.info(
             "extraction approved + promoted",
@@ -964,12 +753,36 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
 
     except HTTPException:
         raise
+    except SpineLookupUnavailable as e:
+        # The spine could not be QUERIED -- not "this parcel is not in the
+        # spine". Nothing was written: _resolve_spine_parcel raises before
+        # build_promotion_rows runs, so no synthetic parcel was minted and no
+        # event was inserted.
+        #
+        # 503, not 500, and deliberately retryable. On 2026-08-17 the previous
+        # code swallowed this exact failure, fell through to the synthetic
+        # path, and minted HENNEPIN-FC-3211821340028-2026-08-26 -- a stub named
+        # after the real parcel the dropped connection would have returned.
+        # Six RemoteProtocolErrors hit five different call sites in 150
+        # seconds; the resolver already retries once before giving up, so
+        # reaching here means the database was genuinely unreachable twice.
+        logger.error(
+            "admin approve extraction unavailable — spine unreachable",
+            extraction_id=payload.id,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Parcel lookup is temporarily unavailable. Nothing was "
+                   "written; please retry.",
+        )
     except Exception as e:
         logger.exception("admin approve extraction failed", error_type=type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail="Failed to approve extraction.",
         )
+
 
 @router.post(
     "/extractions/reject",
