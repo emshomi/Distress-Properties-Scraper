@@ -59,7 +59,17 @@ instrument type and store whatever parties are present.
 Two rows can share a Document # (e.g. the April file's rows 8 & 9 both have doc
 4504143 but different PIDs — a sale covering two adjoining parcels). So the stable
 unique identifier is PID + Document#, NOT the document number alone. We build
-source_id = "{pid}-{docnum}" and parcel_id = "WASHINGTON-FC-{pid}".
+source_id = "{pid}-{docnum}".
+
+CHANGED 2026-08-17: parcel_id is now the PID ITSELF when it is a real
+13-digit Washington PIN. It used to be "WASHINGTON-FC-{pid}" unconditionally
+-- a real county parcel number wrapped in a synthetic prefix, which pointed
+every foreclosure at a stub carrying no address, no market value, no owner
+and no coordinates, while the identical PIN sat in core.parcels beside it.
+Measured 2026-08-17: 133 of 145 Washington stubs embedded a PIN that already
+existed in the spine. The synthetic form is kept ONLY for the 12 rows whose
+"pid" is not a 13-digit number (document numbers and attorney file numbers
+that reach this field when the county file omits a PID).
 
 === ARCHITECTURE ===
 fetch():
@@ -69,7 +79,7 @@ fetch():
   3. Keep only the most recent N months (settings-driven; default a rolling
      window). Download each ADID .xlsx and parse its sale rows.
 parse():  each sale row → DistressEventInsert(event_type="foreclosure").
-write():  resolve_parcel + write_events_dedup (mirrors Anoka exactly).
+write():  resolve_parcel for SYNTHETIC rows only + write_events_dedup.
 
 Enrichment (owner / market value / homestead) is a SEPARATE step: a
 washington_foreclosure_enrichment job that PID-joins these rows to the Washington
@@ -209,6 +219,22 @@ def _norm_pid(raw: Any) -> str | None:
         raw = int(raw)
     s = "".join(str(raw).split())
     return s or None
+
+
+def _is_real_pin(raw: Any) -> bool:
+    """True when this value is a Washington County parcel number.
+
+    core.parcels stores Washington PINs as 13 digits (e.g. 2103020330102).
+    Anything else in the county's "pid" column is NOT a parcel: measured
+    2026-08-17 across 145 rows, the exceptions were six 7-digit document
+    numbers and five attorney file numbers. Writing one of those into
+    parcel_id would attach a foreclosure to whatever parcel shared the digits,
+    so the check is deliberately narrow -- exactly 13, digits only.
+    """
+    if raw is None:
+        return False
+    s = "".join(str(raw).split())
+    return len(s) == 13 and s.isdigit()
 
 
 class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
@@ -515,7 +541,37 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
                 continue
 
             docnum = r.get("docnum") or "nodoc"
-            parcel_id = f"WASHINGTON-FC-{pid}"
+
+            # === THE PID IS THE PARCEL ID (2026-08-17) ===
+            #
+            # This line used to read, unconditionally:
+            #
+            #     parcel_id = f"WASHINGTON-FC-{pid}"
+            #
+            # Washington publishes the county's own unformatted PIN in column A
+            # -- 2103020330102, the exact 13-digit form core.parcels is keyed
+            # on. _norm_pid's own docstring says it is kept verbatim "so it
+            # joins cleanly to the TaxParcel PIN". It joined cleanly to the
+            # enrichment layer and was then thrown away for the parcel
+            # identity, so every foreclosure hung off a stub with no address,
+            # no market value, no owner and no coordinates -- while the same
+            # PIN sat in core.parcels beside it.
+            #
+            # Measured 2026-08-17: 133 of 145 Washington stubs embedded a PIN
+            # that already existed in the spine. No address matching is needed
+            # or wanted here; a PIN is an identity, not an inference.
+            #
+            # The 12 that did NOT match are not PINs at all: six 7-digit
+            # document numbers, and five attorney file numbers (MN24340,
+            # 054676-F2, 26-003543FC) that belong to mnpublicnotice's synthetic
+            # path sharing this prefix. They keep the synthetic form, because
+            # writing a document number into parcel_id would attach a
+            # foreclosure to whatever parcel happened to share those digits.
+            if _is_real_pin(pid):
+                parcel_id = str(pid)
+            else:
+                parcel_id = f"WASHINGTON-FC-{pid}"
+
             # PID + Document# is the stable unique key (two parcels can share a doc).
             source_id = f"{pid}-{docnum}"
 
@@ -612,8 +668,18 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
         if not signals:
             return 0, 0, 0
 
+        # === ONLY SYNTHETIC PARCELS ARE WRITTEN (2026-08-17) ===
+        #
+        # A real PIN already exists in core.parcels with assessor data.
+        # Putting it through resolve_parcel runs _merge_parcel_payload, whose
+        # fill-in semantics set any column the existing row has NULL -- and
+        # this payload carries address=None, city=None, zip=None, so it adds
+        # nothing while appending washington_sheriff to data_sources on a row
+        # it did not supply. _IMMUTABLE_FIELDS protects the key columns only.
         unique_parcels: dict[str, ParcelUpsert] = {}
         for ev in signals:
+            if not ev.parcel_id.startswith("WASHINGTON-FC-"):
+                continue
             if ev.parcel_id in unique_parcels:
                 continue
             raw = ev.raw_data or {}
@@ -643,7 +709,10 @@ class WashingtonSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert])
         logger.info(
             "Washington write complete",
             source=self.source_name,
-            parcels=len(unique_parcels),
+            # Stubs minted this run. Was one per sale row before 2026-08-17;
+            # should now be only the rows whose "pid" is not a 13-digit PIN.
+            parcels_synthetic=len(unique_parcels),
+            events=len(signals),
             events_new=new_events,
             failed=failed_events + parcels_failed,
         )
