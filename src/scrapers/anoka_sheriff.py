@@ -37,8 +37,11 @@ BeautifulSoup rather than hard-coding them — robust to control-name changes.
        status. Detail failures are tolerated (we keep the list row).
 
   parse():  convert each enriched row into a DistressEventInsert (sheriff_sale).
-  write():  synthesize a stable parcel_id (ANOKA-FC-{id}); resolve_parcel +
-            write_events_dedup, mirroring the Dakota scraper.
+  parse():  parcel_id comes off a FOUR-RUNG ladder — propid, then the
+            detail page's tax_parcel_no, then an address match against the
+            county spine, and only then ANOKA-FC-{id}.
+  write():  resolve_parcel for UNRESOLVED (synthetic) rows only +
+            write_events_dedup.
 
 Severity:
   pending sale in the future        -> high     (actionable: can still help)
@@ -63,6 +66,10 @@ from src.models.signal import DistressEventInsert
 from src.scrapers.base_scraper import BaseScraper
 from src.services.event_writer import write_events_dedup
 from src.services.parcel_resolver import resolve_parcel
+from src.services.spine_resolver import (
+    SpineLookupUnavailable,
+    resolve_by_address,
+)
 from src.utils.errors import ParseError, SourceUnavailableError
 from src.utils.logger import logger
 
@@ -1197,10 +1204,54 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
             # rather than borrowing a function that does something else.
             propid = r.get("propid")
             tax_pin = _tax_parcel_no_to_pid(r.get("tax_parcel_no"))
+
+            # ── THIRD RUNG, ADDED 2026-08-17 ───────────────────────────────
+            # The 2026-08-14 note above measured 74 of 181 synthetic Anoka
+            # events carrying a tax_parcel_no and closed that gap. It also
+            # said of the remaining 107: "a separate problem (the detail page
+            # was not fetched, or the county did not publish one) needing its
+            # own fix, not this one." This is that fix.
+            #
+            # Measured 2026-08-17: this scraper minted 17 stubs at 12:46, and
+            # 17 of 17 resolve to exactly ONE real Anoka parcel by address —
+            # the residue after both PIN rungs, matched on the address the
+            # county publishes on its own list and detail pages.
+            #
+            # Address is the LAST rung before synthesising because a PIN is an
+            # identity and an address is an inference. Both PIN rungs are
+            # exact; this one requires a unique normalised match and refuses
+            # ambiguity, since a wrong parcel attaches a foreclosure to
+            # somebody else's house.
+            #
+            # Same fallback chain write() uses: the list row's address, then
+            # the detail page's.
+            _addr = _safe_str(r.get("address")) or _safe_str(
+                r.get("detail_address")
+            )
+            spine_row = None
+            if not (propid and str(propid).strip()) and not tax_pin and _addr:
+                try:
+                    spine_row = resolve_by_address(self.county_code, _addr)
+                except SpineLookupUnavailable as e:
+                    # The spine could not be QUERIED — not evidence the parcel
+                    # is absent. Minting a stub on a dropped connection is
+                    # irreversible in practice: it accrues events, imagery and
+                    # listings that must then be re-pointed by hand. Skip the
+                    # row; Anoka republishes both lists on every run.
+                    logger.warning(
+                        "Anoka row skipped — spine unreachable",
+                        source=self.source_name,
+                        detail_id=detail_id,
+                        error=str(e),
+                    )
+                    continue
+
             if propid and str(propid).strip():
                 parcel_id = str(propid).strip()
             elif tax_pin:
                 parcel_id = tax_pin
+            elif spine_row is not None:
+                parcel_id = spine_row["parcel_id"]
             else:
                 parcel_id = f"ANOKA-FC-{detail_id}"
 
@@ -1342,8 +1393,23 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         if not signals:
             return 0, 0, 0
 
+        # === ONLY SYNTHETIC PARCELS ARE WRITTEN (2026-08-17) ===
+        #
+        # Anoka has always written a ParcelUpsert for EVERY row, including the
+        # ones whose parcel_id came off a real PIN rung. That put the Sheriff's
+        # data through _merge_parcel_payload, whose fill-in semantics set any
+        # column the existing row has NULL — so the foreclosure list's address
+        # could land on a real assessor parcel, and data_sources gained a feed
+        # that did not supply the row. _IMMUTABLE_FIELDS protects parcel_id,
+        # county_code and state; it protects nothing else.
+        #
+        # A row on a real PIN needs no parcels write at all: the parcel is
+        # already there, richer than anything this scraper has. Only the
+        # ANOKA-FC-* residue does.
         unique_parcels: dict[str, ParcelUpsert] = {}
         for ev in signals:
+            if not ev.parcel_id.startswith("ANOKA-FC-"):
+                continue
             if ev.parcel_id in unique_parcels:
                 continue
             raw = ev.raw_data or {}
@@ -1375,7 +1441,11 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         logger.info(
             "Anoka write complete",
             source=self.source_name,
-            parcels=len(unique_parcels),
+            # Stubs minted this run, NOT parcels touched. A real parcel_id off
+            # any of the first three rungs is skipped above — the row already
+            # exists with assessor data that _merge_parcel_payload's fill-in
+            # semantics would write over wherever a column is NULL.
+            parcels_synthetic=len(unique_parcels),
             events_new=new_events,
             failed=failed_events + parcels_failed,
         )
