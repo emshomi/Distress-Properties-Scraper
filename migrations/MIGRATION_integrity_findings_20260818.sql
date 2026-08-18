@@ -36,12 +36,19 @@
 -- have been found. The stubs ACCUMULATING is what made the defect
 -- visible. Keep it visible.
 --
--- === CORRECTED 2026-08-18, SAME NIGHT ===
+-- === CORRECTED TWICE ON 2026-08-18, THE SAME NIGHT IT SHIPPED ===
 --
--- Check 3 shipped wrong and was replaced within minutes of its first
--- run. It grouped on the notice's gis_pid, which flagged every PACKAGE
--- notice as a duplicate -- 9 false alerts on run 1, and it would have
--- missed both of the real duplicates it was written for. See check 3.
+-- v1  grouped on the notice's gis_pid -> flagged every PACKAGE notice
+--     as a duplicate. 9 false alerts on run 1, and it would have missed
+--     both real duplicates.
+-- v2  grouped on the parcel -> flagged the AUCTION LIFECYCLE (a pending
+--     sale and its completed sale are two real facts about one
+--     property). 57 groups, 39 of them false.
+-- v3  grouped on parcel + event_subtype -> 18 groups, all genuine.
+--
+-- Recorded because the shape of the error repeated: each version was
+-- checked against a population that did not contain the case it got
+-- wrong. See check 3.
 --
 -- === HOW TO READ THE OUTPUT ===
 --
@@ -160,9 +167,10 @@ WHERE r.hits = 1
 GROUP BY s.county_code;
 
 
--- === CHECK 3: TWO EVENTS ON ONE PARCEL FOR ONE SALE DATE ============
+-- === CHECK 3: TWO EVENTS, ONE PARCEL, ONE DATE, ONE SUBTYPE =========
 --
--- A genuine duplicate is the SAME PROPERTY twice. Two causes, both real:
+-- A genuine duplicate is the SAME PROPERTY, SAME SALE, twice. Three
+-- causes seen, all real:
 --
 --  (a) A PostgREST connection dropped mid-lookup, the resolver was
 --      swallowing the exception, and the fallback minted a stub -- so
@@ -176,26 +184,46 @@ GROUP BY s.county_code;
 --      Any stub minted BEFORE that date is invisible to the guard.
 --      Beltrami extraction 528 duplicated event 123546 on 2026-08-18 for
 --      exactly this reason -- while extraction 397, promoted 08-02 under
---      the old format, had correctly matched and written nothing.
---      Cause (b) is STILL LIVE for every pre-08-10 stub in the table.
+--      the old format, correctly matched and wrote nothing.
+--      STILL LIVE for every pre-08-10 stub in the table.
 --
--- === WHY THIS IS NOT GROUPED ON THE NOTICE PID ===
+--  (c) A county reissues a notice under a NEW detail id. Anoka parcel
+--      313123440024, sale 2026-10-13: source_id 23665 observed 07-29 and
+--      23849 observed 08-07. source_id is part of
+--      distress_events_source_identity_key, so the constraint permits it.
+--      A cross-source variant exists too -- anoka 063124210026 pairs
+--      anoka_sheriff's '22677' with mnpublicnotice's '19-25-004802'.
 --
--- The first version of this check grouped on
--- raw_data.detail.gis_pid + event_date and flagged differing
--- parcel_ids. That is the PACKAGE shape, not a duplicate. One notice can
--- cover many parcels: washington 26-003536FC lists THIRTEEN Forest Lake
--- properties under a single bid of $261,140.77, and each correctly
--- becomes its own event so a subscriber searching that city sees all of
--- them. gis_pid on every member is the notice's WHOLE LIST.
+-- === WHY event_subtype IS IN THE GROUPING ===
 --
--- That version fired NINE times on its first run, every one a package
--- notice, every one correct behaviour -- and it would have MISSED both
--- real duplicates, because Red Lake and Beltrami each carried the same
--- notice pid on both rows.
+-- Without it this check flags the AUCTION LIFECYCLE as a duplicate.
+-- Anoka publishes a sale in Pending Sales before it happens and in
+-- Completed Sales after:
 --
--- Group on the PARCEL. A package member is distinct by parcel by
--- definition; a duplicate is not.
+--   45353   pending_sale    source_id 23679         $124,880.44  high
+--   187159  completed_sale  source_id 033324220004  NULL         low
+--
+-- Same parcel, same date -- and TWO REAL FACTS. The pending row carries
+-- the amount due; the completed row starts the redemption clock. Losing
+-- either is worse than holding both. (Note the completed list publishes
+-- no detail id, so source_id falls back to the PIN.)
+--
+-- Measured 2026-08-18: 57 groups without event_subtype, 18 with it.
+-- The 39 difference was entirely lifecycle pairs.
+--
+-- This is the same field that is load-bearing in the supersession
+-- trigger, where omitting it collapsed dakota completed_sale_2025 and
+-- completed_sale_2026 -- 60 chains, two different real sales of one
+-- property.
+--
+-- === AND WHY NOT GROUPED ON THE NOTICE PID ===
+--
+-- An earlier version grouped on raw_data.detail.gis_pid and flagged
+-- differing parcel_ids. That is the PACKAGE shape: washington
+-- 26-003536FC lists THIRTEEN Forest Lake properties under one bid, each
+-- correctly its own event. It fired 9 times on run 1, every one a false
+-- positive, and would have missed both real duplicates -- Red Lake and
+-- Beltrami each carried the same notice pid on both rows.
 INSERT INTO audit.integrity_findings (run_at, check_name, severity, county_code, n, detail)
 SELECT v_run,
        'duplicate_events_same_parcel',
@@ -203,14 +231,16 @@ SELECT v_run,
        e.county_code,
        COUNT(*),
        jsonb_build_object(
-         'parcel_id',  e.parcel_id,
-         'event_date', e.event_date,
-         'on_stub',    e.parcel_id LIKE '%-FC-%',
-         'event_ids',  array_agg(e.id        ORDER BY e.id),
-         'source_ids', array_agg(e.source_id ORDER BY e.id))
+         'parcel_id',     e.parcel_id,
+         'event_date',    e.event_date,
+         'event_subtype', e.event_subtype,
+         'on_stub',       e.parcel_id LIKE '%-FC-%',
+         'event_ids',     array_agg(e.id        ORDER BY e.id),
+         'source_ids',    array_agg(e.source_id ORDER BY e.id),
+         'sources',       array_agg(DISTINCT e.source))
 FROM signals.distress_events e
 WHERE e.event_type = 'sheriff_sale'
-GROUP BY e.county_code, e.parcel_id, e.event_date
+GROUP BY e.county_code, e.parcel_id, e.event_date, e.event_subtype
 HAVING COUNT(*) > 1;
 
 
