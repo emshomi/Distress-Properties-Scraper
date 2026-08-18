@@ -29,6 +29,27 @@ never claim a number the page then contradicts.
 One malformed filter set must not stop every other subscriber's digest. Each
 search is counted and sent inside its own try, and a failure is logged and
 skipped.
+
+=== _process_one RETURNS A REASON, NOT A BOOL (2026-08-18) ===
+It used to return True/False, so THREE different outcomes reported
+identically as sent=0, failed=0:
+
+    no_email      the joined user row carries no address
+    no_matches    nothing new since last_alerted_at -- correct, no email
+    send_failed   Resend rejected it
+
+Measured 2026-08-18: the 14:00 run logged considered=2 due=2 sent=0
+failed=0, and establishing which of the three had happened took a query
+against signals.distress_events to prove no Hennepin sheriff_sale event
+existed after 2026-08-15. The instrument could not answer its own question.
+
+send_failed is now counted in `failed`, not merely absent from `sent`. It is
+a soft failure -- resend_send returns falsy rather than raising, and
+last_alerted_at deliberately does NOT advance so the matches are retried --
+but a digest silently failing to send for a week while matches accumulate is
+the exact failure this file exists to prevent. The retry means a transient
+rejection self-heals, so a count that briefly reads 1 costs a second glance.
+Same trade as UNHEALTHY_THRESHOLD = 1 in source_health_tracker.py.
 """
 
 from __future__ import annotations
@@ -97,8 +118,12 @@ def _digest_body(name: str, count: int, base_url: str) -> str:
     )
 
 
-async def _process_one(row: dict[str, Any], base_url: str) -> bool:
-    """Count, send and mark one saved search. Returns True if an email went.
+async def _process_one(row: dict[str, Any], base_url: str) -> str:
+    """Count, send and mark one saved search.
+
+    Returns the OUTCOME, not a bool: one of "sent", "no_email",
+    "no_matches", "send_failed". The caller counts each separately --
+    see the module docstring for why a bare bool was not enough.
 
     Never raises — the caller runs this for every subscriber and one bad row
     must not end the run.
@@ -109,7 +134,7 @@ async def _process_one(row: dict[str, Any], base_url: str) -> bool:
     if not email:
         # No address on the joined user row. Nothing to do, and nothing worth
         # alarming about: the account exists, it simply cannot be mailed.
-        return False
+        return "no_email"
 
     # A digest is about what changed SINCE THE LAST DIGEST, so the baseline is
     # last_alerted_at — not last_viewed_at, which belongs to the badge.
@@ -134,7 +159,7 @@ async def _process_one(row: dict[str, Any], base_url: str) -> bool:
     if not new_count:
         # None (count failed) or 0 (nothing new). Neither is worth an email,
         # and an empty digest is how a useful alert becomes spam.
-        return False
+        return "no_matches"
 
     sent = await resend_send(
         email,
@@ -144,8 +169,8 @@ async def _process_one(row: dict[str, Any], base_url: str) -> bool:
     )
     if not sent:
         # Do NOT advance last_alerted_at on a failed send, or these matches
-        # are never mentioned again.
-        return False
+        # are never mentioned again -- they are retried on the next run.
+        return "send_failed"
 
     try:
         saved_table("searches").update({
@@ -160,7 +185,7 @@ async def _process_one(row: dict[str, Any], base_url: str) -> bool:
             search_id=search_id,
             error_type=type(e).__name__,
         )
-    return True
+    return "sent"
 
 
 async def run_saved_search_alerts() -> dict[str, int]:
@@ -195,8 +220,12 @@ async def run_saved_search_alerts() -> dict[str, int]:
 
     considered = len(rows)
     due = 0
-    sent = 0
-    failed = 0
+    # Every due search lands in exactly one of these, so they sum to `due`
+    # and no outcome is invisible. A bucket that does not sum is how
+    # ramsey_parcels reported 57,500 failures the digest could not reach
+    # (see source_health_tracker.record_partial) -- the same shape.
+    outcomes = {"sent": 0, "no_email": 0, "no_matches": 0,
+                "send_failed": 0, "error": 0}
 
     for row in rows:
         if not _is_due(
@@ -205,25 +234,47 @@ async def run_saved_search_alerts() -> dict[str, int]:
             continue
         due += 1
         try:
-            if await _process_one(row, base_url):
-                sent += 1
+            outcome = await _process_one(row, base_url)
         except Exception as e:
-            failed += 1
+            outcome = "error"
             logger.warning(
                 "saved search alert failed",
                 search_id=row.get("id"),
                 error_type=type(e).__name__,
                 error=str(e)[:300],
             )
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
-    logger.info(
-        "saved search alerts complete",
-        considered=considered,
-        due=due,
-        sent=sent,
-        failed=failed,
-    )
-    return {"considered": considered, "due": due, "sent": sent, "failed": failed}
+    # `failed` keeps its name and its place in the log line -- cron.py reads
+    # it -- but now means "a digest that SHOULD have gone and did not",
+    # which is send_failed plus a raised exception. no_matches is not a
+    # failure; it is the correct outcome when nothing changed.
+    failed = outcomes["send_failed"] + outcomes["error"]
+
+    summary = {
+        "considered": considered,
+        "due": due,
+        "sent": outcomes["sent"],
+        "failed": failed,
+        "no_matches": outcomes["no_matches"],
+        "no_email": outcomes["no_email"],
+        "send_failed": outcomes["send_failed"],
+        "errored": outcomes["error"],
+    }
+
+    # Self-check: if these ever stop summing, a new return path was added to
+    # _process_one and is landing in no bucket at all.
+    counted = sum(outcomes.values())
+    if counted != due:
+        logger.error(
+            "saved search alert outcomes do not sum to due",
+            due=due,
+            counted=counted,
+            **outcomes,
+        )
+
+    logger.info("saved search alerts complete", **summary)
+    return summary
 
 
 def run_saved_search_alerts_blocking() -> dict[str, int]:
