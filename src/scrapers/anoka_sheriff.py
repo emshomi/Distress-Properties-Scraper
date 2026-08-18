@@ -1322,6 +1322,13 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 desc_parts.append(f"Status: {r['status']}.")
             description = " ".join(desc_parts)[:2000]
 
+            # ADDED 2026-08-18. Hoisted out of DistressEventInsert below so
+            # event_subtype and source_id derive from ONE expression. They
+            # must never disagree: source_id now embeds the subtype, and a
+            # drift between them would produce a key that does not describe
+            # the row it identifies.
+            event_subtype = "pending_sale" if is_pending else "completed_sale"
+
             signals.append(DistressEventInsert(
                 parcel_id=parcel_id,
                 # ADDED 2026-08-10. This scraper builds DistressEventInsert
@@ -1338,7 +1345,7 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 # affected in total; all were backfilled by hand.
                 county_code=self.county_code,
                 event_type="sheriff_sale",
-                event_subtype=("pending_sale" if is_pending else "completed_sale"),
+                event_subtype=event_subtype,
                 event_date=sale_date,
                 event_value=amount_due,
                 source=self.source_name,
@@ -1379,7 +1386,24 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 # detail_id is NOT discarded -- it is kept in raw_data.list
                 # below, which is where a trace back to the county's page
                 # belongs. It is just no longer the identity.
-                source_id=f"{parcel_id}-{sale_date.isoformat()}",
+                # === SUBTYPE IS PART OF THE IDENTITY (2026-08-18, later) ===
+                #
+                # parcel + sale date ALONE is not unique. A property whose
+                # sale is scheduled for date X and completed on date X
+                # produces a pending_sale row and a completed_sale row with
+                # the SAME parcel and the SAME date. Both are real and both
+                # are needed -- the pending row carries the amount due, the
+                # completed row starts the redemption clock -- so they must
+                # never be collapsed into one.
+                #
+                # Measured 2026-08-18 after the parcel+date change shipped:
+                # 34 of 150 remaining pending rows could not be re-keyed
+                # because a completed row already occupied
+                # {parcel}-{date}. All 34 differed on subtype, severity and
+                # (30 of 34) value -- distinct records, not copies. Without
+                # the subtype the next run would have overwritten or
+                # dropped a LIVE pending foreclosure on those properties.
+                source_id=f"{parcel_id}-{sale_date.isoformat()}-{event_subtype}",
                 severity=severity,  # type: ignore[arg-type]
                 title=title,
                 description=description,
