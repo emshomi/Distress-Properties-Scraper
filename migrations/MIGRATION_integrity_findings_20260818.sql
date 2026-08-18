@@ -432,6 +432,71 @@ FROM outcomes.reset_stale_labels(true) r
 GROUP BY r.county_code;
 
 
+-- === CHECK 10: EVENT SOURCES MISSING A REGISTRATION =================
+--
+-- ADDED 2026-08-18 (second session). A source can write events while
+-- absent from the registries that make it visible, and every instance so
+-- far was found by somebody stumbling on it. The notes column of
+-- core.source_county_map is a log of the same mistake recurring:
+--
+--   mpls_311            "ADDED 2026-08-10: absent from this registry
+--                        entirely, so all 1,304 of its events carried
+--                        county_code NULL -- which disabled BOTH the
+--                        composite FK to core.parcels AND
+--                        distress_events_dedup_key (NULL never collides)"
+--   mnpublicnotice      "Added 2026-08-05 -- source was absent entirely,
+--                        so 240 rows had no mapping path"
+--   olmsted_delq_list   "fixed 2026-07-11: was NULL in view CASE"
+--   postbulletin_legal  "fixed 2026-07-11: was NULL in view CASE"
+--   ramsey_tfl          "fixed 2026-07-11: was NULL in view CASE"
+--
+-- Found live on 2026-08-18: mnpn_redemption_notice, 335 events across 13
+-- counties, absent from BOTH registries. Its rows were well-formed
+-- (county_code set by the scraper, so county_null = 0), but it had written
+-- nothing for eight days and no bucket in the digest could report that,
+-- because a source with no audit.source_health row is not merely unjudged
+-- -- it is unknown.
+--
+-- TWO DIFFERENT ABSENCES, DELIBERATELY REPORTED SEPARATELY IN detail:
+--   missing_county_map     -> county_code may be NULL on its events,
+--                             which silently disables the composite FK
+--                             and the dedup key
+--   missing_source_health  -> invisible to the health digest entirely;
+--                             cannot be Broken, Stale, Frozen, Healthy
+--                             or even Unscheduled
+--
+-- A NULL county_slug in core.source_county_map is CORRECT for a
+-- multi-county source (mnpublicnotice, startribune_legal resolve the slug
+-- per row from raw_data detail.county), so this check tests for the
+-- PRESENCE OF THE ROW, never for a non-null slug.
+--
+-- Severity is by event count, not by which registry is missing: a source
+-- with thousands of unregistered events has done more damage than one
+-- with three, whichever registry it is absent from.
+INSERT INTO audit.integrity_findings (run_at, check_name, severity, county_code, n, detail)
+SELECT v_run,
+       'source_missing_registration',
+       CASE WHEN COUNT(*) >= 100 THEN 'alert'
+            WHEN COUNT(*) >= 10  THEN 'warn'
+            ELSE 'info' END,
+       NULL,
+       COUNT(*),
+       jsonb_build_object(
+         'source',                e.source,
+         'missing_county_map',    (m.source IS NULL),
+         'missing_source_health', (h.source_name IS NULL),
+         'distinct_counties',     COUNT(DISTINCT e.county_code),
+         'county_null_events',    COUNT(*) FILTER (WHERE e.county_code IS NULL),
+         'first_written',         MIN(e.observed_at),
+         'last_written',          MAX(e.observed_at))
+FROM signals.distress_events e
+LEFT JOIN core.source_county_map m ON m.source      = e.source
+LEFT JOIN audit.source_health    h ON h.source_name = e.source
+WHERE e.source IS NOT NULL
+  AND (m.source IS NULL OR h.source_name IS NULL)
+GROUP BY e.source, (m.source IS NULL), (h.source_name IS NULL)
+HAVING COUNT(*) > 0;
+
 -- ---------------------------------------------------------------------
 -- Return this run's findings, worst first.
 -- ---------------------------------------------------------------------
