@@ -72,7 +72,13 @@ _SCRAPER_SCHEDULES: tuple[tuple[type[BaseScraper], dict[str, Any]], ...] = (
        # API. No scrapable endpoint exists. Re-enable if a violations Feature
        # Service appears on services.arcgis.com/afSMGVsC7QlRK1kZ/.
        # (MplsThreeOneOneScraper, {"hour": 6, "minute": 0}),
-    (HennepinSheriffScraper, {"hour": 6, "minute": 15}),
+    # RETIRED 2026-08-18: hennepin_sheriff also runs in GitHub Actions
+       # (.github/workflows/hennepin-scrape.yml, cron "10 12 * * *"). Both fired
+       # daily — Railway 11:15 UTC as run_id 670, Actions 13:02 UTC as run #89 —
+       # two independent writers on one source. Actions is the survivor because
+       # anoka, dakota and washington all live there. Re-enable ONLY if the
+       # Actions workflow is deleted first.
+       # (HennepinSheriffScraper, {"hour": 6, "minute": 15}),
     (MplsVacantBuildingScraper, {"hour": 7, "minute": 0}),
     (SaintPaulVacantBuildingScraper, {"hour": 7, "minute": 15}),
     (McroProbateScraper, {"hour": 8, "minute": 0}),
