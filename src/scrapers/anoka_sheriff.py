@@ -37,7 +37,10 @@ BeautifulSoup rather than hard-coding them — robust to control-name changes.
        status. Detail failures are tolerated (we keep the list row).
 
   parse():  convert each enriched row into a DistressEventInsert (sheriff_sale).
-  parse():  parcel_id comes off a FOUR-RUNG ladder — propid, then the
+  parse():  source_id is parcel_id + sale date, NOT the county's notice id
+            (2026-08-18 -- Anoka reissues pending sales under a new id and
+            that produced 14 duplicate groups). parcel_id comes off a
+            FOUR-RUNG ladder — propid, then the
             detail page's tax_parcel_no, then an address match against the
             county spine, and only then ANOKA-FC-{id}.
   write():  resolve_parcel for UNRESOLVED (synthetic) rows only +
@@ -1339,7 +1342,44 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                 event_date=sale_date,
                 event_value=amount_due,
                 source=self.source_name,
-                source_id=str(detail_id),
+                # === IDENTITY IS THE PROPERTY AND THE SALE, NOT THE NOTICE ===
+                #
+                # Was `str(detail_id)` for BOTH modes. For a COMPLETED row
+                # detail_id is already the property (propid, see
+                # _parse_list_table: "Identity for a COMPLETED row is the
+                # property"), so completed rows were correct. For a PENDING
+                # row detail_id is Anoka's `?id=` -- an identifier for the
+                # NOTICE, and Anoka reissues a pending sale under a NEW id
+                # during the statutory publication run.
+                #
+                # distress_events_source_identity_key is
+                # (county_code, source, source_id, event_date), so a reissue
+                # produced a fresh key and a second event on the same
+                # property for the same sale.
+                #
+                # Measured 2026-08-18: 14 duplicate groups, every one
+                # pending_sale, every one with a SINGLE distinct event_value
+                # and severity across its copies -- identical records under
+                # different ids. Parcel 033123430062 held THREE copies of one
+                # $6,540.87 HOA foreclosure under ids 23770 / 23812 / 23876,
+                # first seen 07-25 and last 08-15.
+                #
+                # Anoka is not even consistent about it: parcel 313123440024
+                # kept id 23665 across a genuine postponement from 08-04 to
+                # 10-13. An id that is sometimes stable and sometimes not is
+                # worse than one that never is, because the duplicates look
+                # arbitrary.
+                #
+                # parcel_id + sale date is stable across every reissue. It is
+                # the same identity washington_sheriff uses ("{pid}-{docnum}")
+                # and the same conclusion reached for mnpublicnotice
+                # republication, where six statutory weeks correctly produce
+                # ONE event.
+                #
+                # detail_id is NOT discarded -- it is kept in raw_data.list
+                # below, which is where a trace back to the county's page
+                # belongs. It is just no longer the identity.
+                source_id=f"{parcel_id}-{sale_date.isoformat()}",
                 severity=severity,  # type: ignore[arg-type]
                 title=title,
                 description=description,
@@ -1358,6 +1398,12 @@ class AnokaSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         # resolved to core.parcels rows.
                         "propid": r.get("propid"),
                         "docnum": r.get("docnum"),
+                        # ADDED 2026-08-18. source_id is now
+                        # parcel_id + sale date, so the county's own row
+                        # identifier lives here -- it is how you trace a row
+                        # back to ForeclosureNotice.aspx?id=N, and for a
+                        # pending sale it CHANGES on reissue.
+                        "detail_id": r.get("detail_id"),
                     },
                     "detail": {
                         "owner_name": r.get("owner_name"),
