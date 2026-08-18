@@ -178,7 +178,12 @@ SELECT county_code,
 FROM ai.extracted_redemptions
 WHERE parcel_id IS NULL
   AND promoted_at IS NULL
-  AND review_status <> 'rejected'
+  -- 'not_a_parcel', not 'rejected'. MEASURED 2026-08-18: the status
+  -- vocabulary in ai.extracted_redemptions is promoted / pending /
+  -- not_a_parcel. 'rejected' has never existed, so this predicate
+  -- excluded nothing and 30 permanently-unpromotable rows were
+  -- reported as unresolved work on every run.
+  AND review_status NOT IN ('not_a_parcel', 'rejected')
 GROUP BY county_code
 ORDER BY unresolved DESC;
 """
@@ -200,7 +205,12 @@ SELECT r.id,
        r.fetched_at
 FROM ai.extracted_redemptions r
 WHERE r.promoted_at IS NULL
-  AND r.review_status <> 'rejected'
+  -- 'not_a_parcel' is a decision already taken: the notice does not
+  -- describe a parcel (Crow Wing severed mineral interests, for
+  -- example). Those rows can never satisfy parcel_id IS NOT NULL, so
+  -- excluding them here is what makes `held` mean outstanding work.
+  -- 'rejected' kept for forward compatibility; it is not in use.
+  AND r.review_status NOT IN ('not_a_parcel', 'rejected')
   -- Objective completeness. Every one of these is a fact about whether the
   -- row is USABLE, not a judgement about whether it is correct.
   AND r.parcel_id IS NOT NULL          -- resolved against core.parcels
@@ -244,7 +254,7 @@ SELECT count(*)                                                AS held,
                         AND confidence < %(floor)s)            AS below_floor_promoted_anyway
 FROM ai.extracted_redemptions
 WHERE promoted_at IS NULL
-  AND review_status <> 'rejected';
+  AND review_status NOT IN ('not_a_parcel', 'rejected');
 """
 
 EXISTING_EVENT = """
