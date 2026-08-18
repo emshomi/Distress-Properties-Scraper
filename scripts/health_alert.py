@@ -245,10 +245,17 @@ def _fetch_source_max_dates(supabase_url: str, service_key: str) -> dict[str, st
         "Authorization": f"Bearer {service_key}",
         "Accept-Profile": "audit",
     }
+    # LIMIT RAISED 20000 (2026-08-18). At 3000 rows and ~70 scrapers
+    # running daily this window was about six weeks -- so a source whose
+    # last source_max_date report fell outside it VANISHED from the
+    # freshness section entirely. That is the same failure the row-cap was
+    # chosen to avoid, just at a different scale, and it hides exactly the
+    # source most worth watching. Raised rather than switched to a date
+    # window for the reason in the docstring above.
     params = {
         "select": "scraper_name,started_at,metadata",
         "order": "started_at.desc",
-        "limit": "3000",
+        "limit": "20000",
     }
     try:
         resp = httpx.get(url, headers=headers, params=params, timeout=60)
@@ -276,7 +283,54 @@ def _fetch_source_max_dates(supabase_url: str, service_key: str) -> dict[str, st
     return newest
 
 
-def _freshness_state(row: dict, source_max_date: str | None) -> tuple[str, str]:
+def _fetch_source_last_event(supabase_url: str, service_key: str) -> dict[str, str]:
+    """When each source last WROTE AN EVENT, from audit.source_last_event().
+
+    ADDED 2026-08-18. This is the veto that stops a live source being
+    called FROZEN. source_max_date is the newest date IN the data, which
+    is a different thing from liveness: saint_paul_vacant publishes
+    registration dates that stopped moving in July 2025 while the city
+    kept publishing records, and the digest called it FROZEN at 392 days
+    on a morning it wrote 16 events. mpls_vbr is the same shape waiting
+    to happen -- latest_event_date 2024-11-01, wrote 2026-08-07.
+
+    ONE-DIRECTIONAL, deliberately. Recent events prove a source is alive.
+    NO events proves nothing: parcel loaders write to core.parcels and
+    never produce a distress_event, so absence must mean "no opinion",
+    never "frozen". Only 17 of 78 sources have ever written one.
+
+    Never fatal: a failure here degrades the veto to "unavailable" and
+    the digest falls back to the source_max_date rule alone.
+    """
+    url = f"{supabase_url}/rest/v1/rpc/source_last_event"
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Accept-Profile": "audit",
+        "Content-Profile": "audit",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = httpx.post(url, headers=headers, json={}, timeout=60)
+    except httpx.HTTPError as e:
+        print(f"WARNING: could not read source_last_event: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return {}
+    if resp.status_code != 200:
+        print(f"WARNING: source_last_event returned {resp.status_code} — "
+              f"freshness veto unavailable", flush=True)
+        return {}
+    out: dict[str, str] = {}
+    for row in resp.json() or []:
+        name = row.get("source")
+        seen = row.get("last_event_at")
+        if name and seen:
+            out[name] = seen
+    return out
+
+
+def _freshness_state(row: dict, source_max_date: str | None,
+                     last_event_at: str | None = None) -> tuple[str, str]:
     """Return (state, reason) for one source's DATA freshness.
 
     States: 'fresh' | 'frozen' | 'exempt' | 'unjudged' | 'unknown'.
@@ -322,6 +376,27 @@ def _freshness_state(row: dict, source_max_date: str | None) -> tuple[str, str]:
     cadence = f"publishes every ~{int(interval)}d"
 
     if age_days > threshold:
+        # === THE LIVENESS VETO (2026-08-18) ===
+        #
+        # source_max_date says the DATA is old. That is not the same as
+        # the SOURCE being dead. saint_paul_vacant was reported FROZEN at
+        # 392 days on a morning it wrote 16 events -- the city kept
+        # publishing; only the registration-date field stopped moving.
+        #
+        # If this source has written an event inside the same threshold,
+        # it is demonstrably alive and the stale-date reading is a fact
+        # about the field, not the feed. Say so rather than crying frozen.
+        ev = _parse_ts(last_event_at)
+        if ev is not None:
+            if ev.tzinfo is None:
+                ev = ev.replace(tzinfo=timezone.utc)
+            ev_age = (now - ev).total_seconds() / 86400.0
+            if ev_age <= threshold:
+                return "fresh", (
+                    f"newest data {source_max_date} is {age_days:.0f} days old, "
+                    f"BUT the source wrote an event {ev_age:.0f}d ago — alive, "
+                    f"its date field has stopped moving"
+                )
         return "frozen", (
             f"newest data {source_max_date}, {age_days:.0f} days old "
             f"({cadence}, threshold {threshold:.0f}d)"
@@ -463,6 +538,7 @@ def _classify(row: dict) -> tuple[str, str]:
 def _build_digest(
     rows: list[dict],
     source_max_dates: dict[str, str] | None = None,
+    source_last_event: dict[str, str] | None = None,
 ) -> tuple[str, str, bool]:
     """Return (subject, body, any_problem)."""
     broken: list[tuple[str, str]] = []
@@ -475,6 +551,7 @@ def _build_digest(
     frozen: list[tuple[str, str]] = []
     undated: list[str] = []
     smd = source_max_dates or {}
+    sle = source_last_event or {}
 
     for row in sorted(rows, key=lambda r: r.get("source_name", "")):
         state, reason = _classify(row)
@@ -484,10 +561,13 @@ def _build_digest(
         # every day and serve data that stopped moving a year ago. That is
         # exactly the case this section exists for, so it is judged for every
         # source that is not shelved, including the ones reporting HEALTHY.
+        is_frozen = False
         if state != "shelved":
-            f_state, f_reason = _freshness_state(row, smd.get(name))
+            f_state, f_reason = _freshness_state(
+                row, smd.get(name), sle.get(name))
             if f_state == "frozen":
                 frozen.append((name, f_reason))
+                is_frozen = True
             elif f_state in ("unknown", "unjudged"):
                 undated.append(name)
         if state == "broken":
@@ -502,6 +582,15 @@ def _build_digest(
             unscheduled.append(name)
         elif state == "unscheduled_review":
             unscheduled_review.append((name, reason))
+        elif is_frozen:
+            # === FROZEN IS NOT HEALTHY (2026-08-18) ===
+            # Freshness and run-health were computed independently, and a
+            # frozen source whose scraper runs fine landed in BOTH lists.
+            # The 2026-08-17 digest read "2 FROZEN ... (22/78 healthy)"
+            # with both frozen sources INSIDE the 22, and the buckets
+            # summed to 80 against a stated total of 78. A source serving
+            # year-old data is not healthy however green its scraper is.
+            pass
         else:
             healthy.append(name)
 
@@ -518,6 +607,12 @@ def _build_digest(
     lines.append(f"Govire scraper health digest -- "
                  f"{_now().strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("")
+    # Every source in `total` appears in exactly ONE of these buckets, and
+    # they sum to it. Before 2026-08-18 frozen sources were also counted as
+    # healthy and NO FRESHNESS SIGNAL was missing entirely, so the line
+    # added to 80 against a stated 78 and quietly overstated health.
+    _accounted = (len(broken) + len(stale) + len(check) + len(healthy)
+                  + len(unscheduled) + len(unscheduled_review) + len(frozen))
     lines.append(f"Total sources: {total}   "
                  f"Broken: {len(broken)}   "
                  f"Stale: {len(stale)}   "
@@ -525,6 +620,11 @@ def _build_digest(
                  f"Healthy: {len(healthy)}   "
                  f"Unscheduled: {len(unscheduled) + len(unscheduled_review)}   "
                  f"Frozen: {len(frozen)}")
+    lines.append(f"Judged for data freshness: {total - len(undated)} of {total}   "
+                 f"No freshness signal: {len(undated)}")
+    if _accounted != total:
+        lines.append(f"  (bucket total {_accounted} != {total} — "
+                     f"report this, the digest is miscounting)")
     lines.append("")
 
     if frozen:
@@ -652,8 +752,10 @@ def main() -> int:
     # Never fatal: a freshness read that fails degrades the section to
     # "unknown" rather than losing the whole digest.
     source_max_dates = _fetch_source_max_dates(supabase_url, service_key)
+    # The liveness veto. Also never fatal -- see _fetch_source_last_event.
+    source_last_event = _fetch_source_last_event(supabase_url, service_key)
 
-    subject, body, _ = _build_digest(rows, source_max_dates)
+    subject, body, _ = _build_digest(rows, source_max_dates, source_last_event)
     print(body, flush=True)  # also visible in the Actions run log
     _send_email(resend_key, to_addr, from_addr, subject, body)
     return 0
