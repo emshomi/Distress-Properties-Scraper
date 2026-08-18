@@ -50,6 +50,12 @@
 -- checked against a population that did not contain the case it got
 -- wrong. See check 3.
 --
+-- === CHECK 9 ADDED 2026-08-18 ===
+--
+-- Detects eCRV labels whose expiry moved out from under them. Requires
+-- outcomes.reset_stale_labels(), created the same day. See check 9 for
+-- why the matcher's scope clause is NOT the thing to widen.
+--
 -- === HOW TO READ THE OUTPUT ===
 --
 -- Every check reports a count. The healthy state for all of them is
@@ -376,6 +382,54 @@ FROM signals.distress_events e
 WHERE e.observed_at IS NOT NULL
 GROUP BY e.source
 HAVING MAX(e.observed_at) < now() - interval '14 days';
+
+
+-- === CHECK 9: eCRV LABELS WHOSE OWN BASIS HAS MOVED =================
+--
+-- The eCRV matcher only considers outcome IN ('pending','unknown',
+-- 'foreclosed'). Once a tracker is labelled, the matcher never revisits
+-- it -- however far its redemption_expiry_date later moves.
+-- redemption_builder's ON CONFLICT updates redemption_expiry_date and
+-- (since 2026-08-02) next_check_date, but never outcome. That 08-02 fix
+-- states the same finding one column earlier: "the consequence is not a
+-- wrong date shown to an owner; it is a wrong OUTCOME."
+--
+-- Measured 2026-08-18: 2 of 123 labelled trackers. 502 and 540 carried
+-- ecrv_owner_sale_in_window against sales now 72 and 107 days
+-- POST-expiry. Reset by hand and archived in
+-- outcomes.tracker_stale_label_archive_20260818.
+--
+-- === WHY THE MATCHER IS NOT SIMPLY WIDENED ===
+--
+-- The obvious fix -- drop the scope clause so the matcher re-decides
+-- everything -- was dry-run on 2026-08-18 and is WRONG. 145 trackers in
+-- scope, 135 unchanged, but 9 would flip from foreclosed_sold to
+-- redeemed_by_owner and all 9 are *_arcgis_sale_after_expiry: labelled
+-- by the OWNER CHECKER from the county's own last-sale record, which is
+-- more recent and more authoritative than the earlier eCRV row the
+-- matcher would select. Tracker 170: the checker saw a county sale
+-- 2026-02-02 after expiry 2025-08-27; the matcher would pick an eCRV
+-- deed from 2025-03-21 and call it a redemption.
+--
+-- The scope clause is not an oversight. It is the boundary that stops
+-- the eCRV matcher overruling the owner checker. Widening it would have
+-- turned nine correct foreclosures into redemptions -- the harmful
+-- direction, and it would inflate the redemption rate.
+--
+-- So this check is scoped to detection_source LIKE 'ecrv%' only, and
+-- reports rather than repairs. outcomes.reset_stale_labels(false) does
+-- the reset when a human decides to.
+INSERT INTO audit.integrity_findings (run_at, check_name, severity, county_code, n, detail)
+SELECT v_run,
+       'tracker_labels_invalidated',
+       'warn',
+       r.county_code,
+       COUNT(*),
+       jsonb_build_object(
+         'tracker_ids', array_agg(r.tracker_id ORDER BY r.tracker_id),
+         'fix',         'SELECT * FROM outcomes.reset_stale_labels(false);')
+FROM outcomes.reset_stale_labels(true) r
+GROUP BY r.county_code;
 
 
 -- ---------------------------------------------------------------------
