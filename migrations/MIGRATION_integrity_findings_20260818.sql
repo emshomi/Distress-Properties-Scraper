@@ -36,6 +36,13 @@
 -- have been found. The stubs ACCUMULATING is what made the defect
 -- visible. Keep it visible.
 --
+-- === CORRECTED 2026-08-18, SAME NIGHT ===
+--
+-- Check 3 shipped wrong and was replaced within minutes of its first
+-- run. It grouped on the notice's gis_pid, which flagged every PACKAGE
+-- notice as a duplicate -- 9 false alerts on run 1, and it would have
+-- missed both of the real duplicates it was written for. See check 3.
+--
 -- === HOW TO READ THE OUTPUT ===
 --
 -- Every check reports a count. The healthy state for all of them is
@@ -153,10 +160,9 @@ WHERE r.hits = 1
 GROUP BY s.county_code;
 
 
--- === CHECK 3: DUPLICATE EVENTS ACROSS DIFFERENT PARCEL IDS ==========
+-- === CHECK 3: TWO EVENTS ON ONE PARCEL FOR ONE SALE DATE ============
 --
--- The same foreclosure on two parcel_ids. Two causes were found on
--- 2026-08-17, both real:
+-- A genuine duplicate is the SAME PROPERTY twice. Two causes, both real:
 --
 --  (a) A PostgREST connection dropped mid-lookup, the resolver was
 --      swallowing the exception, and the fallback minted a stub -- so
@@ -168,41 +174,44 @@ GROUP BY s.county_code;
 --  (b) THE SYNTHETIC PID FORMAT CHANGED ON 2026-08-10, from
 --      '{COUNTY}-FC-{source_id}' to '{COUNTY}-FC-{digits}-{sale_date}'.
 --      Any stub minted BEFORE that date is invisible to the guard.
---      Beltrami extraction 528 duplicated event 123546 on 2026-08-18
---      for exactly this reason -- while extraction 397, promoted 08-02
---      under the old format, had correctly matched and written nothing.
+--      Beltrami extraction 528 duplicated event 123546 on 2026-08-18 for
+--      exactly this reason -- while extraction 397, promoted 08-02 under
+--      the old format, had correctly matched and written nothing.
+--      Cause (b) is STILL LIVE for every pre-08-10 stub in the table.
 --
--- Cause (b) is still live for every pre-08-10 stub in the table.
+-- === WHY THIS IS NOT GROUPED ON THE NOTICE PID ===
 --
--- Matched on the NOTICE's own pid + date + amount, which is stable
--- across republication, rather than on parcel_id -- which is precisely
--- the field that differs when this goes wrong.
+-- The first version of this check grouped on
+-- raw_data.detail.gis_pid + event_date and flagged differing
+-- parcel_ids. That is the PACKAGE shape, not a duplicate. One notice can
+-- cover many parcels: washington 26-003536FC lists THIRTEEN Forest Lake
+-- properties under a single bid of $261,140.77, and each correctly
+-- becomes its own event so a subscriber searching that city sees all of
+-- them. gis_pid on every member is the notice's WHOLE LIST.
+--
+-- That version fired NINE times on its first run, every one a package
+-- notice, every one correct behaviour -- and it would have MISSED both
+-- real duplicates, because Red Lake and Beltrami each carried the same
+-- notice pid on both rows.
+--
+-- Group on the PARCEL. A package member is distinct by parcel by
+-- definition; a duplicate is not.
 INSERT INTO audit.integrity_findings (run_at, check_name, severity, county_code, n, detail)
 SELECT v_run,
-       'duplicate_events_split_parcels',
+       'duplicate_events_same_parcel',
        'alert',
-       d.county_code,
+       e.county_code,
        COUNT(*),
        jsonb_build_object(
-         'notice_pid',  d.notice_pid,
-         'event_date',  d.event_date,
-         'event_ids',   d.event_ids,
-         'parcel_ids',  d.parcel_ids)
-FROM (
-    SELECT e.county_code,
-           e.raw_data->'detail'->>'gis_pid'      AS notice_pid,
-           e.event_date,
-           array_agg(e.id      ORDER BY e.id)    AS event_ids,
-           array_agg(DISTINCT e.parcel_id)       AS parcel_ids
-    FROM signals.distress_events e
-    WHERE e.raw_data->'detail'->>'gis_pid' IS NOT NULL
-      AND e.event_type = 'sheriff_sale'
-    GROUP BY e.county_code,
-             e.raw_data->'detail'->>'gis_pid',
-             e.event_date
-    HAVING COUNT(DISTINCT e.parcel_id) > 1
-) d
-GROUP BY d.county_code, d.notice_pid, d.event_date, d.event_ids, d.parcel_ids;
+         'parcel_id',  e.parcel_id,
+         'event_date', e.event_date,
+         'on_stub',    e.parcel_id LIKE '%-FC-%',
+         'event_ids',  array_agg(e.id        ORDER BY e.id),
+         'source_ids', array_agg(e.source_id ORDER BY e.id))
+FROM signals.distress_events e
+WHERE e.event_type = 'sheriff_sale'
+GROUP BY e.county_code, e.parcel_id, e.event_date
+HAVING COUNT(*) > 1;
 
 
 -- === CHECK 4: SHERIFF SALES WITH NO MATCHING EVENT ==================
