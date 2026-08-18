@@ -1,101 +1,52 @@
 """
-Geocode stub parcels that carry a real address but no coordinates.
+Backfill core.parcels.geom from lat/lng.
 
-Run: python outcome_capture/backfill_stub_geocode.py
-     DRY_RUN=1 python outcome_capture/backfill_stub_geocode.py   (no writes)
+Run: python outcome_capture/backfill_parcel_geom.py
 
-=== WHY THIS EXISTS (2026-08-18) ===
-222 parcels on synthetic '{COUNTY}-FC-...' keys carry a real street address --
-'20088 FERRET ST, NOWTHEN' , '7969 East River Road, Fridley' -- and NULL
-lat/lng. A person could drive to any of them. The product shows no map pin and
-no Street View, because every downstream consumer of position reads lat/lng.
+=== WHY THIS EXISTS (2026-08-02) ===
+core.parcels has carried a `geom geography(Point,4326)` column and an index on
+it (idx_parcels_geom) since the schema was designed. NOTHING EVER POPULATED
+IT — 0 of 845,000 parcels had a value, while 860,687 had perfectly good lat and
+lng. Same shape as scraper_run_id being NULL on 100% of distress_events: a
+column built for a purpose nobody wired up.
 
-This surfaced from the wrong end. audit.run_integrity_checks() reports 406
-imagery rows on stubs; 348 of them are status='no_location' with the error
-'parcel has no lat/lng'. The first instinct was to delete those 348 as noise.
-That would have been wrong three times over:
+It matters because geometry is what makes neighbourhood-level questions
+answerable. "Distressed properties in Highland Park" is not a city filter —
+Highland Park is one of Saint Paul's 17 District Council areas, and picking it
+out means a point-in-polygon join against a boundary layer. Without geom that
+join cannot happen at all; with it, it is one query.
 
-  1. They are not noise. They are the resolver's own record that it looked and
-     there was nowhere to look -- outcome_capture/resolve_parcel_imagery.py
-     says it outright: "'we checked and there is nowhere to look' is a
-     different fact from 'we never checked', and a missing row cannot express
-     either."
-  2. WORKING_SET_SQL in that same file RE-OPENS a no_location row the moment
-     the parcel gains coordinates ("that verdict was true when written and is
-     not any more"). Deleting them would have dropped the parcels into
-     NO_LOCATION_SQL instead, which only matches rows with no imagery row at
-     all -- back to square one.
-  3. The imagery rows were a symptom correctly reporting a real gap. Fix the
-     gap and they resolve themselves.
+=== WHY A SCRIPT AND NOT A SINGLE UPDATE ===
+The Supabase SQL editor dies on this. A whole-table UPDATE times out at the API
+gateway (not statement_timeout — the gateway gives up while the statement is
+very possibly still running server-side, which is its own hazard: you cannot
+tell a slow success from a failure).
 
-So: no deletes. Geocode the parcels, and the existing resolver does the rest
-on its next run.
+Batching is not just about time. core.parcels has an index ON geom, so
+updating it means every row gets new index entries and Postgres cannot use HOT
+updates — each batch does far more write work than the row count suggests.
+1,000 rows per batch was measured comfortable in the editor; this uses the same
+size and commits each batch separately, so a failure costs one batch rather
+than the whole run.
 
-=== WHY A STUB WITH COORDINATES IS NOT A CORRUPTION ===
-MIGRATION_integrity_findings_20260818.sql, check 5:
-    "DO NOT let anything delete these automatically. Dakota's stubs DO carry
-     lat/lng from ArcGIS geometry, and two of its rows held a real
-     google_streetview pano_id. status='ok' rows are genuine images."
-Dakota's stubs already work this way and produced 23 real panoramas. This makes
-the other counties match the case that already works.
+=== SELF-RESUMING ===
+The predicate is `geom IS NULL`, so a completed row is never revisited. Re-run
+this as many times as you like: it always picks up where it stopped, and once
+finished it does nothing. No cursor, no state file, no offset to get wrong.
 
-Coordinates give a map pin and an imagery lookup. They do NOT identify a
-parcel: src/services/spine_resolver.py records that core.parcels.geom is
-geography(Point,4326) -- centroids, not boundaries -- so point-in-polygon is
-impossible against this table. Nothing here changes that.
+=== COORDINATE ORDER — the one thing that must not be got wrong ===
+ST_MakePoint takes (X, Y) = (LONGITUDE, LATITUDE). Reversing it is the classic
+error and it does not fail loudly: it silently places every Minnesota parcel
+off the coast of Somalia, and a later spatial join simply matches nothing.
 
-=== geom NEEDS NO SECOND PASS ===
-MIGRATION_parcels_geom_generated_2026-08-13.sql made geom a GENERATED column
-derived from lat/lng. Writing lat/lng writes geom. Do not run
-backfill_parcel_geom.py after this; there is nothing for it to do.
+Verified live before this script was written: 810 Maryland Ave E, Saint Paul
+came back as POINT(-93.066465 44.977053) — longitude first and negative. If a
+sample ever reads POINT(44.x -93.x), stop; the arguments are swapped.
 
-=== THE TWO ADDRESS SHAPES (measured 2026-08-18, all 222) ===
-  212  street only            -> compose '<street>, <city>, MN <zip>'
-   10  already full           -> use the address verbatim
-
-The 10 self-contained ones look like '1017 9th Street N, Moorhead, Minnesota
-56560' -- city and state already inside the field, and zip NULL in its own
-column because it lives in the string. Composing those would repeat the city
-and drop the zip; split_part() on the comma would delete the city entirely.
-Detected by ', MN' / ', Minnesota' rather than by county or by length.
-
-Three of the 212 are multi-property notices:
-    '101 Charles Street NE, 179 Charles Street NE, 180 Charles Street NE'
-    '1320  1340 & 1350 Lagoon Ave, Unit #s'
-    '301 Clifton Ave Units 4G, G3 and G5'
-split_part(address, ',', 1) takes the first, which is the right answer for a
-package: one pin on the first property beats no pin on any of them. It is a
-no-op on the 209 addresses with no comma at all.
-
-115 of 222 carry a unit suffix ('UNIT 132', '#5', 'Apt 4'). Mapbox returns the
-BUILDING for these, which is what an imagery lookup wants -- a Street View
-panorama is of the building whatever the unit number.
-
-=== COORDINATE ORDER -- the one thing that must not be got wrong ===
-Mapbox GeoJSON returns coordinates as [longitude, latitude]. Reversing them
-does not fail loudly: it places every Minnesota parcel in Somalia and the
-imagery resolver simply finds nothing. src/services/geocoder.py unpacks
-`lng, lat = coords[0], coords[1]` and this file does the same, in one place,
-with the sample printed every run so a swap is visible immediately.
-
-The Minnesota bounding box is a second guard, matching the one in the geom
-trigger. A result outside it is SKIPPED and reported, never written -- a bad
-geocode stays visibly ungeocoded instead of becoming a plausible wrong point.
-
-=== WHY THE OUTCOMES ARE COUNTED SEPARATELY ===
-Three defects found on 2026-08-18 shared one shape: a job reporting success for
-work it did not do. records_new counting upserts as inserts; the mnpn scraper
-alerting HARD FAILURE on a caught-up run; saved_search_alerts returning a bare
-bool so no_matches and send_failed both read sent=0 failed=0. So:
-
-    written      Mapbox returned a point inside Minnesota, lat/lng saved
-    not_found    Mapbox answered, no match -- the address is not geocodable
-    out_of_bounds  a point, but outside Minnesota -- skipped, listed
-    failed       the call itself errored -- retryable, NOT the same as no match
-
-not_found and failed are different facts and are never summed. The buckets are
-checked against the attempt count at the end; if they ever stop summing, a
-return path was added that lands nowhere.
+The Minnesota bounding box in the WHERE clause is a second guard. A row with a
+projected or transposed coordinate is SKIPPED rather than converted, so bad
+input stays visibly unconverted instead of becoming a plausible-looking point
+in the wrong place.
 """
 
 from __future__ import annotations
@@ -103,136 +54,79 @@ from __future__ import annotations
 import os
 import sys
 import time
-from typing import Any
 
 import psycopg2
-import requests
 
 
-# Mapbox handles 600/min; 222 addresses is nothing. The delay is politeness,
-# not a limit, and it keeps a full run near 30 seconds.
-REQUEST_DELAY_SECONDS = 0.1
-REQUEST_TIMEOUT_SECONDS = 20
+# Measured comfortable in the Supabase editor. The limit is index maintenance
+# on geom, not the geography construction, so raising this buys less than it
+# looks like it should.
+BATCH_SIZE = 1000
 
-# Minnesota, generously bounded. Same numbers as the geom trigger's CHECK
-# (MIGRATION_parcels_geom_trigger_2026-08-13.sql) so a row that would be
-# rejected there is never offered to it.
+# Minnesota, generously bounded. Guard rather than filter: anything outside is
+# left alone for a human to look at.
 LAT_MIN, LAT_MAX = 43.0, 49.5
 LNG_MIN, LNG_MAX = -97.5, -89.0
 
-# Bias toward the metro. Same value src/services/geocoder.py uses.
-PROXIMITY = "-93.265,44.977"
-
-MAPBOX_URL = "https://api.mapbox.com/search/geocode/v6/forward"
-
-# Defensive ceiling. 222 today; a run that tries to geocode thousands means
-# the predicate has drifted and should stop rather than spend.
-MAX_ADDRESSES = 2000
+# Stop rather than loop forever if something stops making progress.
+MAX_BATCHES = 2000
 
 
-# A stub parcel with a usable address and no coordinates.
-#
-#   parcel_id !~ '^[0-9]'  synthetic key
-#   lat IS NULL            SELF-RESUMING: a geocoded row is never revisited,
-#                          so re-running always resumes and eventually no-ops
-#   address ~ '[0-9]'      has a house number
-#   address ~* '[a-z]{3}'  has a street name (excludes ',' and other debris)
-#   city present           needed to disambiguate a street name statewide
-#
-# MATERIALIZED on the stub CTE deliberately: without it the planner evaluates
-# the regexes across all 2.2M rows of core.parcels and the statement times out
-# at the gateway. Narrow on the cheap predicate first -- the same lesson as
-# CROSS JOIN LATERAL in the address-resolution work.
-SELECT_SQL = """
-WITH stubs AS MATERIALIZED (
-  SELECT county_code, parcel_id, address, city, zip
-  FROM   core.parcels
-  WHERE  parcel_id !~ '^[0-9]'
-    AND  lat IS NULL
-)
-SELECT county_code,
-       parcel_id,
-       address,
-       CASE
-         WHEN address ~* ', *(MN|Minnesota)'
-           THEN address
-         ELSE concat_ws(', ',
-                split_part(address, ',', 1),
-                city,
-                nullif(concat_ws(' ', 'MN', nullif(trim(zip), '')), 'MN'))
-       END AS geocode_query
-FROM   stubs
-WHERE  address ~ '[0-9]'
-  AND  address ~* '[a-z]{3}'
-  AND  city IS NOT NULL
-  AND  city <> ''
-ORDER  BY county_code, parcel_id
-LIMIT  %(cap)s;
+BATCH_SQL = """
+UPDATE core.parcels p
+SET geom = ST_SetSRID(ST_MakePoint(p.lng::float8, p.lat::float8), 4326)::geography
+FROM (
+  SELECT ctid
+  FROM core.parcels
+  WHERE geom IS NULL
+    AND lat IS NOT NULL
+    AND lng IS NOT NULL
+    AND lat BETWEEN %(lat_min)s AND %(lat_max)s
+    AND lng BETWEEN %(lng_min)s AND %(lng_max)s
+  LIMIT %(batch)s
+) s
+WHERE p.ctid = s.ctid;
 """
 
-# lat IS NULL in the predicate as well as the select. Two runs overlapping, or
-# a row geocoded by something else mid-run, must not be overwritten -- a real
-# coordinate always beats a derived one.
-UPDATE_SQL = """
-UPDATE core.parcels
-SET    lat = %(lat)s,
-       lng = %(lng)s
-WHERE  county_code = %(county_code)s
-  AND  parcel_id   = %(parcel_id)s
-  AND  lat IS NULL;
+REMAINING_SQL = """
+SELECT count(*)
+FROM core.parcels
+WHERE geom IS NULL
+  AND lat IS NOT NULL
+  AND lng IS NOT NULL
+  AND lat BETWEEN %(lat_min)s AND %(lat_max)s
+  AND lng BETWEEN %(lng_min)s AND %(lng_max)s;
 """
 
 SAMPLE_SQL = """
-SELECT county_code, parcel_id, address, lat, lng, ST_AsText(geom::geometry)
-FROM   core.parcels
-WHERE  county_code = %(county_code)s
-  AND  parcel_id   = %(parcel_id)s;
+SELECT county_code, address, ST_AsText(geom::geometry)
+FROM core.parcels
+WHERE geom IS NOT NULL
+LIMIT 1;
+"""
+
+SKIPPED_SQL = """
+SELECT county_code, count(*)
+FROM core.parcels
+WHERE geom IS NULL
+  AND lat IS NOT NULL
+  AND lng IS NOT NULL
+  AND (lat NOT BETWEEN %(lat_min)s AND %(lat_max)s
+       OR lng NOT BETWEEN %(lng_min)s AND %(lng_max)s)
+GROUP BY county_code
+ORDER BY 2 DESC;
 """
 
 
 def log(msg: str) -> None:
-    print(f"[stub-geocode] {msg}", flush=True)
+    print(f"[geom-backfill] {msg}", flush=True)
 
 
-def geocode(session: requests.Session, token: str,
-            query: str) -> tuple[str, tuple[float, float] | None]:
-    """Resolve one address.
-
-    Returns (outcome, coords) where outcome is 'ok' | 'not_found' | 'failed'.
-    'not_found' means Mapbox answered and had no match -- a fact about the
-    address. 'failed' means the call did not complete -- a fact about the
-    network. Collapsing them would hide a broken token behind 222 addresses
-    that all look unmatchable.
-    """
-    try:
-        response = session.get(
-            MAPBOX_URL,
-            params={
-                "q": query,
-                "access_token": token,
-                "limit": 1,
-                "country": "us",
-                "proximity": PROXIMITY,
-            },
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:  # noqa: BLE001
-        log(f"  call failed for {query!r}: {type(e).__name__}: {str(e)[:160]}")
-        return "failed", None
-
-    features = data.get("features") or []
-    if not features:
-        return "not_found", None
-
-    coords = (features[0].get("geometry") or {}).get("coordinates")
-    if not coords or len(coords) < 2:
-        return "not_found", None
-
-    # [lng, lat] -- see the coordinate-order note in the module docstring.
-    lng, lat = float(coords[0]), float(coords[1])
-    return "ok", (lat, lng)
+def _bounds() -> dict[str, float]:
+    return {
+        "lat_min": LAT_MIN, "lat_max": LAT_MAX,
+        "lng_min": LNG_MIN, "lng_max": LNG_MAX,
+    }
 
 
 def main() -> int:
@@ -240,117 +134,76 @@ def main() -> int:
     if not dsn:
         log("FATAL: DATABASE_URL is not set")
         return 1
-
-    token = os.environ.get("MAPBOX_TOKEN")
-    if not token:
-        log("FATAL: MAPBOX_TOKEN is not set")
-        return 1
-
     dry_run = os.environ.get("DRY_RUN") == "1"
 
     conn = psycopg2.connect(dsn)
     try:
         with conn.cursor() as cur:
-            cur.execute(SELECT_SQL, {"cap": MAX_ADDRESSES})
-            rows = cur.fetchall()
+            cur.execute(REMAINING_SQL, _bounds())
+            remaining = cur.fetchone()[0]
+        log(f"start: {remaining} parcels need geom")
 
-        log(f"start: {len(rows)} stub parcels have an address and no lat/lng")
-        if not rows:
+        if dry_run:
+            log("DRY_RUN=1 — no writes performed")
+            return 0
+        if remaining == 0:
             log("nothing to do")
             return 0
 
-        if dry_run:
-            log("DRY_RUN=1 -- no Mapbox calls, no writes. Sample queries:")
-            for county_code, parcel_id, address, query in rows[:10]:
-                log(f"  {county_code}/{parcel_id}")
-                log(f"      address: {address!r}")
-                log(f"      query:   {query!r}")
-            if len(rows) > 10:
-                log(f"  ... and {len(rows) - 10} more")
-            return 0
-
-        outcomes = {"written": 0, "not_found": 0,
-                    "out_of_bounds": 0, "failed": 0, "no_row_updated": 0}
-        out_of_bounds: list[tuple[str, str, float, float]] = []
-        first_written: dict[str, Any] | None = None
+        written = 0
+        batches = 0
         started = time.monotonic()
 
-        session = requests.Session()
-        for n, (county_code, parcel_id, address, query) in enumerate(rows, 1):
-            outcome, coords = geocode(session, token, query)
-
-            if outcome == "failed":
-                outcomes["failed"] += 1
-            elif outcome == "not_found":
-                outcomes["not_found"] += 1
-            else:
-                lat, lng = coords  # type: ignore[misc]
-                if not (LAT_MIN <= lat <= LAT_MAX and LNG_MIN <= lng <= LNG_MAX):
-                    # Skipped, not written. A wrong point that looks right is
-                    # worse than no point: nothing downstream would notice.
-                    outcomes["out_of_bounds"] += 1
-                    out_of_bounds.append((county_code, parcel_id, lat, lng))
-                else:
-                    with conn.cursor() as cur:
-                        cur.execute(UPDATE_SQL, {
-                            "lat": lat, "lng": lng,
-                            "county_code": county_code,
-                            "parcel_id": parcel_id,
-                        })
-                        updated = cur.rowcount
-                    conn.commit()
-                    if updated:
-                        outcomes["written"] += 1
-                        if first_written is None:
-                            first_written = {"county_code": county_code,
-                                             "parcel_id": parcel_id}
-                    else:
-                        # lat stopped being NULL between SELECT and UPDATE.
-                        outcomes["no_row_updated"] += 1
-
-            if n % 25 == 0:
-                elapsed = time.monotonic() - started
-                log(f"{n}/{len(rows)} attempted "
-                    f"({outcomes['written']} written, {elapsed:.0f}s)")
-            time.sleep(REQUEST_DELAY_SECONDS)
-
-        log(f"done: written={outcomes['written']} "
-            f"not_found={outcomes['not_found']} "
-            f"out_of_bounds={outcomes['out_of_bounds']} "
-            f"failed={outcomes['failed']} "
-            f"no_row_updated={outcomes['no_row_updated']}")
-
-        counted = sum(outcomes.values())
-        if counted != len(rows):
-            log(f"WARNING: outcomes sum to {counted} but {len(rows)} were "
-                f"attempted -- a return path lands in no bucket")
-
-        if first_written:
-            # Printed EVERY run. A reversed coordinate pair produces a valid
-            # point in the wrong hemisphere and nothing downstream would
-            # notice. Longitude must be NEGATIVE and near -93 for Minnesota.
+        while batches < MAX_BATCHES:
             with conn.cursor() as cur:
-                cur.execute(SAMPLE_SQL, first_written)
-                sample = cur.fetchone()
-            if sample:
-                log(f"sample: {sample[0]}/{sample[1]} {sample[2]!r} -> "
-                    f"lat={sample[3]} lng={sample[4]} geom={sample[5]}")
+                cur.execute(BATCH_SQL, {**_bounds(), "batch": BATCH_SIZE})
+                n = cur.rowcount
+            conn.commit()
 
-        if out_of_bounds:
-            log("OUT OF BOUNDS -- geocoded outside Minnesota, left "
-                "ungeocoded deliberately (inspect these):")
-            for county_code, parcel_id, lat, lng in out_of_bounds:
-                log(f"  {county_code}/{parcel_id}: {lat}, {lng}")
+            if n == 0:
+                # Nothing left that matches. Not an error — the normal exit.
+                break
 
-        if outcomes["failed"]:
-            log(f"NOTE: {outcomes['failed']} call(s) errored rather than "
-                f"returning no match. Those addresses are unchanged and a "
-                f"re-run will retry them.")
+            written += n
+            batches += 1
+            if batches % 25 == 0 or n < BATCH_SIZE:
+                elapsed = time.monotonic() - started
+                rate = written / elapsed if elapsed > 0 else 0
+                log(f"{written}/{remaining} written "
+                    f"({batches} batches, {rate:.0f} rows/sec)")
+
+        if batches >= MAX_BATCHES:
+            # Defensive: should never fire at 1000 x 2000 = 2M capacity, but a
+            # silent infinite loop in a scheduled job is worse than a stop.
+            log(f"WARNING: hit MAX_BATCHES ({MAX_BATCHES}) — re-run to finish")
+
+        with conn.cursor() as cur:
+            cur.execute(REMAINING_SQL, _bounds())
+            still = cur.fetchone()[0]
+            cur.execute(SAMPLE_SQL)
+            sample = cur.fetchone()
+            cur.execute(SKIPPED_SQL, _bounds())
+            skipped = cur.fetchall() or []
+
+        log(f"done: {written} written, {still} still without geom")
+
+        if sample:
+            # Printed EVERY run on purpose. A reversed ST_MakePoint produces a
+            # valid-looking point in the wrong hemisphere and nothing else in
+            # this pipeline would notice. Longitude must come first and be
+            # negative for Minnesota.
+            log(f"sample: {sample[0]} {sample[1]} -> {sample[2]}")
+
+        if skipped:
+            log("SKIPPED — coordinates outside the Minnesota bounding box "
+                "(left unconverted deliberately; inspect these):")
+            for county, n in skipped:
+                log(f"  {county}: {n}")
 
         return 0
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         conn.rollback()
-        log(f"FAILED -- {type(e).__name__}: {e}")
+        log(f"FAILED — {type(e).__name__}: {e}")
         raise
     finally:
         conn.close()
