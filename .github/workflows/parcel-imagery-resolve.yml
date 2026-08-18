@@ -19,10 +19,35 @@ name: Parcel Imagery Resolve
 # The distress set GROWS (8,299 -> 8,321 in thirteen hours), so re-running
 # after a scrape is the normal way new parcels get imagery.
 #
-# workflow_dispatch ONLY for now. Once the backlog is resolved this becomes a
-# weekly schedule picking up newly-scraped parcels — but a cron for a job
-# whose first run is a 7,453-parcel backfill would hide how long that backfill
-# actually took.
+# SCHEDULED DAILY 2026-08-18. This was workflow_dispatch-only while the first
+# run was a 7,453-parcel backfill, because a cron would have hidden how long
+# that backfill took. The backlog is cleared, so the reason has expired.
+#
+# DAILY, NOT WEEKLY as the original note proposed. The sheriff scrapers run
+# every morning at 12:00-12:20 UTC and the distress set grows with them (8,299
+# -> 8,321 in thirteen hours, measured 2026-08-13). On a weekly cron a property
+# scraped Wednesday shows a blank card until the following Monday -- six days
+# of a live listing with no photograph. Weekly was the right call for a 25-
+# minute backfill and the wrong one for a steady trickle: the run on
+# 2026-08-18 resolved 75 parcels in 17 seconds, and every metadata call is
+# free, so a daily pass costs nothing and closes the gap to hours.
+#
+# 13:45 UTC IS CHOSEN FOR ITS PLACE IN THE ORDER, not for the minute:
+#   12:00-12:20  the daily sheriff scrapers -- the source of new parcels
+#   12:30        redemption-promoter
+#   13:30        monthly tax jobs
+#   13:45        THIS -- after the day's scrapes have landed
+#   14:45        postbulletin (Mon/Thu)
+#   15:00        audit.run_integrity_checks()
+# Running before 15:00 matters: imagery_failures_on_stubs is counted by the
+# integrity check, so resolving first means the digest reports what is still
+# missing AFTER the resolver has had its turn rather than before it.
+#
+# dry_run keeps its '0' default deliberately. A blank input on a scheduled run
+# is an EMPTY env var, not an absent one (redemption-promoter.yml run #1), and
+# resolve_parcel_imagery.py reads DRY_RUN == '1', so '' means live -- which is
+# what a scheduled imagery pass should do. Nothing here is destructive and
+# nothing here is billable.
 on:
   workflow_dispatch:
     inputs:
@@ -30,6 +55,9 @@ on:
         description: 'Set to 1 to report the working-set size without writing'
         required: false
         default: '0'
+  schedule:
+    # Daily at 13:45 UTC = 8:45am Central (DST) / 7:45am (standard).
+    - cron: '45 13 * * *'
 jobs:
   resolve:
     name: Resolve parcel imagery
