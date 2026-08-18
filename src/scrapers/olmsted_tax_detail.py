@@ -129,6 +129,30 @@ _BATCH_SIZE = 40                    # parcels between proactive rests
 _BATCH_REST_SECONDS = 300           # 5-min proactive rest per batch
 _OVERLIMIT_BACKOFFS = (300, 600, 900)  # escalating silence on OverLimit
 
+# Abort the fetch once a parcel exhausts every attempt on OverLimit.
+#
+# MEASURED 2026-08-18 (run 678, Actions run #13). The run reached 200 of
+# 502 parcels in 27 minutes -- five proactive rests, exactly as designed --
+# and then never got another parcel. From 16:49 every request returned
+# OverLimit. Three PINs each burned the full ladder
+# (300+600+900+900 = 2700s = 45 MINUTES per parcel) and the loop simply
+# moved to the next one, because nothing here knew the lockout was
+# global rather than per-parcel. At 45 min/parcel the remaining 302 would
+# have taken ~226 hours; GitHub cancelled the job at its 2h30m limit.
+#
+# THE COST WAS NOT THE WASTED TIME. fetch() accumulates into `raw` and
+# returns only at the end, so a cancelled run writes NOTHING -- all 200
+# successfully scraped parcels were discarded. Three consecutive Tuesdays
+# (08-04, 08-11, 08-18) died this way and audit.scraper_runs recorded all
+# three as 'interrupted' with zero counters.
+#
+# 45 minutes of escalating silence failing to clear is not a transient
+# blip; it is a long-window quota. Breaking here returns the parcels
+# already collected, so a locked-out run persists what it got instead of
+# losing everything. The run is reported PARTIAL by base_scraper, which
+# is what it is.
+_ABORT_AFTER_EXHAUSTED_PARCELS = 1
+
 _MAINTENANCE_MARKER = "currently unavailable due to maintenance"
 
 
@@ -807,8 +831,14 @@ class TylerTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                 ),
             },
         ) as client:
+            exhausted_overlimit = 0
             for n, pin in enumerate(pins, start=1):
                 record: dict[str, Any] | None = None
+                # Bound before the attempt loop: a parcel that fails for a
+                # reason OTHER than OverLimit must not be counted toward the
+                # lockout abort, and a parcel that never raises leaves this
+                # False.
+                is_overlimit = False
                 for attempt in range(1, _PER_PARCEL_ATTEMPTS + 1):
                     try:
                         record = await self._scrape_parcel(client, pin, taxyr)
@@ -848,12 +878,34 @@ class TylerTaxDetailScraper(BaseScraper[dict[str, Any], dict[str, Any]]):
                         await asyncio.sleep(1.5 * attempt)
                 if record is None:
                     record = {"pin": pin, "found": False, "error": True}
+                    if is_overlimit:
+                        exhausted_overlimit += 1
+                else:
+                    # A success proves the lockout lifted; the counter is
+                    # about CONSECUTIVE exhaustion, not a lifetime total.
+                    exhausted_overlimit = 0
                 raw.append(record)
                 if n % 25 == 0:
                     logger.info(
                         "Tyler-portal scrape progress",
                         source=self.source_name, done=n, total=len(pins),
                     )
+                if exhausted_overlimit >= _ABORT_AFTER_EXHAUSTED_PARCELS:
+                    logger.warning(
+                        "Portal lockout did not clear — ending fetch early "
+                        "and keeping what was collected",
+                        source=self.source_name,
+                        last_pin=pin,
+                        collected=len(raw),
+                        remaining=len(pins) - n,
+                        backoff_seconds_spent=sum(
+                            _OVERLIMIT_BACKOFFS[
+                                min(i, len(_OVERLIMIT_BACKOFFS) - 1)
+                            ]
+                            for i in range(_PER_PARCEL_ATTEMPTS)
+                        ),
+                    )
+                    break
                 # Proactive rest BEFORE the quota trips (v2.2): the
                 # portal tolerates ~60-100 sustained parcels; rest well
                 # inside that.
