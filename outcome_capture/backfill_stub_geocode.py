@@ -92,6 +92,19 @@ no-op on the 209 addresses with no comma at all.
 BUILDING for these, which is what an imagery lookup wants -- a Street View
 panorama is of the building whatever the unit number.
 
+'MN' IS ALWAYS APPENDED, ZIP ONLY WHEN PRESENT (fixed 2026-08-18). The first
+version wrapped the state segment in nullif(..., 'MN') meaning to drop a
+dangling 'MN' left by a missing zip. It dropped the STATE instead: only 23 of
+222 rows carry a zip, so the composed query for the other 199 read
+'16471 LAIGLE AVE, Lakeville' with no state at all. Caught in the dry run for
+the widened predicate, where 111 of 138 rows were Dakota townships --
+'Vermillion Twp', 'Randolph' -- names that are not distinctive nationally.
+country=us and the Minneapolis proximity bias make a wrong-state match
+unlikely rather than impossible, and the Minnesota bounding box would skip one
+if it happened (it caught Norfolk VA and West Virginia on the first live run),
+so the cost was skipped rows rather than bad data. Still worth not spending.
+concat_ws drops the NULL zip on its own; the outer nullif was never needed.
+
 === COORDINATE ORDER -- the one thing that must not be got wrong ===
 Mapbox GeoJSON returns coordinates as [longitude, latitude]. Reversing them
 does not fail loudly: it places every Minnesota parcel in Somalia and the
@@ -180,7 +193,7 @@ SELECT county_code,
          ELSE concat_ws(', ',
                 split_part(address, ',', 1),
                 city,
-                nullif(concat_ws(' ', 'MN', nullif(trim(zip), '')), 'MN'))
+                concat_ws(' ', 'MN', nullif(trim(zip), '')))
        END AS geocode_query
 FROM   candidates
 WHERE  address ~ '[0-9]'
