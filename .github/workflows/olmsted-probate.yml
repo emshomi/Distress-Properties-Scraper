@@ -1,0 +1,103 @@
+name: Olmsted Probate Notices
+# Manual + weekly. Probate is a slow-moving channel (notices publish twice
+# per estate, estates administer over months) and the scraper's 365-day
+# window re-covers the active set every run — weekly is plenty. Second
+# probate source after Fillmore (2026-08-19).
+#
+# WHY 365 DAYS AND NOT FILLMORE'S 90
+# An estate runs its notices over a fortnight and then goes quiet, but the
+# parcel stays estate-owned for months. A decedent whose Olmsted property
+# we could not match in June — because core.owners had not been refreshed,
+# or the name parsed badly — is still worth re-testing in December. The
+# dedup key makes the wide window free: re-covering a matched estate
+# writes nothing.
+#
+# FIRST RUN MAY LEGITIMATELY WRITE ZERO EVENTS. The scraper only emits when
+# a decedent named in a notice matches an OWNER OF RECORD in core.owners
+# for Olmsted. Most decedents in any window own no Olmsted parcel, or the
+# property already transferred. Read estates_seen / estates_no_match /
+# skipped_not_probate in the run log, not records_new — a run that fetches
+# 1,000 notices and writes 3 events is working correctly.
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays 13:05 UTC — after fillmore-probate (12:50, same day, so the
+    # two probate sources land together and a bad week is one place to
+    # look), before the monthly tax jobs at 13:30 and well clear of the
+    # daily sheriff scrapers at 12:00-12:20.
+    - cron: '5 13 * * 1'
+jobs:
+  scrape:
+    name: Run Olmsted probate notices
+    runs-on: ubuntu-latest
+    # One Column fetch (up to 6 pages x 200) plus a core.owners lookup per
+    # ESTATE — not per notice, since non-probate notices are rejected on
+    # text before any query. ~100 estates/year, so ~100 lookups worst case.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Olmsted probate notices scraper
+        env:
+          # --- Required: database ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # --- Required: app config (mirror Railway's values) ---
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          # --- Geocoding (parcel_resolver may call these) ---
+          GEOCODING_ENABLED: 'true'
+          GEOCODING_CACHE_DAYS: '30'
+          NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          # --- Scheduler (only used by Railway, but config may require it) ---
+          SCHEDULER_TIMEZONE: America/Chicago
+          # --- Feature flags: enable ONLY this job ---
+          #
+          # scraper_olmsted_probate_enabled defaults FALSE in src/config.py,
+          # so this line is what makes the run happen. It is also the only
+          # flag here that has to be right: src/config.py scraper_enabled()
+          # returns False for an unknown field, and run_olmsted_probate.py
+          # passes trigger="manual" so a disabled flag RAISES rather than
+          # skipping quietly. A typo in this key fails the run loudly, which
+          # is the intent.
+          SCRAPER_OLMSTED_PROBATE_ENABLED: 'true'
+          SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
+          SCRAPER_ANOKA_PARCELS_ENABLED: 'false'
+          SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
+          SCRAPER_DAKOTA_PARCELS_ENABLED: 'false'
+          SCRAPER_FILLMORE_LEGAL_ENABLED: 'false'
+          SCRAPER_FILLMORE_PARCELS_ENABLED: 'false'
+          SCRAPER_FILLMORE_PROBATE_ENABLED: 'false'
+          SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
+          SCRAPER_HENNEPIN_PARCELS_ENABLED: 'false'
+          SCRAPER_HENNEPIN_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_MCRO_PROBATE_ENABLED: 'false'
+          SCRAPER_MPLS_311_ENABLED: 'false'
+          SCRAPER_MPLS_VBR_ENABLED: 'false'
+          SCRAPER_OLMSTED_DELQ_LIST_ENABLED: 'false'
+          SCRAPER_OLMSTED_PARCELS_ENABLED: 'false'
+          SCRAPER_OLMSTED_TAX_DETAIL_ENABLED: 'false'
+          SCRAPER_POSTBULLETIN_LEGAL_ENABLED: 'false'
+          SCRAPER_RAMSEY_SHERIFF_ENABLED: 'false'
+          SCRAPER_RAMSEY_PARCELS_ENABLED: 'false'
+          SCRAPER_RAMSEY_TAX_ROLL_ENABLED: 'false'
+          SCRAPER_RAMSEY_TFL_ENABLED: 'false'
+          SCRAPER_SAINT_PAUL_VACANT_ENABLED: 'false'
+          SCRAPER_TAX_FORFEIT_ENABLED: 'false'
+          SCRAPER_USPS_VACANCY_ENABLED: 'false'
+          SCRAPER_WABASHA_PARCELS_ENABLED: 'false'
+          SCRAPER_WASHINGTON_SHERIFF_ENABLED: 'false'
+          SCRAPER_WASHINGTON_PARCELS_ENABLED: 'false'
+        run: |
+          python -m scripts.run_olmsted_probate github_actions
