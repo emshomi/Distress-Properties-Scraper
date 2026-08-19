@@ -137,6 +137,30 @@ _CATEGORY_FILTERS: dict[str, list[dict[str, str]]] = {
     "tax_assessment": [
         {"source": "ramsey_tax_roll", "event_type": "tax_assessment"},
     ],
+    # ADDED 2026-08-19. Probate had NO category, so fillmore_probate's 48
+    # events were stored correctly and displayed nowhere -- registered in
+    # _SOURCE_TO_COUNTY on 2026-08-07 and never here. Same shape as the
+    # comment on that line: a source can be half-registered and look fine.
+    #
+    # A sixth category, not a fold into an existing one. An estate with a
+    # personal representative holding power to sell is not a foreclosure
+    # (no sale is scheduled) and not tax distress (nothing is owed);
+    # filing it under "foreclosure" would put properties with no auction
+    # date on the Foreclosure Sales tab. Our own eCRV analysis measured
+    # estate-channel sales closing ~30% below market (median $237.5k vs
+    # $340k statewide), which is the strongest per-signal economics we
+    # have -- it earns its own tab.
+    #
+    # NOTE FOR THE FRONTEND: adding this key makes category=probate work
+    # on the API immediately, but the /data tab strip is in
+    # Distress-Properties-Frontend and does NOT yet know about it. Until
+    # six files there are updated (api.ts union, PropertiesView columns +
+    # label, FilterRail sections, HelpTip copy, SignalCatalog, stats.ts),
+    # these events are reachable by API and invisible in the product.
+    "probate": [
+        {"source": "fillmore_probate"},
+        {"source": "olmsted_probate"},
+    ],
 }
 
 # Fixed source -> county for sources whose county is one-to-one with the
@@ -177,6 +201,9 @@ _SOURCE_TO_COUNTY: dict[str, str] = {
     # when 15 sources have data — the probe set is built from this map's
     # keys, so a missing source is invisible twice over.
     "fillmore_probate": "Fillmore",
+    # ADDED 2026-08-19 with the scraper, BEFORE it was enabled -- the note
+    # above this line is what happens otherwise.
+    "olmsted_probate": "Olmsted",
     "olmsted_delq_list": "Olmsted",
     "mn_dor_red_book": "Statewide",
 }
@@ -1017,6 +1044,83 @@ def _extract_olmsted_delq(raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+def _extract_probate(raw: dict, row: dict) -> dict[str, Any]:
+    """fillmore_probate / olmsted_probate — a parcel whose owner of record
+    matches the decedent named in a published probate notice.
+
+    Shared by both counties by design, like _extract_postbulletin_legal is
+    shared with fillmore_legal: olmsted_probate was written from
+    fillmore_probate and emits the same raw_data keys.
+
+    THERE IS NO AMOUNT AND NO SALE DATE, and both are left None rather
+    than filled with the hearing date or the EMV. A probate notice says a
+    personal representative has power to sell; it does not say a sale is
+    scheduled or what anything is owed. Putting the hearing date in
+    sale_date would render a court date as an auction date on a property
+    card.
+
+    status carries the decedent so the card is self-explanatory without
+    opening raw_data -- "Estate of Alan G. Ihde in probate".
+
+    olmsted_probate resolves the property address from core.parcels at
+    scrape time; fillmore_probate does not, so address/city fall back to
+    None there and the assessor patch fills them.
+    """
+    decedent = raw.get("decedent")
+    emv = raw.get("emv_total")
+    try:
+        emv_f = float(emv) if emv is not None else None
+    except (TypeError, ValueError):
+        emv_f = None
+
+    prs = raw.get("personal_representatives") or []
+    pr_name = None
+    if isinstance(prs, list) and prs:
+        first_pr = prs[0]
+        if isinstance(first_pr, dict):
+            pr_name = first_pr.get("name")
+
+    return {
+        "address": raw.get("property_address"),
+        "city": raw.get("property_city"),
+        "zip": None,
+        # The OWNER OF RECORD as the assessor has it, which is the string
+        # the decedent matched against -- not the personal representative.
+        # Showing the PR here would name a living person as the owner.
+        "owner": raw.get("matched_owner_name"),
+        "sale_date": None,      # a hearing is not a sale -- see docstring
+        "sale_time": None,
+        "amount": None,         # nothing is owed on a probate filing
+        "status": (
+            f"Estate of {decedent} in probate" if decedent
+            else "Owner of record is a decedent in probate"
+        ),
+        "tax_parcel_no": row.get("parcel_id"),
+        "original_principal": None,
+        "municipality": raw.get("property_city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": raw.get("published_date"),
+        "market_value": emv_f,
+        "earliest_delq_year": None,
+        "dwelling_type": raw.get("property_type"),
+        "ward": None,
+        # The owner's MAILING address, which on an estate is frequently
+        # not the property -- an out-of-state one is a motivation signal
+        # (55-PR-26-5142 named a co-representative in Naples, Florida).
+        "owner_mailing": raw.get("owner_mailing_address"),
+        "is_absentee": raw.get("owner_is_absentee"),
+        "annual_tax": None,
+        "special_assessment_due": None,
+        # Kept for the property card: the PR is who an investor contacts,
+        # and the case number is what MCRO is searched by.
+        "probate_case_number": raw.get("case_number"),
+        "probate_representative": pr_name,
+        "probate_hearing_date": raw.get("hearing_date"),
+    }
+
+
 _EXTRACTORS: dict[str, Any] = {
     "anoka_sheriff": _extract_anoka,
     "hennepin_sheriff": _extract_hennepin_sheriff,
@@ -1035,6 +1139,10 @@ _EXTRACTORS: dict[str, Any] = {
     # (2026-07-23) — the extractor is shared, like ramsey_tax_roll.
     "fillmore_legal": _extract_postbulletin_legal,
     "olmsted_delq_list": _extract_olmsted_delq,
+    # Both probate sources share one extractor (2026-08-19) -- same
+    # raw_data schema by design, like fillmore_legal above.
+    "fillmore_probate": _extract_probate,
+    "olmsted_probate": _extract_probate,
 }
 
 # ============================================================
