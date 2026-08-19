@@ -161,22 +161,52 @@ def addr_key(value: Any) -> str:
     apart.
 
     '315 1st Street South, Brook Park, Minnesota 55007' and
-    '315 1st Street South' produce the same key ON PURPOSE -- only the first
-    comma segment is ever passed in.
+    '315 1st Street South' produce the same key ON PURPOSE.
+
+    THE TRUNCATION IS NOW INSIDE THE KEY (2026-08-19). It used to rely on
+    every caller passing only the first comma segment -- resolve_by_address()
+    does that on the INPUT side. That was never true of the STORED side, and
+    Washington's parcel load appends the city to the address itself:
+
+        9665 GLACIAL VALLEY RD, CITY OF WOODBURY
+
+    keyed to '9665GLACIALVALLEYCITYOFWOODBURY', which no notice could ever
+    produce. Measured 2026-08-19: 101,413 of Washington's 101,423 addresses
+    carry a comma and 96,143 carry ', CITY OF ...', so EVERY address
+    resolution against a tier-1 metro county had been failing since the county
+    was loaded -- silently, because a miss is indistinguishable from a parcel
+    that is not there. Every other county is at or near zero (hennepin 4,
+    anoka 3, st_louis 1).
+
+    Truncating inside the key makes it symmetric: the same address produces
+    the same key whichever side it arrives from, and no caller has to remember
+    to split first. Verified before shipping that this creates no empty keys
+    -- 0 of 101,413 Washington rows and 0 elsewhere have nothing before the
+    comma, and the two anoka rows that key to empty ("," from an empty-field
+    concatenation) already did so under the old definition.
+
+    core.addr_key() was changed in the same session. **A change to either
+    MUST change both.**
 
     Verified pairs, run before shipping rather than reasoned about:
         '8344 Onigum Road Northwest' == '8344 ONIGUM RD NW'      -> match
         '5195 194TH ST W'            == '5195 194th Street West' -> match
         '1221 1st Avenue Northwest'  == '1221 1ST AVE NW'        -> match
+        '9665 Glacial Valley Rd.'
+             == '9665 GLACIAL VALLEY RD, CITY OF WOODBURY'       -> match
         '100 Main St N'              vs '100 Main St S'          -> DIFFER
         '100 Main St NE'             vs '100 Main St NW'         -> DIFFER
+        '9665 Glacial Valley Rd.'    vs '9665 66th St S'         -> DIFFER
 
     Order of operations mirrors the SQL the measurement used: punctuation
     becomes a SPACE first (so 'ST.' is recognisable as a word), then street
     types are dropped, then directionals are canonicalised, then all
     whitespace is removed.
     """
-    text = re.sub(r"[^A-Za-z0-9]", " ", str(value or "")).upper()
+    # First comma segment only -- see the docstring. Mirrors
+    # split_part($1, ',', 1) in core.addr_key().
+    head = str(value or "").split(",")[0]
+    text = re.sub(r"[^A-Za-z0-9]", " ", head).upper()
     text = _STREET_TYPE_RE.sub(" ", text)
     text = _DIRECTIONAL_RE.sub(
         lambda m: " " + _DIRECTIONALS[m.group(1).upper()] + " ", text
