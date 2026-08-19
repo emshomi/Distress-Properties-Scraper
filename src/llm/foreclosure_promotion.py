@@ -424,7 +424,6 @@ def build_promotion_rows(
             city = extracted.get("city") or ""
             address_is_notice_level = bool(address)
     sale_date = extracted.get("sale_date")
-  
     amount_due = extracted.get("amount_due")
     mortgagor = extracted.get("mortgagor") or "not stated"
     mortgagee = extracted.get("mortgagee") or "not stated"
