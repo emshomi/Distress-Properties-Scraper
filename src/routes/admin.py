@@ -35,6 +35,8 @@ from src.db.supabase_client import (
 from src.llm.foreclosure_promotion import (
     build_promotion_rows,
     split_pids,
+    derive_source,
+    derive_source_id,
     _county_slug as _fc_county_slug,
 )
 from src.services.spine_resolver import (
