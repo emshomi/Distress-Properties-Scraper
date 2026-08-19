@@ -219,6 +219,22 @@ class Settings(BaseSettings):
     scraper_hennepin_tax_roll_enabled: bool = Field(default=True)
     scraper_olmsted_delq_list_enabled: bool = Field(default=True)
 
+    # ADDED 2026-08-19 — Olmsted probate, WITH the scraper rather than after
+    # a failed run. scraper_enabled() below returns False for a missing
+    # field, so the workflow env var alone would do nothing: extra="ignore"
+    # discards the unknown key, hasattr fails, and the run dies with
+    # ScraperDisabledError. That is the hennepin_tax_roll story above, and
+    # the only reason it would surface fast here is that
+    # run_olmsted_probate.py passes trigger="manual" so a disabled flag
+    # raises instead of silently skipping.
+    #
+    # Defaults FALSE, unlike fillmore_probate. Not a judgement about the
+    # source — a brand-new scraper against a live 75,039-parcel owner table
+    # should not start writing because a deploy happened. The workflow sets
+    # it 'true' explicitly, so the first run is a deliberate dispatch that
+    # can be watched. Flip this to True once a manual run has been read.
+    scraper_olmsted_probate_enabled: bool = Field(default=False)
+
     # ADDED 2026-08-05 — MnGeo statewide parcel spine.
     #
     # ONE field for FIFTY-ONE counties, deliberately. The config-driven
