@@ -544,6 +544,11 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
         promoted_count = 0
         duplicate_count = 0
         postponed_count = 0
+        # Members that ended up WITH an event on a real parcel — either just
+        # inserted by the RPC, or already present so the insert was correctly
+        # skipped. Distinct from promoted_via_rpc, which is only the first
+        # case. See the promoted_at stamp after the loop.
+        members_with_event = 0
         source_id = None
         # True once signals.promote_extraction() has run for at least one
         # member. That function marks the extraction approved itself, inside
@@ -702,11 +707,13 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
             # Tally per member. `already` and `postponed` are set by the body
             # above for THIS parcel.
             if already:
+                members_with_event += 1
                 if postponed:
                     postponed_count += 1
                 else:
                     duplicate_count += 1
             else:
+                members_with_event += 1
                 promoted_count += 1
 
         already = promoted_count == 0
@@ -715,16 +722,60 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
         
 
         # The RPC already stamped this row inside the promotion transaction.
-        # Only a notice where EVERY member was a duplicate or a postponement
-        # reaches here unstamped -- nothing was inserted, so there is nothing
-        # for this update to be atomic with.
+        # Anything else reaches here unstamped, and what it gets depends on
+        # whether an event actually exists.
+        #
+        # === promoted_at IS NOT SET WHEN NOTHING PROMOTED (2026-08-19) ===
+        # This block used to stamp promoted_at unconditionally on `if not
+        # promoted_via_rpc`. That flag is False in TWO cases that are nothing
+        # alike:
+        #
+        #   every member was already there  -> the event EXISTS; the insert
+        #                                      was correctly skipped
+        #   no member resolved to a parcel  -> NOTHING was written anywhere
+        #
+        # Both were marked promoted. Measured 2026-08-19 across every approval
+        # since 2026-06-07: 523 approvals, 493 with an event on the published
+        # PID, its digits, or the address-resolved parcel -- and 30 with an
+        # event on NONE of them, all stamped promoted_at, all looking done in
+        # the admin UI. Nineteen are in counties holding between 1 and 67
+        # parcels (martin 3, beltrami 1, roseau 3, todd 1, sibley 1, redwood 1,
+        # dodge 1, blue_earth 1, le_sueur 11, pine 67) where no resolver could
+        # place them; the rest are multi-address package notices whose whole
+        # address list is passed as one address.
+        #
+        # None of that is fixable here, and none of it should be silent. An
+        # approval that placed nothing now keeps promoted_at NULL, so
+        # `promoted_at IS NULL AND review_status = 'approved'` is a queue that
+        # can be counted, alerted on and worked -- instead of 30 rows that
+        # claim success. Same failure shape as the billing service's
+        # `if user_id and sub_id:` with no else: the guard was right, the
+        # reporting was not.
+        #
+        # review_status still becomes 'approved' either way. You DID approve
+        # it; the system just could not place it.
         if not promoted_via_rpc:
             ts = datetime.now(timezone.utc).isoformat()
-            ai_table("extracted_foreclosures").update({
+            _update: dict[str, Any] = {
                 "review_status": "approved",
                 "reviewed_at": ts,
-                "promoted_at": ts,
-            }).eq("id", payload.id).execute()
+            }
+            if members_with_event:
+                _update["promoted_at"] = ts
+            ai_table("extracted_foreclosures").update(_update).eq(
+                "id", payload.id
+            ).execute()
+            if not members_with_event:
+                logger.warning(
+                    "extraction approved but NOTHING promoted — no member "
+                    "resolved to a parcel with an event; promoted_at left "
+                    "NULL so this stays visible as outstanding work",
+                    extraction_id=payload.id,
+                    county=extracted.get("county"),
+                    published_pid=extracted.get("parcel_id"),
+                    address=extracted.get("property_address"),
+                    members=len(pins),
+                )
 
         logger.info(
             "extraction approved + promoted",
