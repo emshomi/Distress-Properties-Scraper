@@ -619,7 +619,74 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 .limit(1)
                 .execute()
             )
-            existing_rows = existing.data or []
+                        existing_rows = existing.data or []
+
+            # === FALLBACK: MATCH ON THE PUBLISHED PID (added 2026-08-19) ===
+            #
+            # The lookup above matches on effective_pid, which in a county with
+            # NO spine is a SYNTHETIC key -- and the synthetic key is derived
+            # from source_id, which is 'ef-{extraction id}' whenever a notice
+            # carries no attorney file number. A new extraction row every week
+            # means a new id, a new source_id, a new synthetic parcel, and a
+            # guard that can never find the event it wrote last week.
+            #
+            # Measured live 2026-08-19: Pine 355039000 (315 1st Street South,
+            # Brook Park) holds TWO events -- PINE-FC-ef-164 dated 2026-07-09
+            # and PINE-FC-ef-426 dated 2026-08-13 -- one property, one
+            # foreclosure, postponed. Both approvals then 500'd on
+            # distress_events_source_identity_key because the guard missed and
+            # the insert hit the unique index. Across all live mnpublicnotice
+            # and startribune_legal events: 273 rows for 250 distinct
+            # properties.
+            #
+            # The stable identity is what the COUNTY published: county plus the
+            # parcel number printed on the notice, held in
+            # raw_data.detail.gis_pid. That does not move when the sale date
+            # moves, which is precisely what the guard needs.
+            #
+            # Filtering happens in Python rather than as a PostgREST JSON
+            # filter: _PROMOTION_SOURCES covers 273 live rows STATEWIDE, so a
+            # single county's unresolved sheriff sales are a handful of rows,
+            # and this avoids depending on nested-JSON filter syntax.
+            #
+            # resolved_at IS NULL is required: a foreclosure that already
+            # completed or cured must not block a genuinely new one on the
+            # same parcel years later.
+            if not existing_rows:
+                _member_digits = "".join(ch for ch in str(_pin or "") if ch.isdigit())
+                _event_county = (built["distress_event"] or {}).get("county_code")
+                if _member_digits and _event_county:
+                    _candidates = (
+                        signals_table("distress_events")
+                        .select("id, event_date, source, parcel_id, raw_data")
+                        .in_("source", list(_PROMOTION_SOURCES))
+                        .eq("county_code", _event_county)
+                        .eq("event_type", "sheriff_sale")
+                        .is_("resolved_at", "null")
+                        .execute()
+                    )
+                    for _row in (_candidates.data or []):
+                        _pub = (
+                            ((_row.get("raw_data") or {}).get("detail") or {})
+                            .get("gis_pid")
+                        )
+                        _pub_digits = "".join(
+                            ch for ch in str(_pub or "") if ch.isdigit()
+                        )
+                        if _pub_digits and _pub_digits == _member_digits:
+                            existing_rows = [_row]
+                            logger.info(
+                                "existing event found by PUBLISHED PID "
+                                "(synthetic parcel key missed)",
+                                extraction_id=payload.id,
+                                county_code=_event_county,
+                                published_pid=_pin,
+                                stale_parcel_key=effective_pid,
+                                matched_event_id=_row.get("id"),
+                                matched_parcel_id=_row.get("parcel_id"),
+                            )
+                            break
+
             already = bool(existing_rows)
             postponed = False
 
