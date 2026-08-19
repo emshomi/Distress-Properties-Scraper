@@ -619,7 +619,7 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 .limit(1)
                 .execute()
             )
-                        existing_rows = existing.data or []
+            existing_rows = existing.data or []
 
             # === FALLBACK: MATCH ON THE PUBLISHED PID (added 2026-08-19) ===
             #
