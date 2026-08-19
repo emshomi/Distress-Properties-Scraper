@@ -228,12 +228,26 @@ class Settings(BaseSettings):
     # run_olmsted_probate.py passes trigger="manual" so a disabled flag
     # raises instead of silently skipping.
     #
-    # Defaults FALSE, unlike fillmore_probate. Not a judgement about the
-    # source — a brand-new scraper against a live 75,039-parcel owner table
-    # should not start writing because a deploy happened. The workflow sets
-    # it 'true' explicitly, so the first run is a deliberate dispatch that
-    # can be watched. Flip this to True once a manual run has been read.
-    scraper_olmsted_probate_enabled: bool = Field(default=False)
+    # Shipped 2026-08-19 defaulting FALSE so a brand-new scraper could not
+    # start writing against a live 75,039-parcel owner table because a
+    # deploy happened. FLIPPED TRUE the same day, after the first manual
+    # dispatch was read (run 679, 8.2s):
+    #
+    #   1,200 notices fetched   1,032 rejected as not probate
+    #   15 estates seen          0 with an unparseable decedent
+    #   8 matched an owner of record -> 15 events, 0 failed
+    #
+    # All fifteen verified by hand against the decedent name. $7.92M of
+    # estate-owned Olmsted property, including a six-parcel $3.07M Eyota
+    # farm estate under one case number (55-PR-26-4541).
+    #
+    # NOTE: the workflow was never gated on this field — olmsted-probate.yml
+    # sets SCRAPER_OLMSTED_PROBATE_ENABLED='true' in its own env, which is
+    # why the first run worked with this at False. What True adds is the
+    # Railway API trigger path (POST /trigger/olmsted_probate), which would
+    # otherwise raise ScraperDisabledError, and parity with
+    # scraper_fillmore_probate_enabled above.
+    scraper_olmsted_probate_enabled: bool = Field(default=True)
 
     # ADDED 2026-08-05 — MnGeo statewide parcel spine.
     #
