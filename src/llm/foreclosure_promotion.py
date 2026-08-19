@@ -508,7 +508,6 @@ def build_promotion_rows(
             # True when raw_data.address holds the NOTICE's address string
             # rather than this parcel's own -- see the fallback above.
             "address_is_notice_level": address_is_notice_level,
-
                "note": (
                 f"Part of a package sale of {pkg_size} properties sold together"
                 f" for {_money_str(amount_due)}. No individual price was"
