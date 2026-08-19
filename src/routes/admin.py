@@ -911,14 +911,104 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
     dependencies=[AdminKeyRequired],
 )
 async def reject_extraction(payload: AdminActionIn) -> dict[str, Any]:
-    """Mark an extraction rejected. It is never promoted to the live tables."""
+    """Mark an extraction rejected, and retire the event IT created (if any).
+
+    CHANGED 2026-08-19. This route used to update review_status and nothing
+    else, and its docstring claimed the extraction "is never promoted to the
+    live tables". That is false for anything approved BEFORE it was rejected.
+
+    Measured live: extraction 126 (St. Louis, file 26-120401) was promoted
+    2026-06-14 and rejected 2026-06-29 -- fifteen days later. Event 61632 was
+    still on the foreclosure tab on 2026-08-19, seven weeks after the
+    rejection, because rejecting changed a status column and left the live row
+    untouched.
+
+    === WHY THE MATCH IS DELIBERATELY NARROW ===
+
+    Retiring "the event for this parcel" would be actively wrong. Minnesota
+    requires six weeks of publication (Minn. Stat. 580.03) and postponements
+    are routine, so ONE foreclosure produces SEVERAL extraction rows over
+    months, all on the same parcel. Rejecting a stale republication is the
+    normal way to clear the queue -- and under a parcel-wide rule that would
+    retire the CURRENT event.
+
+    Concrete case from 2026-08-19: extraction 90 (Martin, 058273-F1, sale
+    2026-06-26) was rejected as stale. Its parcel's live event 69252 had been
+    moved to 2026-08-17 by a postponement and must survive.
+
+    So the match is the identity of THIS NOTICE VERSION: same source_id (with
+    the package '#parcel' suffix allowed) AND the same sale date. Under that
+    rule extraction 90 finds nothing -- 058273-F1 matches, 2026-06-26 does not
+    equal 2026-08-17 -- and 69252 stays live, which is correct.
+
+    A NULL sale_date matches nothing and retires nothing. That is deliberate:
+    an extraction with no sale date cannot identify a version, and doing
+    nothing is the safe failure.
+    """
     try:
+        row_result = (
+            ai_table("extracted_foreclosures")
+            .select("id, source_name, attorney_file_no, sale_date")
+            .eq("id", payload.id)
+            .limit(1)
+            .execute()
+        )
+        rows = row_result.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Extraction not found.")
+        extracted = rows[0]
+
+        retired_event_ids: list[int] = []
+        _sale_date = extracted.get("sale_date")
+        _source = derive_source(extracted)
+        _source_id = derive_source_id(extracted)
+
+        if _sale_date and _source_id:
+            _candidates = (
+                signals_table("distress_events")
+                .select("id, source_id, event_date, parcel_id")
+                .eq("source", _source)
+                .eq("event_type", "sheriff_sale")
+                .eq("event_date", _sale_date)
+                .is_("resolved_at", "null")
+                .execute()
+            )
+            for _row in (_candidates.data or []):
+                _sid = str(_row.get("source_id") or "")
+                # Exact match, or a package member of this same notice.
+                if _sid == _source_id or _sid.startswith(f"{_source_id}#"):
+                    retired_event_ids.append(_row["id"])
+
+        if retired_event_ids:
+            signals_table("distress_events").update({
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+                "resolution": "rejected",
+            }).in_("id", retired_event_ids).execute()
+            logger.info(
+                "rejected extraction: live events retired",
+                extraction_id=payload.id,
+                source=_source,
+                source_id=_source_id,
+                sale_date=_sale_date,
+                retired_event_ids=retired_event_ids,
+            )
+
         ai_table("extracted_foreclosures").update({
             "review_status": "rejected",
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", payload.id).execute()
-        logger.info("extraction rejected", extraction_id=payload.id)
-        return success_envelope({"id": payload.id, "status": "rejected"})
+        logger.info(
+            "extraction rejected",
+            extraction_id=payload.id,
+            retired_events=len(retired_event_ids),
+        )
+        return success_envelope({
+            "id": payload.id,
+            "status": "rejected",
+            "retired_event_ids": retired_event_ids,
+        })
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("admin reject extraction failed", error_type=type(e).__name__)
         raise HTTPException(status_code=500, detail="Failed to reject extraction.")
