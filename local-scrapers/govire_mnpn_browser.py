@@ -2157,6 +2157,13 @@ def _fetch_full_notice(page, notice_id: str, context=None) -> Optional[str]:
 # Alerting (silent-failure guard)
 # ============================================================
 
+# Below this many NEW notices attempted, a run that stores nothing is
+# reported PARTIAL rather than HARD. Three, because one bad LLM
+# response is a document problem and three in a row is a site
+# problem -- and because the 2026-08-18 12:12 run had exactly one.
+_HARD_FAILURE_MIN_ATTEMPTS = 3
+
+
 def _maybe_alert(env: dict[str, str], stats: dict[str, int]) -> None:
     """Email an alert via Resend when a run looks unhealthy, so a silent
     failure (e.g. a captcha migration that makes every notice fail) surfaces
@@ -2197,29 +2204,80 @@ def _maybe_alert(env: dict[str, str], stats: dict[str, int]) -> None:
             (tax_notices > 0 and parcels == 0)
             or (parcels > 0 and stored == 0 and dupes == 0)
         )
+        # Not used in this mode -- the redemption rule already reasons about
+        # tax_notices/parcels/dupes rather than raw counts. Bound so the
+        # shared `soft` line below cannot raise NameError.
+        thin_miss = False
     else:
-        hard = ids > 0 and stored == 0
-    soft = no_text > 0
+        # FIXED 2026-08-19. This was `ids > 0 and stored == 0`, which is the
+        # exact rule the redemption branch above was corrected away from on
+        # 2026-08-09 -- and for the same reason, one mode later.
+        #
+        # ids counts notices FOUND, and in a healthy window most of them are
+        # ones we already have: the search returns the last N days and a
+        # foreclosure notice republishes for six statutory weeks, so a feed
+        # that is fully caught up finds ten and stores none. That is the
+        # dedup SUCCEEDING, and it emailed HARD FAILURE for it.
+        #
+        # TWO CHANGES, and the second is the one that matters.
+        #
+        # 1. Gate on new_attempted, not ids. A run with nothing new to do
+        #    cannot have failed to do it.
+        #
+        # 2. Gate on the FAILURE RATE, not the count. Measured on the
+        #    2026-08-18 12:12 run: ids=10, already_staged=9,
+        #    new_attempted=1, stored=0, extract_failed=1 -- ONE new notice
+        #    whose extraction returned unparseable JSON. Under
+        #    `new_attempted > 0 and stored == 0` that is still a HARD
+        #    FAILURE, at the same volume as "twelve new notices and the site
+        #    is down". It is not the same event. A site change or a captcha
+        #    break fails EVERYTHING; one malformed LLM response fails one
+        #    document.
+        #
+        #    So a hard failure needs a meaningful attempt behind it. Below
+        #    the floor the run is reported PARTIAL, which still emails --
+        #    nothing goes silent that used to alarm, it is only ranked
+        #    honestly.
+        #
+        # The 2026-08-17 07:44 run -- ids=12, already_staged=2,
+        # new_attempted=9, stored=0 -- still fires HARD, correctly: nine
+        # notices were new and none landed.
+        new_attempted = stats.get("new", 0)
+        hard = new_attempted >= _HARD_FAILURE_MIN_ATTEMPTS and stored == 0
+        # A partial: something new was tried, nothing stored, but too few
+        # attempts to tell a broken site from one bad document.
+        thin_miss = 0 < new_attempted < _HARD_FAILURE_MIN_ATTEMPTS and stored == 0
+    soft = no_text > 0 or thin_miss
     if not (hard or soft):
         return  # healthy run, nothing to do
 
     severity = "HARD FAILURE" if hard else "PARTIAL FAILURE"
     summary = (
         f"[{severity}] govire mnpn scraper\n\n"
-        f"ids_found={ids}  stored={stored}  no_text={no_text}  "
-        f"extract_failed={stats.get('extract_fail', 0)}  "
-        f"already_staged={stats.get('already', 0)}\n\n"
-        + ("Found notices but stored NONE -- likely a site/captcha change "
-           "blocking extraction. Check the run log for the failure mode.\n"
+        # new_attempted ADDED 2026-08-19. Without it the counters do not
+        # reconcile and the email cannot be diagnosed from the email: the
+        # 08-17 alert read ids=12 already_staged=2 no_text=1
+        # extract_failed=0 stored=0, which accounts for 3 of 12 and leaves
+        # nine unexplained. new_attempted is the number that closes the gap,
+        # and it is now also the number the severity rule gates on.
+        f"ids_found={ids}  already_staged={stats.get('already', 0)}  "
+        f"new_attempted={stats.get('new', 0)}  stored={stored}  "
+        f"no_text={no_text}  "
+        f"extract_failed={stats.get('extract_fail', 0)}\n\n"
+        + ("Attempted several NEW notices and stored NONE of them -- "
+           "likely a site/captcha change blocking extraction. Check the run "
+           "log for the failure mode.\n"
            if hard else
-           "Some notices produced no text -- possible partial site change or "
-           "flaky captcha solves. Check the run log.\n")
+           "Some notices produced no text, or a small number of new "
+           "notices were attempted and none stored (one bad extraction "
+           "reads like this). Check the run log.\n")
         + f"\nRun finished {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} local."
     )
 
     # Always emit a loud local line so the signal is in the run output too.
     _log("!" * 60)
-    _log(f"ALERT  {severity}: ids={ids} stored={stored} no_text={no_text}")
+    _log(f"ALERT  {severity}: ids={ids} new_attempted={stats.get('new', 0)} "
+         f"stored={stored} no_text={no_text}")
     _log("!" * 60)
 
     api_key = env.get("RESEND_API_KEY")
