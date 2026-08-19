@@ -394,7 +394,7 @@ def build_promotion_rows(
     # be trusted to fill it. The county's own list is kept in
     # _package.notice_addresses, visible but not presented as this property's
     # address.
-        #
+    #
     # ADDED 2026-08-19. The blank is correct ONLY when the member has a SPINE
     # parcel to inherit an address from. Washington's Forest Lake member is in
     # exactly that state: blank here, but core.parcels holds its real address
