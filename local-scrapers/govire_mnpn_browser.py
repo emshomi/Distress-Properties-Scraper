@@ -1741,6 +1741,7 @@ def _run_search_collect_ids(page, window_days: int,
     # Collect IDs from page 1.
     _html = page.content()
     _harvest_publications(_html)
+    _harvest_published_dates(_html)
     ids.extend(_ids_in_html(_html, seen))
 
     # Follow pagination: click "next" while it exists, up to a safety cap.
@@ -1763,6 +1764,7 @@ def _run_search_collect_ids(page, window_days: int,
         before = len(seen)
         _html = page.content()
         _harvest_publications(_html)
+        _harvest_published_dates(_html)
         ids.extend(_ids_in_html(_html, seen))
         if len(seen) == before:
             break  # no new IDs -> stop
@@ -1805,12 +1807,47 @@ def _run_search_collect_ids(page, window_days: int,
              "date range)")
 
     _log(f"Found {len(ids)} notice IDs in the recent window.")
+    # TEMPORARY PROBE 2026-08-19 — verifies the grid harvest fires on the
+    # LIVE page, not just on the one row captured by hand. Safe to delete
+    # once the counts have been read; it only prints.
+    _log(f"  [probe] harvested dates: {len(_notice_published)} / "
+         f"publications: {len(_notice_publication)}")
+    _log(f"  [probe] sample dates: "
+         f"{dict(list(_notice_published.items())[:3])}")
+    _log(f"  [probe] sample pubs : "
+         f"{dict(list(_notice_publication.items())[:2])}")
     return ids
 
 
 # notice_id -> publication name, harvested from the results grid so a
 # publication can be skipped BEFORE paying for its Turnstile solves.
 _notice_publication: dict[str, str] = {}
+
+# notice_id -> ISO publication date, harvested from the SAME grid row.
+#
+# ADDED 2026-08-19. Every one of the 456 rows in ai.extracted_redemptions
+# has published_date NULL, and the reason was not a parse failure: the
+# call site passed the literal `None`. _store_redemptions has taken a
+# published_date parameter since it was written and handles it correctly.
+#
+# It matters because of the 84 pending redemption rows with no
+# redemption_expiry. Those notices state the deadline as "60 days after
+# service of notice" and never give the service date -- the model reported
+# that accurately and declined to invent one. But SERVICE MUST PRECEDE
+# PUBLICATION, so a publication date is a real lower bound on a deadline
+# that is otherwise unbounded. Not the exact date; a floor. The same
+# distinction signals.tax_delinquency_status already makes with
+# forfeiture_basis: record how a date was derived rather than pretending
+# it was published.
+#
+# The grid row (captured live 2026-08-19) reads:
+#     <input ... hdnPKValue ... value="1071273">
+#     ...
+#     <div class="left"><strong>Star Tribune (Minneapolis)</strong><br>
+#     Tuesday, August 18, 2026</div>
+# so the date sits immediately after the publication, inside the same
+# span _harvest_publications already traverses.
+_notice_published: dict[str, str] = {}
 
 # Publications observed publishing SCANNED (image-only) PDFs this run.
 #
@@ -1861,6 +1898,42 @@ def _harvest_publications(html: str) -> None:
             pub = re.sub(r"\s+", " ", pub).strip()
             if nid and pub and nid not in _notice_publication:
                 _notice_publication[nid] = pub
+    except Exception:
+        pass
+
+
+def _harvest_published_dates(html: str) -> None:
+    """Map notice id -> ISO publication date from the search results grid.
+
+    A SEPARATE regex from _harvest_publications, not a widened one, and
+    deliberately so. The comment on that function records an earlier grid
+    parse that mapped only 2 of 10 ids because "each grid row repeats the
+    id in BOTH places and the distance to <strong> varies with the row's
+    markup". Folding the date into that pattern would make a row without a
+    date lose its publication too. Two passes cost one extra regex scan of
+    HTML already in memory, and a date miss cannot break the publication
+    map.
+
+    The day name is optional in the pattern ("Tuesday, August 18, 2026"
+    observed live, but a row rendering only "August 18, 2026" still
+    matches), and an unparseable date is skipped rather than stored as a
+    string -- a bad date on a redemption deadline is worse than no date.
+    """
+    try:
+        for m in re.finditer(
+            r'hdnPKValue[^>]*?value="(\d+)'
+            r'".{0,1500}?</strong>\s*<br\s*/?>\s*'
+            r'(?:[A-Za-z]+,\s*)?([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})',
+            html, re.I | re.S,
+        ):
+            nid, mon, day, yr = m.groups()
+            if not nid or nid in _notice_published:
+                continue
+            try:
+                d = datetime.strptime(f"{mon} {day} {yr}", "%B %d %Y").date()
+            except ValueError:
+                continue
+            _notice_published[nid] = d.isoformat()
     except Exception:
         pass
 
@@ -2598,9 +2671,18 @@ def main() -> int:
                     _log(f"  notice {nid}: classified tax redemption but the "
                          "model returned no parcels -- skipped")
                     continue
+                # Was `None, None` (fixed 2026-08-19). Both values were
+                # already in hand -- _notice_publication has been populated
+                # since the scanned-PDF work, and _notice_published is
+                # harvested from the same grid row -- and both were being
+                # discarded at the call site. publication is what says WHICH
+                # paper ran a notice in a county served by several, which is
+                # exactly the Crow Wing case where one publication prints
+                # text and two print scans.
                 n_ok, n_dupe = _store_redemptions(
                     sb, parcels, source_url, notice_text, county_map,
-                    None, None)
+                    _notice_published.get(str(nid)),
+                    _notice_publication.get(str(nid)))
                 stats["parcels"] += len(parcels)
                 stats["dupes"] += n_dupe
                 if n_ok:
