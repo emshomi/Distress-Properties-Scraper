@@ -394,12 +394,37 @@ def build_promotion_rows(
     # be trusted to fill it. The county's own list is kept in
     # _package.notice_addresses, visible but not presented as this property's
     # address.
+        #
+    # ADDED 2026-08-19. The blank is correct ONLY when the member has a SPINE
+    # parcel to inherit an address from. Washington's Forest Lake member is in
+    # exactly that state: blank here, but core.parcels holds its real address
+    # and geometry, so it renders and geocodes fine.
+    #
+    # When there is NO spine parcel (resolved_parcel_id is None) the stub built
+    # below is the only record this property will ever have, and a blank
+    # address is permanent: backfill_stub_geocode.py requires a usable address,
+    # so the row can never acquire coordinates. Measured on 2026-08-19 across
+    # all 34 package members: 3 blank addresses, and the 2 with no geometry are
+    # both Martin, a county with no spine at all (5 parcels, every one
+    # synthetic). Washington's blank has geom and is unaffected.
+    #
+    # In that case fall back to what the county PRINTED. It is a real address
+    # and it is strictly better than nothing -- but it describes the NOTICE,
+    # not this parcel ('1228 & 1224 N Prairie Ave' covers both members), so it
+    # is flagged in _package.address_is_notice_level and the card can qualify
+    # it rather than presenting it as this parcel's own.
     notice_addresses = None
+    address_is_notice_level = False
     if package:
         notice_addresses = address
         address = (member_address or {}).get("address") or ""
         city = (member_address or {}).get("city") or ""
+        if not address and resolved_parcel_id is None:
+            address = notice_addresses or ""
+            city = extracted.get("city") or ""
+            address_is_notice_level = bool(address)
     sale_date = extracted.get("sale_date")
+  
     amount_due = extracted.get("amount_due")
     mortgagor = extracted.get("mortgagor") or "not stated"
     mortgagee = extracted.get("mortgagee") or "not stated"
