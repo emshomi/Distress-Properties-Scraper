@@ -4371,6 +4371,156 @@ async def list_properties(
 
 
 # ============================================================
+# GET /properties/{property_id} — single property by event id
+# ============================================================
+#
+# ADDED 2026-08-20 to back the property DETAIL PAGE (a real route with a real
+# URL, not the slide-out panel). Declared BEFORE the (source, source_id) route
+# below because a reader expects the narrower key first; the two cannot
+# actually collide, since this path is one segment and that one is two.
+#
+# WHY A SECOND SINGLE-PROPERTY ROUTE RATHER THAN REUSING THE ONE BELOW.
+# Three reasons, in order of severity:
+#
+#   1. That route reads signals.distress_events DIRECTLY. The 2026-08-19 fix
+#      that added `WHERE de.resolved_at IS NULL` lives in the VIEW, so it never
+#      reaches it — that route will serve a superseded or resolved event as
+#      live. This one reads signals.distress_with_parcel and inherits the
+#      filter.
+#
+#   2. postponement_count / prior_sale_dates / first_known_sale_date are
+#      DERIVED IN THE VIEW, by lateral join on signals.distress_event_history.
+#      They do not exist as columns on distress_events, so
+#      _shape_property_row's `row.get("postponement_count") or 0` silently
+#      returns 0 on that route for every property in the database. The
+#      redemption ruler's postponement markers are the reason the detail page
+#      exists; sourcing them from a table that cannot carry them would render
+#      an empty ruler and call it "no postponements".
+#
+#   3. (source, source_id) IS NOT A STABLE URL. That route's own docstring
+#      concedes the pair is not unique and accepts a parcel_id disambiguator.
+#      Worse, source_id MOVES: anoka_sheriff embeds the sale date in it
+#      (anoka_sheriff.py:1326), so a postponement mints a brand-new one by
+#      construction, and mnpublicnotice falls back to `ef-{extraction id}`,
+#      which changes on every republication. A link mailed to an investor
+#      would 404 the first time the sale was moved — in a product whose claim
+#      is that it tracks the moves.
+#
+# `id` is signals.distress_events.id carried through the view. Verified
+# 2026-08-20: 8,301 rows, 8,301 distinct ids, 0 nulls — the parcel join does
+# not fan out, so one id is one property and `.limit(1)` is exact rather than
+# a tie-break.
+#
+# NOTE ON `.select("*")`: deliberate, and only safe because this returns ONE
+# row. The list endpoint must name its columns, which is half of the trap
+# recorded at _shape_property_row — a new view column needs the select list
+# AND the hand-built dict. Here the select side is automatic, so a new column
+# needs only the dict edit. The dict is still the thing that decides what
+# reaches the client.
+
+
+@router.get(
+    "/properties/{property_id}",
+    status_code=http_status.HTTP_200_OK,
+    summary="Fetch a single property by signals.distress_events.id.",
+)
+async def get_property_by_id(
+    property_id: int,
+    _ctx: TierContext = TierResolved,
+) -> dict[str, Any]:
+    """Return the full record for one property identified by its event id.
+
+    Typed `int` on purpose: FastAPI rejects a non-numeric segment with 422
+    before the handler runs, so no malformed id ever reaches PostgREST.
+    """
+    try:
+        result = (
+            signals_table("distress_with_parcel")
+            .select("*")
+            .eq("id", property_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            # Also the answer when the event exists but has been resolved or
+            # superseded — the view excludes it, and a page that says "not
+            # found" is more honest than one that renders a dead foreclosure
+            # with a live countdown.
+            raise HTTPException(
+                status_code=404,
+                detail=f"Property not found: {property_id}",
+            )
+
+        row = rows[0]
+        raw_data = row.get("raw_data") or {}
+        src = row.get("source") or ""
+
+        overlay_map = _load_overlay_map()
+        owner_map = _load_owner_map()
+        tracker_map = _load_redemption_tracker_map()
+        delq_map = _load_delq_status_map()
+
+        shaped = _shape_property_row(
+            row, overlay_map, owner_map, tracker_map, delq_map
+        )
+        _apply_assessor_owners([shaped])
+        _recompute_deal_math([shaped])
+        shaped["raw"] = raw_data
+
+        # The view already computes both halves of the composite key, so take
+        # them from it rather than re-deriving.
+        #
+        # This is NOT merely tidier. The route below derives the county as
+        # `(_resolve_county(...) or "").lower()`, which lowercases the DISPLAY
+        # name: 'St. Louis' -> 'st. louis', 'Otter Tail' -> 'otter tail'.
+        # core.parcels is keyed on the slug ('st_louis', 'otter_tail'), so on
+        # that route enrichment and imagery silently return None for every
+        # multi-word county. Identical to the slug for single-word counties,
+        # which is why it has gone unnoticed. Fixing it there is its own task;
+        # this route uses the view's county_slug and does not inherit it.
+        eff_pid = row.get("eff_parcel_id") or _effective_parcel_id(
+            src, raw_data, row
+        )
+        county_slug = (
+            row.get("county_slug")
+            or _county_slug(_resolve_county(src, raw_data))
+            or ""
+        ).lower()
+
+        shaped["enrichment"] = (
+            _load_parcel_enrichment(county_slug, eff_pid) if eff_pid else None
+        )
+        # Google panorama IDS ONLY, never pixels. Gated below by
+        # redact_property: imagery_pano is in _LOCATOR_FIELDS, so under
+        # STANDARD the client receives only imagery.available.
+        shaped["imagery"] = (
+            _load_parcel_imagery(county_slug, eff_pid) if eff_pid else None
+        )
+
+        # Internal de-dup key — never leaves the server.
+        shaped.pop("_eff_key", None)
+
+        shaped = redact_property(shaped, tier=_ctx.tier)
+        shaped = redact_detail_extras(shaped, tier=_ctx.tier)
+
+        return success_envelope(shaped)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            "single property by id query failed",
+            property_id=property_id,
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch property: {type(e).__name__}",
+        )
+
+
+# ============================================================
 # GET /properties/{source}/{source_id} — single property
 # ============================================================
 
