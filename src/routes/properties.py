@@ -4918,11 +4918,32 @@ async def owner_properties(
         # PostgREST directly, so we fetch foreclosure-source rows that HAVE a
         # gis_owner and match in Python. The enriched set is small (~600 rows).
         result = (
-            signals_table("distress_events")
+            # CHANGED 2026-08-20: signals.distress_events -> the view.
+            #
+            # Three reasons, in order of severity.
+            #
+            #   1. NO `id` WAS SELECTED, so every row in an owner's portfolio
+            #      arrived without the one value that addresses a property.
+            #      Nothing could link from here to /property/{id} — the owner
+            #      drawer is where a premium subscriber sees a landlord's
+            #      whole portfolio, and not one of those rows could be opened
+            #      as a page.
+            #   2. distress_events has no resolved_at filter, so this route
+            #      served superseded and resolved events as live. The view
+            #      carries `WHERE de.resolved_at IS NULL`.
+            #   3. postponement_count / prior_sale_dates / first_known_sale_date
+            #      are derived IN the view. Off the base table they do not
+            #      exist, so _shape_property_row's `or 0` returned zero
+            #      postponements for every row here.
+            #
+            # Same column list otherwise, plus the view's enrichment, which
+            # the shaper already knows how to read.
+            signals_table("distress_with_parcel")
             .select(
-                "source_id, source, parcel_id, event_type, event_date, "
+                "id, source_id, source, parcel_id, event_type, event_date, "
                 "event_value, severity, title, description, raw_data, "
-                "observed_at"
+                "observed_at, county_slug, eff_parcel_id, "
+                "postponement_count, prior_sale_dates, first_known_sale_date"
             )
             .not_.is_("raw_data->detail->>gis_owner", "null")
             .range(0, 4999)
