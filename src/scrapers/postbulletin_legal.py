@@ -219,6 +219,13 @@ def _clean_ws(text: str | None) -> str | None:
     return s or None
 
 
+# Column's search index appends a chunk ordinal to the document id when it
+# splits a long notice across records: '<docid>-0', '-1', '-2'. Anchored to
+# the END and to digits only, so a document id that legitimately contains a
+# hyphen is untouched.
+_RE_CHUNK_SUFFIX = re.compile(r"-\d+$")
+
+
 def _extract_pin(text: str) -> str | None:
     m = _RE_PIN.search(text)
     if not m:
@@ -337,6 +344,14 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
         signals: list[DistressEventInsert] = []
         skipped_no_text = skipped_not_fc = skipped_no_pin = 0
         skipped_county = 0
+        # Second line of defence. The source_id above already collapses
+        # chunks at the constraint, but emitting five identical rows and
+        # relying on the database to reject four is wasteful and makes the
+        # run log lie about how much was found. Keyed on the same pair the
+        # identity uses, so it can never suppress a genuinely distinct
+        # property.
+        seen_in_run: set[tuple[str, Any]] = set()
+        skipped_chunk_dupe = 0
 
         for hit in raw_records:
             text = _extract_notice_text(hit)
@@ -448,6 +463,53 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
                 or hit.get("objectID") or pin
             )
 
+            # === THE CHUNK-INDEX DUPLICATE (fixed 2026-08-20) ==============
+            #
+            # Column's search index SPLITS a long notice into several
+            # records, each carrying the same document id with a numeric
+            # suffix: 'UoIWOStaj1a5KgVNjxbi-0', '-1', '-2'... Every chunk
+            # holds a slice of the SAME notice text, so every chunk parses
+            # to the same PIN, the same sale date and the same amount.
+            #
+            # `hit["id"]` and friends are absent on this feed, so notice_id
+            # fell through to objectID and the suffix became part of the
+            # event identity. distress_events_source_identity_key is
+            # (county_code, source, source_id, event_date) — four distinct
+            # source_ids are four distinct identities, so the constraint
+            # correctly permitted all of them.
+            #
+            # Measured 2026-08-20: olmsted 850611061190, sale 2026-09-24,
+            # $178,479.38 — FIVE events. Suffix -0 from the 2026-07-23 run
+            # and -1 -2 -3 -4 all written in the 15:16:14 run, two
+            # milliseconds apart. Also 630744037449 with -4 and -5. The
+            # chunk COUNT and ORDER change whenever the document is
+            # re-indexed, so a re-run mints new duplicates indefinitely.
+            #
+            # === WHY NOT SIMPLY STRIP THE SUFFIX ===
+            #
+            # Because one notice can legitimately describe MANY properties.
+            # Washington notice 26-003536FC lists thirteen Forest Lake
+            # parcels under a single bid, each correctly its own event
+            # (recorded in integrity check 3). Collapsing to a bare document
+            # id would give all thirteen one identity and lose twelve real
+            # properties — trading a duplicate for a deletion, which is the
+            # worse direction.
+            #
+            # So the identity is the DOCUMENT plus the PROPERTY. The
+            # document id is stable across re-indexing; the PIN is
+            # intrinsic to the parcel and guaranteed non-null here (a hit
+            # without a parseable PIN was skipped above, never given a
+            # synthetic id). Chunks of one notice collapse; distinct
+            # properties in one notice stay distinct.
+            notice_doc_id = _RE_CHUNK_SUFFIX.sub("", notice_id)
+            source_id = f"{notice_doc_id}-{pin}"
+
+            dupe_key = (source_id, sale_date)
+            if dupe_key in seen_in_run:
+                skipped_chunk_dupe += 1
+                continue
+            seen_in_run.add(dupe_key)
+
             signals.append(DistressEventInsert(
                 parcel_id=pin,
                 event_type="sheriff_sale",
@@ -458,7 +520,7 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
                 event_date=sale_date,
                 event_value=amount_due,
                 source=self.source_name,
-                source_id=notice_id,
+                source_id=source_id,
                 severity="high",  # type: ignore[arg-type]
                 title=_TITLE,
                 description=_DESC,
@@ -489,7 +551,10 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
                     "redemption_basis": redemption_basis,
                     "redemption_abandonment_caveat": abandon_caveat,
                     "postponed": bool(postponements),
+                    # The raw hit id, suffix and all — kept for tracing a
+                    # row back to the exact search record it came from.
                     "notice_id": notice_id,
+                    "notice_doc_id": notice_doc_id,
                     "newspaper": _NEWSPAPER,
                     "pin_matched": True,
                 },
@@ -503,6 +568,7 @@ class PostBulletinLegalScraper(BaseScraper[dict[str, Any], DistressEventInsert])
             skipped_no_text=skipped_no_text,
             skipped_not_foreclosure=skipped_not_fc,
             skipped_no_pin=skipped_no_pin,
+            skipped_chunk_dupe=skipped_chunk_dupe,
             skipped_other_county=skipped_county,
         )
         return signals
