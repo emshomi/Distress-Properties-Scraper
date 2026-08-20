@@ -343,7 +343,22 @@ class DakotaSheriffScraper(BaseArcGISScraper[DistressEventInsert]):
         return DistressEventInsert(
             parcel_id=parcel_id,
             event_type="sheriff_sale",
-            event_subtype=f"completed_sale_{year}",
+            # CHANGED 2026-08-19. Was f"completed_sale_{year}", which minted a
+            # NEW subtype value every January -- completed_sale_2025,
+            # completed_sale_2026, and completed_sale_2027 due next. A value
+            # set that grows forever cannot be enumerated by a CHECK
+            # constraint or matched by any cross-source rule, which is what
+            # blocks correcting signals.mark_superseded_sheriff_sales().
+            #
+            # hennepin_sheriff.py:467 and anoka_sheriff.py:1330 both write the
+            # bare "completed_sale". Dakota was the only outlier.
+            #
+            # The year is not load-bearing: distress_events_dedup_key is
+            # (county_code, parcel_id, event_type, event_date, source) and
+            # event_subtype is NOT in it. Verified 2026-08-19 on all 170 live
+            # dakota rows -- 170 events, 170 distinct dedup keys. event_date
+            # already separates a 2025 sale from a 2026 one.
+            event_subtype="completed_sale",
             event_date=sale_date,
             event_value=sale_amount,
             source=self.source_name,
