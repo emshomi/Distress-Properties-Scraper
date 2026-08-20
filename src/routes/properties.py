@@ -3841,8 +3841,16 @@ async def list_properties(
         # value, type, school) run at the DB level and scale as enrichment grows.
         query = (
             signals_table("distress_with_parcel")
-            .select(
-                "source_id, source, parcel_id, event_type, event_date, "
+                        .select(
+                # id ADDED 2026-08-19. This is signals.distress_events.id, the
+                # view's real identifier. Its absence is why the comment at
+                # line 1624 warns that "the list endpoint selects from
+                # distress_with_parcel WITHOUT the distress_events id, so a PK
+                # join would silently fail there" -- and why _eff_key and the
+                # secondary join path exist at all. Selecting it costs nothing
+                # and lets the list, the detail route and the saved-search
+                # tracker key on the same value.
+                "id, source_id, source, parcel_id, event_type, event_date, "
                 "event_value, severity, title, description, raw_data, "
                 "observed_at, year_built, sqft, lot_sqft, emv_total, "
                 "property_type, school_district",
