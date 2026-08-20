@@ -3859,7 +3859,14 @@ async def list_properties(
                 "id, source_id, source, parcel_id, event_type, event_date, "
                 "event_value, severity, title, description, raw_data, "
                 "observed_at, year_built, sqft, lot_sqft, emv_total, "
-                "property_type, school_district",
+                "property_type, school_district, "
+                # ADDED 2026-08-19. Derived in signals.distress_with_parcel from
+                # signals.distress_event_history via a lateral join on event_id.
+                # Counts ONLY versions recorded since the history trigger went
+                # live 2026-08-19 18:50 UTC -- chains that predate it were never
+                # captured, so this reads 0 on properties that genuinely were
+                # postponed. Present as "since tracking began", not as a total.
+                "postponement_count, prior_sale_dates, first_known_sale_date",
                 count="exact",
             )
         )
