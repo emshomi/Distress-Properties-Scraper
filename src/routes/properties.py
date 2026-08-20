@@ -874,6 +874,76 @@ def _extract_startribune_legal(raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+def _extract_mnpublicnotice(raw: dict, row: dict) -> dict[str, Any]:
+    """mnpublicnotice — the statewide published-notice feed.
+
+    ADDED 2026-08-20. This source was NOT in _EXTRACTORS and fell through to
+    _extract_generic, which knows none of its keys. Consequences, all live:
+
+      * OWNER WAS ALWAYS NULL. The generic extractor reads `owner_name` or
+        `owner`; this feed writes the borrower into `mortgagors`, a list of
+        {display} objects. Every mnpublicnotice property in the product
+        showed no owner — the largest statewide foreclosure feed, and the
+        only one covering counties with no sheriff scraper.
+      * `mortgagee` and `lawFirm` sat in raw_data and reached nothing, so the
+        foreclosing party and attorney were invisible on these rows.
+
+    The third consequence is the serious one: without `mortgagee`,
+    _compute_deal_math cannot tell an association assessment lien from a
+    first mortgage, and those two produce completely different deal math.
+    See _is_association_lien.
+
+    raw_data shape is written by build_promotion_rows (camelCase) — the
+    approve path is its only writer, per the 2026-08-19 writer audit.
+    """
+    mortgagors = raw.get("mortgagors")
+    owner = None
+    if isinstance(mortgagors, list) and mortgagors:
+        names = [
+            str((m or {}).get("display") or "").strip()
+            for m in mortgagors
+            if isinstance(m, dict)
+        ]
+        names = [n for n in names if n]
+        # Joined rather than truncated to the first: a notice naming two
+        # borrowers describes joint owners, and showing one of them is a
+        # statement about title that the notice does not make.
+        owner = " & ".join(names) or None
+
+    return {
+        "address": raw.get("address"),
+        "city": raw.get("city"),
+        "zip": raw.get("zip"),
+        "owner": owner,
+        "sale_date": raw.get("dateOfSale") or row.get("event_date"),
+        "sale_time": None,
+        "amount": raw.get("amount_due") or row.get("event_value"),
+        "status": None,
+        "tax_parcel_no": (raw.get("detail") or {}).get("gis_pid")
+        or row.get("parcel_id"),
+        "original_principal": None,
+        "municipality": raw.get("city"),
+        "lat": None,
+        "lng": None,
+        "neighborhood": None,
+        "registered_date": row.get("event_date"),
+        # Never published by this feed. Filled afterwards from the parcel
+        # spine by _apply_assessor_owners, then deal math is recomputed —
+        # see _recompute_deal_math.
+        "market_value": None,
+        "earliest_delq_year": None,
+        "dwelling_type": None,
+        "ward": None,
+        "owner_mailing": None,
+        "is_absentee": None,
+        "homestead": None,
+        # The foreclosing party. Load-bearing, not decorative — see
+        # _is_association_lien.
+        "mortgagee": raw.get("mortgagee"),
+        "law_firm": raw.get("lawFirm"),
+    }
+
+
 def _extract_generic(raw: dict, row: dict) -> dict[str, Any]:
     """Fallback extractor for unknown sources. Tries common keys."""
     return {
@@ -1127,6 +1197,9 @@ _EXTRACTORS: dict[str, Any] = {
     "dakota_sheriff": _extract_dakota,
     "washington_sheriff": _extract_washington,
     "startribune_legal": _extract_startribune_legal,
+    # ADDED 2026-08-20. Was falling through to _extract_generic, which left
+    # owner NULL on every row of the only statewide feed.
+    "mnpublicnotice": _extract_mnpublicnotice,
     "mpls_vbr": _extract_mpls_vbr,
     "mpls_311": _extract_mpls_311,
     "saint_paul_vacant": _extract_saint_paul_vacant,
@@ -2434,6 +2507,94 @@ def _vacancy_fields(source: str, raw: dict, row: dict) -> dict[str, Any]:
     }
 
 
+# Foreclosing parties that are community associations rather than lenders.
+# Matched against the mortgagee, the sale type and the notice title, because
+# the three feeds publish it in three different places.
+#
+# `assoc\w*` rather than `assoc\b`: washington_sheriff writes the association
+# into the TITLE, where it can be truncated mid-word — "BAILEY'S ARBOR
+# TOWNHOMES ASSOCIAT" is a real row.
+_ASSOCIATION_RE = _re.compile(
+    r"\b("
+    r"assoc\w*|homeowners?|home\s?owners?|condominium|condo\b|"
+    r"townhome\w*|villas?\b|hoa\b|coa\b"
+    r")",
+    _re.IGNORECASE,
+)
+
+# Chartered lenders, checked FIRST and excluded.
+#
+# "NATIONAL ASSOCIATION" is a federal bank charter designation, not a
+# community association — U.S. Bank N.A., Wells Fargo Bank N.A., Bank of
+# America N.A. Without this, hennepin 139673 ("U.S. Bank Trust National
+# Association, not in its individual capacity, but solely as Owner Trustee
+# for RUN 2022-NQM1 Trust") matches on the word "Association" and has its
+# entirely correct $1,211,803 spread suppressed. Verified: that row is a real
+# first mortgage of $2,288,560.62.
+#
+# `\bbank\b` will not fire on "Riverbank Estates Homeowners Association" —
+# the boundary is doing real work here.
+_LENDER_RE = _re.compile(
+    r"national\s+association|\bn\.\s?a\.|\bbank\b|\bmortgage\b|"
+    r"\bsavings\b|\bcredit\s+union\b|\bfederal\b|\bfannie\b|\bfreddie\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_association_lien(shaped: dict[str, Any]) -> bool:
+    """True when the foreclosing party is a community association, not a
+    mortgage lender.
+
+    WHY THIS EXISTS — Minn. Stat. 515B.3-116(b).
+
+    An association's assessment lien is prior to all other liens EXCEPT,
+    among others, any first mortgage encumbering the fee simple interest in
+    the unit. The association lien is therefore JUNIOR to the first mortgage,
+    and foreclosing it does NOT discharge that mortgage: whoever takes the
+    sheriff's certificate takes the unit subject to it.
+
+    That makes `est_market_value - assessment_debt` meaningless as an equity
+    spread. Measured 2026-08-20: of 531 rows eligible for deal math, 40 owe
+    under 5% of assessed value, and EVERY ONE of the 40 that names a
+    foreclosing party names an association — Hermitage Shores, Pinecliff,
+    Legacy Bay Farms, Cedar Ponds, Almar Village. The worst case is
+    $4,760.15 owed against $5,020,600. The page would have printed roughly
+    +$5,400,000 above the payoff on a property still carrying an unknown
+    first mortgage.
+
+    This population was switched ON deliberately by the 2026-08-10 recompute
+    fix, whose own docstring cites '2469 Jaber Avenue NE ... $3,006 owed
+    against $504,100 -- a half-million-dollar spread the page could not
+    display'. That row is Legacy Bay Farms Community Association. It is not a
+    spread. The defect arrived inside a fix, which is why it read as a win.
+
+    Detection is POSITIVE ONLY. A row that cannot be classified is treated as
+    a mortgage and left alone — dakota_sheriff publishes no mortgagee at all,
+    and guessing 'association' from a low ratio would suppress real deals on
+    nearly-paid-off homes. A low debt-to-value ratio is evidence about the
+    debt, not about who holds it.
+    """
+    # Authoritative where published: hennepin_sheriff sets typeOfSale, and
+    # it is the county's own classification of the sale. It outranks any
+    # name matching, in both directions.
+    if str(shaped.get("type_of_sale") or "").strip().lower() == "assessment":
+        return True
+
+    mortgagee = shaped.get("mortgagee")
+
+    # Exclude chartered lenders BEFORE looking for association words. The
+    # order is the whole point: "National Association" contains
+    # "Association".
+    if isinstance(mortgagee, str) and _LENDER_RE.search(mortgagee):
+        return False
+
+    for field in ("mortgagee", "title"):
+        v = shaped.get(field)
+        if isinstance(v, str) and _ASSOCIATION_RE.search(v):
+            return True
+    return False
+
+
 def _compute_deal_math(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Deal math for ONE shaped row, or None when it doesn't apply.
 
@@ -2473,9 +2634,40 @@ def _compute_deal_math(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
     seller_net = round(raw_emv * float(inwin["median"]) - amount)
     equity_spread = round(est_market - amount)
 
+    # Minn. Stat. 515B.3-116(b): an association assessment lien is junior to
+    # any first mortgage on the unit, so foreclosing it leaves that mortgage
+    # on title. The arithmetic below is unchanged and correct as arithmetic;
+    # what changes is that it must not be PRESENTED as an equity spread,
+    # because the payoff excludes a senior debt of unknown size. The flags
+    # travel with the numbers so every consumer sees them — this page, the
+    # list, the marketplace card.
+    is_assoc = _is_association_lien(shaped)
+
+    basis = (
+        "Assessed value calibrated by the median of %d recent %s-level "
+        "sales; band from %d confirmed in-window foreclosure sales "
+        "(25th-75th pct). Floor is the foreclosing debt only - other "
+        "liens may apply. Not an appraisal."
+        % (int(ratio_row["n"]), scope, int(inwin["n"]))
+    )
+    if is_assoc:
+        basis = (
+            "FORECLOSING PARTY IS A COMMUNITY ASSOCIATION. Under Minn. Stat. "
+            "515B.3-116(b) an assessment lien is junior to any first mortgage "
+            "on the unit, so this sale does NOT discharge that mortgage and a "
+            "purchaser takes title subject to it. The amount shown is the "
+            "assessment debt alone; the mortgage balance is not published and "
+            "is not included. These figures are NOT an equity spread. "
+            + basis
+        )
+
     return {
         "payoff_floor": round(amount),
         "payoff_is_partial": True,  # foreclosing debt only; other liens may exist
+        # ADDED 2026-08-20. 'association' means a senior first mortgage
+        # survives the sale and the spread below is not a spread.
+        "lien_type": "association" if is_assoc else "mortgage",
+        "senior_mortgage_survives": is_assoc,
         "est_market_value": est_market,
         "local_ratio": float(ratio_row["ratio"]),
         "ratio_scope": scope,
@@ -2487,13 +2679,7 @@ def _compute_deal_math(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
         "equity_spread": equity_spread,
         "reo_benchmark": round(raw_emv * float(reo["median"])) if reo else None,
         "reo_n": int(reo["n"]) if reo else None,
-        "basis": (
-            "Assessed value calibrated by the median of %d recent %s-level "
-            "sales; band from %d confirmed in-window foreclosure sales "
-            "(25th-75th pct). Floor is the foreclosing debt only - other "
-            "liens may apply. Not an appraisal."
-            % (int(ratio_row["n"]), scope, int(inwin["n"]))
-        ),
+        "basis": basis,
     }
 
 
