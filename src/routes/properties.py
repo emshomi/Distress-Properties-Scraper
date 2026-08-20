@@ -2816,6 +2816,12 @@ def _shape_property_row(
         "title": row.get("title"),
         "description": row.get("description"),
         "observed_at": row.get("observed_at"),
+        # ADDED 2026-08-19. Selecting these in the query is not enough — this
+        # dict is built by hand, which is why `id` reached the database and
+        # never the client until both edits were made.
+        "postponement_count": row.get("postponement_count") or 0,
+        "prior_sale_dates": row.get("prior_sale_dates"),
+        "first_known_sale_date": row.get("first_known_sale_date"),
         **extracted,
         **redemption,
     }
