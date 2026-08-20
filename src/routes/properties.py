@@ -2802,6 +2802,12 @@ def _shape_property_row(
     redemption = _redemption_fields(source, raw, row, tracker_map)
 
     shaped = {
+        # ADDED 2026-08-19. signals.distress_events.id. Selecting it in the
+        # query was not enough -- this dict is built by hand, so a column the
+        # view exposes and the query returns still never reaches the client
+        # unless it is copied here. Verified live: the payload carried no id
+        # even after the select change. Any NEW view column needs both edits.
+        "id": row.get("id"),
         "source": source,
         "source_id": row.get("source_id"),
         "parcel_id": row.get("parcel_id"),
