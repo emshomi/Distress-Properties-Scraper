@@ -71,6 +71,7 @@ async def main() -> int:
         f"not_found={stats['not_found']} ambiguous={stats['ambiguous']} "
         f"parcel_missing={stats['parcel_missing']} "
         f"unparsed_address={stats['unparsed_address']} "
+        f"unreachable={stats['unreachable']} "
         f"rekey_collision={stats['rekey_collision']}",
         flush=True,
     )
@@ -80,17 +81,45 @@ async def main() -> int:
         flush=True,
     )
 
-    # A county that resolves nothing at all is a broken instrument, not an
-    # honest answer: 1225 Lasalle Ave #604 is known to resolve. Fail loudly
-    # rather than report a clean zero -- the Washington loader reported
-    # written=118,418 failed=0 with lat NULL on every row.
-    if stats["candidates"] > 0 and stats["resolved"] == 0:
+    # === WHAT COUNTS AS FAILURE (rewritten 2026-08-20) ===
+    #
+    # This used to fail whenever `resolved` was 0, on the reasoning that
+    # "a county that resolves nothing at all is a broken instrument, not an
+    # honest answer: 1225 Lasalle Ave #604 is known to resolve."
+    #
+    # That canary has left the population. 1225 Lasalle Ave #604 resolved at
+    # 03:40 on 2026-08-21 — in the SHERIFF run, because hennepin_sheriff now
+    # asks PINS at mint time. It is no longer a candidate here, and neither
+    # are the other 105 addresses that run resolved.
+    #
+    # What remains is the residue: 29 candidates, every one a case the county
+    # ANSWERED and the answer was no. 14 ambiguous (two parcels for one unit —
+    # a building deeds its parking stalls separately), 14 not found (multi-
+    # property notices like '1215 & 1219 Knox Ave N', addresses with no unit),
+    # 1 unparsed. Zero re-keys is the CORRECT result for that set, and a job
+    # that goes red every night for a correct result trains everyone to
+    # ignore it — so the one night it means something, nobody looks.
+    #
+    # The rule now tests what the old one was reaching for: CAN WE REACH THE
+    # COUNTY. `unreachable` counts only 'no_response' and transport errors —
+    # a timeout, a 5xx, a dropped connection. A refusal is an answer.
+    if stats["unreachable"] > 0:
         print(
-            "[hennepin-condo-runner] resolved 0 of "
-            f"{stats['candidates']} candidates — treating as failure",
+            f"[hennepin-condo-runner] {stats['unreachable']} of "
+            f"{stats['candidates']} candidates got NO RESPONSE from the "
+            "county — treating as failure",
             flush=True,
         )
         return 1
+
+    if stats["candidates"] > 0 and stats["resolved"] == 0:
+        print(
+            f"[hennepin-condo-runner] resolved 0 of {stats['candidates']} "
+            "— every candidate was answered and declined "
+            f"({stats['ambiguous']} ambiguous, {stats['not_found']} not "
+            f"found, {stats['unparsed_address']} unparsed). Not a failure.",
+            flush=True,
+        )
 
     return 0
 
