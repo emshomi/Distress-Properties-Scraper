@@ -658,15 +658,72 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
                 _member_digits = "".join(ch for ch in str(_pin or "") if ch.isdigit())
                 _event_county = (built["distress_event"] or {}).get("county_code")
                 if _member_digits and _event_county:
-                    _candidates = (
-                        signals_table("distress_events")
-                        .select("id, event_date, source, parcel_id, raw_data")
-                        .in_("source", list(_PROMOTION_SOURCES))
-                        .eq("county_code", _event_county)
-                        .eq("event_type", "sheriff_sale")
-                        .is_("resolved_at", "null")
-                        .execute()
-                    )
+                    # RETRIED ONCE, AND A SECOND FAILURE IS A 503 (2026-08-21).
+                    #
+                    # This is the republication guard. It is a READ, and its
+                    # answer decides whether a notice already on file gets
+                    # promoted a second time. A dropped connection here does
+                    # not mean "no prior event exists" — it means we did not
+                    # get to ask. Falling through would promote a duplicate,
+                    # which is the same error _resolve_spine_parcel documents
+                    # above: "a transport failure is NOT evidence that a parcel
+                    # does not exist".
+                    #
+                    # Measured 2026-08-21 08:35: two approvals died here on
+                    # httpx.RemoteProtocolError "Server disconnected" —
+                    # admin.py line 668, inside this .execute(). Both surfaced
+                    # as a bare 500 "Failed to approve extraction", because
+                    # nothing caught the transport error and the generic
+                    # handler at the end of the function took it. Nothing was
+                    # written; the review card simply said "Approve failed.
+                    # Try again."
+                    #
+                    # 221 Boutwell Road North is the case this guard is for:
+                    # attorney file 1550793 has been extracted and approved
+                    # THREE times (08-07, 08-14, 08-21) as the notice was
+                    # republished weekly, and there is exactly ONE event on
+                    # parcel 2903020240050. The guard has to run.
+                    #
+                    # Retrying a SELECT is safe — no side effects — unlike the
+                    # promotion below, which writes an event, a sheriff_sale
+                    # row and a parcel inside one transaction and must never
+                    # be replayed.
+                    _candidates = None
+                    for _attempt in (1, 2):
+                        try:
+                            _candidates = (
+                                signals_table("distress_events")
+                                .select("id, event_date, source, parcel_id, raw_data")
+                                .in_("source", list(_PROMOTION_SOURCES))
+                                .eq("county_code", _event_county)
+                                .eq("event_type", "sheriff_sale")
+                                .is_("resolved_at", "null")
+                                .execute()
+                            )
+                            break
+                        except Exception as _e:
+                            if _attempt == 1:
+                                logger.warning(
+                                    "republication guard transport failure — retrying once",
+                                    extraction_id=payload.id,
+                                    county=_event_county,
+                                    error_type=type(_e).__name__,
+                                )
+                                continue
+                            # Raised, not swallowed: this lands in the
+                            # SpineLookupUnavailable handler below, which
+                            # returns 503 "nothing was written; please retry"
+                            # rather than a 500 that reads as our bug.
+                            logger.error(
+                                "republication guard unavailable after retry",
+                                extraction_id=payload.id,
+                                county=_event_county,
+                                error_type=type(_e).__name__,
+                            )
+                            raise SpineLookupUnavailable(
+                                "duplicate-check query failed twice: "
+                                f"{type(_e).__name__}"
+                            ) from _e
                     for _row in (_candidates.data or []):
                         _pub = (
                             ((_row.get("raw_data") or {}).get("detail") or {})
