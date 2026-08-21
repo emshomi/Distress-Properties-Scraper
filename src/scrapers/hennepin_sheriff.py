@@ -66,6 +66,7 @@ from src.models.parcel import ParcelUpsert
 from src.models.signal import DistressEventInsert
 from src.scrapers.base_scraper import BaseScraper
 from src.services.event_writer import write_events_dedup
+from src.scrapers.hennepin_condo_resolver import resolve_address_via_pins
 from src.services.parcel_resolver import resolve_parcel
 from src.services.spine_resolver import (
     SpineLookupUnavailable,
@@ -347,6 +348,8 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         resolved_count = 0
         synthetic_count = 0
         unresolvable = 0
+        pins_resolved = 0
+        pins_declined: dict[str, int] = {}
 
         for r in raw_records:
             record_no = _safe_str(r.get("saleRecordNumber"))
@@ -406,6 +409,61 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
                         error=str(e),
                     )
                     continue
+
+            # === ASK THE COUNTY BEFORE INVENTING A PARCEL (2026-08-20) ===
+            #
+            # The spine match above is an EXACT normalised join, so it cannot
+            # resolve two shapes the county resolves easily:
+            #
+            #   * A CONDO UNIT. core.parcels holds one row per unit but does
+            #     not store the unit number in `address` — eleven Robbinsdale
+            #     parcels all read '4176 ADAIR AVE N' — so '#11' has nothing
+            #     to match against and the join returns eleven candidates.
+            #   * A STREET NAME WE SPELL DIFFERENTLY. PINS is fuzzier than we
+            #     are: it returns 27 CIRCLE WEST for a search of '27 Circle W'.
+            #
+            # PINS holds the unit and does the fuzzy match, so it answers both.
+            # Until tonight this ran only as a nightly clean-up job, which
+            # meant every stub was live — and visible with no market value, no
+            # owner and no imagery — for up to a day. It also could not keep
+            # up: the run at 02:55 re-keyed 3 events while the scraper minted
+            # more, taking the stub count from 33 to 34.
+            #
+            # Asking here costs one HTTP call for the records that would
+            # OTHERWISE BECOME STUBS — 4 on today's run, at 1.5s pacing.
+            #
+            # A DECLINE IS STILL A STUB. Two parcels for one unit is normal
+            # (a large building deeds its parking stalls separately and the
+            # stall carries the unit number), and picking either would attach
+            # a foreclosure to a neighbour's home or to a garage space. The
+            # placeholder is the honest answer; only an unambiguous hit moves.
+            if resolved is None and address:
+                try:
+                    pid, how = await resolve_address_via_pins(address)
+                except Exception as e:
+                    # The county being unreachable is not evidence about the
+                    # parcel. Fall through to the placeholder rather than
+                    # failing the run; the nightly resolver retries.
+                    pid, how = None, f"error:{type(e).__name__}"
+                    logger.warning(
+                        "Hennepin PINS lookup failed",
+                        source=self.source_name,
+                        record_no=record_no,
+                        error=str(e),
+                    )
+                if pid:
+                    resolved = {"parcel_id": pid}
+                    pins_resolved += 1
+                    logger.info(
+                        "Hennepin parcel resolved via county PINS",
+                        source=self.source_name,
+                        record_no=record_no,
+                        address=address,
+                        parcel_id=pid,
+                        how=how,
+                    )
+                else:
+                    pins_declined[how] = pins_declined.get(how, 0) + 1
 
             if resolved is not None:
                 parcel_id = resolved["parcel_id"]
@@ -502,12 +560,19 @@ class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
         # The number that matters on every run. A rising `synthetic` count
         # means the spine is drifting from what the Sheriff publishes; a
         # non-zero `unreachable` means records were DEFERRED, not lost.
+        # `pins_resolved` is the count that would have been stubs before
+        # 2026-08-20. `pins_declined` breaks down the refusals by reason so a
+        # rising 'ambiguous_in_building' reads as normal (stalls deeded with
+        # the unit number) while a rising 'no_response' reads as the county
+        # being unreachable.
         logger.info(
             "Hennepin parcel resolution",
             source=self.source_name,
             resolved=resolved_count,
             synthetic=synthetic_count,
             unreachable=unresolvable,
+            pins_resolved=pins_resolved,
+            pins_declined=pins_declined,
             events=len(signals),
         )
         return signals
