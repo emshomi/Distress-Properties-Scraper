@@ -66,7 +66,6 @@ from src.models.parcel import ParcelUpsert
 from src.models.signal import DistressEventInsert
 from src.scrapers.base_scraper import BaseScraper
 from src.services.event_writer import write_events_dedup
-from src.scrapers.hennepin_condo_resolver import resolve_address_via_pins
 from src.services.parcel_resolver import resolve_parcel
 from src.services.spine_resolver import (
     SpineLookupUnavailable,
