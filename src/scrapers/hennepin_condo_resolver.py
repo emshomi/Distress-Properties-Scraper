@@ -1,116 +1,191 @@
 """
-Hennepin County Sheriff Foreclosure Sales scraper.
+Hennepin condo resolver — turn a unit address into a real parcel id.
 
-Source: Hennepin County public foreclosure API (clean JSON, no auth wall
-        beyond an Azure APIM subscription key).
-    Frontend:  https://foreclosure.hennepin.us/
-    List:      POST https://api.hennepincounty.gov/hcso-public-services-api/v1/Foreclosure/Search
-    Detail:    GET  https://api.hennepincounty.gov/hcso-public-services-api/v1/Foreclosure/{saleRecordNumber}
+Run: python -m scripts.run_hennepin_condo_resolver
 
-License / posture: official Hennepin County government API. Public foreclosure
-notice data under the Minnesota Government Data Practices Act. No anti-bot
-terms, no robots restriction on the API host. We fetch politely (small delays).
+=== WHAT IS WRONG ===
+A Hennepin sheriff notice publishes a UNIT address -- '1225 Lasalle Ave #604'.
+core.parcels, loaded from the county GIS parcel roll, stores only the BUILDING
+address: 138 rows all reading '1225 LASALLE AVE', no unit anywhere. So the
+event cannot be matched to a parcel and stays on its
+HENNEPIN-FC-<saleRecordNumber> placeholder.
 
-=== WHY THIS IS THE EASIEST SHERIFF SOURCE WE HAVE ===
-Unlike Anoka (bot-resistant ASP.NET WebForms requiring Playwright) and the
-HTML-scraping counties, Hennepin exposes a modern JSON API:
-  * List endpoint paginates cleanly (10/page; ~47 pages; ~465 records).
-  * Detail endpoint returns the full record by saleRecordNumber, INCLUDING a
-    server-computed `redemptionExpirationDate` — we READ it rather than
-    computing sale_date + 6 months. This handles the 5-week / 2-month /
-    12-month redemption edge cases automatically and correctly.
+A placeholder EXISTS in core.parcels, so every join succeeds and returns a row
+with no lat, no emv_total, no owner. Nothing errors, nothing logs, and the
+product renders em-dashes as though the county published nothing.
 
-=== AUTH ===
-The API sits behind Azure API Management and requires a subscription key
-header: `Ocp-Apim-Subscription-Key`. It is a public, client-side key (shipped
-in the site's JS), but we read it from settings/env so it can be rotated
-without a code change. Falls back to the known published value if unset.
+Measured 2026-08-15: 113 hennepin sheriff_sale events on placeholders whose
+address carries a '#'.
 
-=== DATA AVAILABLE ===
-List record:    saleRecordNumber, dateOfSale, typeOfSale, address, city,
-                mortgagors[].display
-Detail record:  + mortgagee, toWhomSold, finalBidAmount,
-                redemptionExpirationDate, lawFirm, mortgageDocumentNumber,
-                comments, noticeOfIntent
+=== WHY THIS IS NOT AN ADDRESS MATCH ===
+Matching on address alone cannot work: 121 Washington Ave S resolves to 615
+parcels, 1225 Lasalle Ave to 138. Any match would be a guess across units whose
+values differ by 4x.
 
-=== ARCHITECTURE ===
-  fetch():
-    1. POST Search with {pagination:{activePage, pageSize}} until all pages
-       are collected. Read totalPages from the first response.
-    2. For each saleRecordNumber, GET the detail endpoint. Detail failures
-       are tolerated (we keep the list row's basic fields).
-  parse():  convert each enriched record into a DistressEventInsert
-            (sheriff_sale / completed_sale). The full detail JSON is stored
-            in raw_data so redemptionExpirationDate is preserved for the
-            redemption-window UI work.
-  parse():  RESOLVES the spine parcel by address first (2026-08-17); only a
-            genuine miss falls back to HENNEPIN-FC-{saleRecordNumber}.
-  write():  resolve_parcel for UNRESOLVED records only + write_events_dedup.
+Matching on address + OWNER NAME was measured and rejected: 3 of 8 sampled.
+The assessor's owner of record has often already changed to the bank or a new
+buyer by the time a foreclosure publishes, so the mortgagor is simply absent
+from the building's owner list.
 
-Severity:
-  redemption window still open (future expiration)  -> high  (actionable)
-  redemption expired / unknown                       -> low/medium
+=== THE COUNTY PUBLISHES THE ANSWER ===
+Hennepin's Property Information Search takes house number + street + UNIT and
+returns the parcel. Verified by hand on 2026-08-15:
+
+    POST https://www16.co.hennepin.mn.us/pins/addrresult.jsp
+    house=1225&street=Lasalle&condo=604&ps=20
+    -> Property ID number: 27-029-24-24-0203, EMV $118,000
+
+A plain form POST. No token, no CAPTCHA, no JavaScript. Works county-wide --
+'4387 Wilshire Blvd' resolves in MOUND with no city field.
+
+=== TWO PATHS, BECAUSE THE NOTICE'S UNIT FORMAT IS NOT THE COUNTY'S ===
+1. POST with the unit. A hit returns ONE parcel: scrape the Property ID.
+2. A miss re-POSTs WITHOUT the unit and gets every unit in the building, each
+   with its own PID, and matches on trailing digits.
+
+Path 2 exists because the notice writes '4387 Wilshire Blvd #D204' and the
+county records '#204'. Searching '#D204' returns nothing; the building list
+contains #204 with PID 19-117-23-13-0127. Guessing which unit is meant would be
+wrong; reading the building's own list is not.
+
+ps=100 on the fallback. The default page size is 20 and 4387 Wilshire Blvd has
+36 units -- at ps=20 the last 16 are on a second page and a unit could be
+'missing' when it is merely paginated.
+
+=== IT ONLY RE-KEYS; IT NEVER CREATES A PARCEL ===
+The resolved parcel is ALREADY in core.parcels with value and coordinates --
+2702924240203 holds emv_total $118,000, lat/lng, year_built 1978. Nothing needs
+fetching. This writes distress_events.parcel_id and nothing else, and refuses
+to write a parcel id that does not already exist.
+
+=== PACING ===
+The site sits behind an F5 load balancer (f5_cspm cookies on the response).
+MCRO is recorded as F5 Shape bot-defended, so this paces deliberately at 1.5s
+between parcels -- the same rate the Tyler portal work settled on -- and one
+client keeps the session cookie rather than reconnecting per request.
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation
-from typing import Any, ClassVar
+import html
+import os
+import re
+import sys
+from typing import Any
 
 import httpx
 
-from src.config import settings
-from src.models.parcel import ParcelUpsert
-from src.models.signal import DistressEventInsert
-from src.scrapers.base_scraper import BaseScraper
-from src.services.event_writer import write_events_dedup
-from src.services.parcel_resolver import resolve_parcel
-from src.services.spine_resolver import (
-    SpineLookupUnavailable,
-    resolve_by_address,
-)
-from src.utils.errors import SourceUnavailableError
+from src.db.supabase_client import core_table, signals_table
 from src.utils.logger import logger
 
 
-_API_BASE = "https://api.hennepincounty.gov/hcso-public-services-api/v1/Foreclosure"
-_LIST_URL = f"{_API_BASE}/Search"
-_DETAIL_URL = f"{_API_BASE}/{{record}}"
+_COUNTY = "hennepin"
+_SOURCE = "hennepin_sheriff"
+_URL = "https://www16.co.hennepin.mn.us/pins/addrresult.jsp"
 
-# Public client-side APIM subscription key shipped in the site's JS. Read from
-# settings/env when available so it can be rotated without a redeploy; this
-# literal is only a fallback to avoid hard-blocking if the env var is unset.
-_FALLBACK_SUBSCRIPTION_KEY = "e522a816143443189f09de85c4288b98"
+_PACE_SECONDS = 1.5
+_MAX_RETRIES = 3
+_LIST_PAGE_SIZE = 100
 
-_PAGE_SIZE = 10
-# Defensive ceiling so a malformed totalPages can never spin forever.
-# ~47 pages today; 200 leaves enormous headroom.
-_MAX_PAGES = 200
+# Ceiling on building-list pages. 410 Groveland Ave is 229 records, so three
+# pages covers it with room; a building needing more than 500 rows is not a
+# condo we can disambiguate anyway.
+_MAX_LIST_PAGES = 5
 
-# Politeness: small delay between detail-record fetches.
-_DETAIL_DELAY_SECONDS = 0.25
-# Small delay between list-page POSTs.
-_LIST_DELAY_SECONDS = 0.2
+# "Records 1 - 20 of 229" — the service states its own total, so the pager
+# never guesses how far to go.
+_TOTAL_RE = re.compile(r"Records\s+[\d,]+\s*-\s*[\d,]+\s+of\s+([\d,]+)",
+                       re.IGNORECASE)
+
+# BOTH PATTERNS ARE WRITTEN AGAINST CAPTURED MARKUP, NOT AGAINST SCREENSHOTS.
+#
+# The first version of this file guessed both from rendered pages and matched
+# NOTHING: run #1 on 2026-08-15 returned resolved=0 of 113 candidates, 107 of
+# them reported as 'unit_not_in_building' when the real cause was that neither
+# regex could ever fire. The page source was then captured and both were
+# rebuilt and tested against it.
+#
+# Single-result page. The label and the value are SEPARATE divs with newlines
+# and tabs between them:
+#     <div class="col">Property ID number:</div>
+#     <div class="col">
+#         <strong>27-029-24-24-0203</strong>
+#     </div>
+# The old pattern allowed one optional tag in that gap. The real gap is
+# '</div>\n\t<div class="col">\n\t\t<strong>'.
+_PID_RE = re.compile(
+    r"Property\s+ID\s+number:\s*</div>.*?<strong>\s*"
+    r"([\d]{2}-[\d]{3}-[\d]{2}-[\d]{2}-[\d]{4})\s*</strong>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Building list. Keyed on the LINK, not the displayed text, because the href
+# already carries the 13-digit parcel id in core.parcels format -- no
+# hyphen-stripping, no reformatting:
+#     <a href="pidresult.jsp?pid=1911723130112">&nbsp;19-117-23-13-0112</a>
+#     </td><td ...><p> &nbsp;4387
+#        WILSHIRE BLVD #101 </p></td>
+# The address SPANS A NEWLINE and is preceded by &nbsp;, so any pattern
+# matching '#' within one line misses every row.
+_ROW_RE = re.compile(
+    r'href="pidresult\.jsp\?pid=(\d+)".*?</td>\s*<td[^>]*>(.*?)</td>',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
-def _subscription_key() -> str:
-    """Read the APIM key from settings if present, else the fallback."""
-    for attr in ("hennepin_api_key", "HENNEPIN_API_KEY"):
-        val = getattr(settings, attr, None)
-        if val:
-            return str(val)
-    return _FALLBACK_SUBSCRIPTION_KEY
+def _total_records(body: str) -> int:
+    """Total rows the service says the query has, 0 when it does not say."""
+    m = _TOTAL_RE.search(body or "")
+    if not m:
+        return 0
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+
+
+def _clean_cell(text: str) -> str:
+    """Strip tags, unescape entities, collapse whitespace across newlines."""
+    t = re.sub(r"<[^>]+>", " ", text or "")
+    t = html.unescape(t).replace("\xa0", " ")
+    return " ".join(t.split())
+# '1225 Lasalle Ave #604' -> ('1225', 'Lasalle Ave', '604')
+_ADDR_UNIT_RE = re.compile(r"^(\d+)\s+(.+?)\s*#\s*(.+)$")
+
+# '3500 Portland Ave S' -> ('3500', 'Portland Ave S'). No unit.
+#
+# ADDED 2026-08-15. The first version only accepted addresses containing '#',
+# because condos were the known problem. Measured afterwards: of 69 hennepin
+# events still on a placeholder, only 13 are unresolved condos -- 52 carry an
+# ORDINARY address that the internal match still missed.
+#
+# The county's form resolves those too, and its street matching is FUZZIER
+# than ours: it returns 27 CIRCLE WEST for a search of 'Circle W'. That is
+# exactly why an exact normalised join inside the database could never find
+# them and this endpoint can.
+#
+# Verified by hand 2026-08-15:
+#     3500 Portland Ave S  -> 03-028-24-41-0135 (MINNEAPOLIS)
+#     27 Circle W          -> 29-117-21-11-0021 (EDINA, recorded '27 CIRCLE WEST')
+#     11115 Quantico La N  -> TWO parcels, left unresolved on purpose
+_ADDR_PLAIN_RE = re.compile(r"^(\d+)\s+(.+)$")
+
+# Sheriff placeholders that are not addresses at all. 'SALE CARD NOT USED' is
+# published for a cancelled or unused sale record; posting it to the county
+# would be a guaranteed miss and a wasted request.
+_NOT_AN_ADDRESS_RE = re.compile(
+    r"sale\s+card|not\s+used|address\s+(pending|unassigned)|^\s*$",
+    re.IGNORECASE,
+)
 
 
 def _headers() -> dict[str, str]:
     return {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Origin": "https://foreclosure.hennepin.us",
-        "Referer": "https://foreclosure.hennepin.us/",
-        "Ocp-Apim-Subscription-Key": _subscription_key(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://www16.co.hennepin.mn.us",
+        "Referer": "https://www16.co.hennepin.mn.us/pins/",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -118,528 +193,338 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _search_body(active_page: int) -> dict[str, Any]:
-    """Mirror the exact payload the site sends; only activePage varies."""
-    return {
-        "dateOfSale": {"minDate": None, "maxDate": None},
-        "address": None,
-        "city": None,
-        "mortgagorName": None,
-        "pagination": {"activePage": active_page, "pageSize": _PAGE_SIZE},
-    }
+def _digits(s: str) -> str:
+    """Trailing digits of a unit label. 'D204' -> '204', '#A1620' -> '1620'.
+
+    The notice's prefix letters are its own formatting, not the county's: the
+    county records 4387 Wilshire Blvd #D204 as #204. Comparing on digits is
+    what lets the building list resolve it.
+    """
+    m = re.search(r"(\d+)\s*$", (s or "").strip())
+    return m.group(1) if m else ""
 
 
-def _safe_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    s = str(value).strip()
-    return s or None
+def _to_parcel_id(pid_display: str) -> str:
+    """'27-029-24-24-0203' -> '2702924240203', the core.parcels format."""
+    return re.sub(r"[^0-9]", "", pid_display or "")
 
 
-def _safe_decimal(value: Any) -> Decimal | None:
-    if value is None:
-        return None
-    try:
-        d = Decimal(str(value).replace(",", "").strip())
-        return d if d >= 0 else None
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def _parse_iso_date(value: Any) -> date | None:
-    """Parse the API's ISO datetimes (e.g. '2025-06-03T00:00:00')."""
-    if not value:
-        return None
-    s = str(value).strip()
-    # Strip a trailing 'Z' if present so fromisoformat is happy.
-    if s.endswith("Z"):
-        s = s[:-1]
-    try:
-        return datetime.fromisoformat(s).date()
-    except ValueError:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
-            try:
-                return datetime.strptime(s, fmt).date()
-            except ValueError:
+async def _post(client: httpx.AsyncClient, data: dict[str, str]) -> str | None:
+    """One form POST. Returns the HTML body, or None after retries."""
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            resp = await client.post(_URL, data=data)
+            if resp.status_code == 200:
+                return resp.text
+            if resp.status_code in (429, 500, 502, 503, 504):
+                await asyncio.sleep(2 ** attempt)
                 continue
+            logger.warning(
+                "Hennepin condo: unexpected status",
+                status=resp.status_code,
+                data=data,
+            )
+            return None
+        except httpx.HTTPError as e:
+            if attempt == _MAX_RETRIES:
+                logger.warning(
+                    "Hennepin condo: request failed",
+                    error_type=type(e).__name__,
+                    data=data,
+                )
+                return None
+            await asyncio.sleep(2 ** attempt)
     return None
 
 
-def _mortgagor_names(mortgagors: Any) -> str | None:
-    """Join mortgagors[].display into a single owner string."""
-    if not isinstance(mortgagors, list):
-        return None
-    names = [
-        _safe_str(m.get("display"))
-        for m in mortgagors
-        if isinstance(m, dict) and _safe_str(m.get("display"))
+async def _resolve_one(
+    client: httpx.AsyncClient, house: str, street: str, unit: str
+) -> tuple[str | None, str]:
+    """Resolve one address to a 13-digit parcel id. `unit` may be empty.
+
+    Returns (parcel_id, how) where `how` records which path produced it, so a
+    later query can tell a direct hit from a list match without re-running.
+    """
+    # NO UNIT: one POST. A single result is the parcel; a LIST means the
+    # address maps to more than one parcel and must NOT be guessed at.
+    # 11115 Quantico La N returns two parcels (33-120-22-31-0003 and
+    # 33-120-22-32-0027) -- a house on two tax parcels, with nothing on the
+    # page saying which one the foreclosure is against.
+    if not unit:
+        body = await _post(client, {"house": house, "street": street,
+                                    "condo": "", "ps": str(_LIST_PAGE_SIZE)})
+        if not body:
+            return None, "no_response"
+        m = _PID_RE.search(body)
+        if m:
+            return _to_parcel_id(m.group(1)), "direct_no_unit"
+        rows = _ROW_RE.findall(body)
+        if len(rows) == 1:
+            return rows[0][0], "list_single_no_unit"
+        if len(rows) > 1:
+            return None, "ambiguous_address"
+        return None, "address_not_found"
+
+    # Path 1: ask for the unit directly.
+    #
+    # FIXED 2026-08-20. This asked the right question and then discarded the
+    # answer. It ran ONLY _PID_RE, which matches a single-property DETAIL
+    # page. When the county returns two or more parcels for one unit the
+    # response is a LIST page, _PID_RE finds nothing, and control fell
+    # through to the whole-building scan below — which then failed for a
+    # different reason and reported a misleading one.
+    #
+    # Verified by hand 2026-08-20 against the live service:
+    #   addrresult.jsp?house=410&street=Groveland&condo=202&ps=100
+    #   -> 27-029-24-33-0145 and 27-029-24-33-0498, both '410 GROVELAND
+    #      AVE #202'. Records 1-2 of 2.
+    #
+    # A large condo building deeds its PARKING STALLS separately and the
+    # stall carries the same unit number, so two parcels for one unit is
+    # normal rather than exceptional: 410 Groveland shows the same doubling
+    # on #1002, #1004, #1006, #1104, #1106, #1202, #1203, #1204 and #1302.
+    #
+    # So parse the rows. One row resolves. Two or more is AMBIGUOUS and must
+    # stay a decline — picking either would attach a foreclosure to a
+    # neighbour's parcel, or to a garage stall. This also skips the
+    # whole-building fetch entirely, which is a page of up to 229 rows.
+    body = await _post(client, {"house": house, "street": street,
+                                "condo": unit, "ps": str(_LIST_PAGE_SIZE)})
+    if body:
+        m = _PID_RE.search(body)
+        if m:
+            return _to_parcel_id(m.group(1)), "direct"
+        unit_rows = _ROW_RE.findall(body)
+        if len(unit_rows) == 1:
+            return unit_rows[0][0], "direct_list"
+        if len(unit_rows) > 1:
+            return None, "ambiguous_in_building"
+
+    await asyncio.sleep(_PACE_SECONDS)
+
+    # Path 2: the whole building, matched on trailing digits.
+    #
+    # PAGINATED 2026-08-20. This fetched ONE page of _LIST_PAGE_SIZE and
+    # stopped. 410 Groveland Ave holds 229 records, and the list is sorted
+    # as TEXT rather than numerically — '#1001, #1002, ... #101, #102 ...' —
+    # so a three-digit unit sits well past row 100 and was invisible. The
+    # miss was then reported as 'unit_not_in_building' about a unit the
+    # county holds.
+    #
+    # `sr` is the 1-based start row, read off the service's own paging links:
+    #   addrresult.jsp?house=410&street=Groveland&condo=&ps=100&sr=130
+    #
+    # Capped at _MAX_LIST_PAGES so a pathological building cannot spin.
+    body = await _post(client, {"house": house, "street": street,
+                                "condo": "", "ps": str(_LIST_PAGE_SIZE)})
+    if not body:
+        return None, "no_response"
+
+    pages = [body]
+    total = _total_records(body)
+    if total > _LIST_PAGE_SIZE:
+        start = _LIST_PAGE_SIZE + 1
+        for _ in range(_MAX_LIST_PAGES - 1):
+            if start > total:
+                break
+            await asyncio.sleep(_PACE_SECONDS)
+            more = await _post(client, {"house": house, "street": street,
+                                        "condo": "", "ps": str(_LIST_PAGE_SIZE),
+                                        "sr": str(start)})
+            if not more:
+                break
+            pages.append(more)
+            start += _LIST_PAGE_SIZE
+    body = "".join(pages)
+
+    want = _digits(unit)
+    if not want:
+        return None, "unit_has_no_digits"
+
+    # pid from the href is ALREADY the 13-digit core.parcels format.
+    matches = [
+        pid
+        for pid, addr in _ROW_RE.findall(body)
+        if _digits(_clean_cell(addr).split("#")[-1]) == want
     ]
-    return "; ".join(n for n in names if n) or None
+    # A single result page (no list) can also come back here.
+    if not matches:
+        m = _PID_RE.search(body)
+        if m:
+            return _to_parcel_id(m.group(1)), "list_single"
+        return None, "unit_not_in_building"
+
+    if len(matches) > 1:
+        # Two units whose trailing digits agree. Never guess.
+        return None, "ambiguous_in_building"
+
+    return matches[0], "list"
 
 
-class HennepinSheriffScraper(BaseScraper[dict[str, Any], DistressEventInsert]):
-    """Hennepin County sheriff foreclosure sales — clean JSON API source."""
+async def resolve_address_via_pins(address: str) -> tuple[str | None, str]:
+    """Resolve ONE street address to a real Hennepin parcel id via PINS.
 
-    source_name: ClassVar[str] = "hennepin_sheriff"
-    signal_type: ClassVar[str] = "sheriff_sale"
-    county_code: ClassVar[str] = "hennepin"
+    ADDED 2026-08-20. The public entry point so hennepin_sheriff can ask the
+    county AT MINT TIME instead of writing a placeholder and waiting for this
+    job to re-key it hours later.
 
-    # ---- Fetch (paginated JSON list + per-record detail) ----
+    WHY IT MATTERS. Measured tonight: the nightly run re-keyed 3 events onto
+    real parcels — 4176 Adair Ave N #11 ($56,200), 815 11th Ave S #7 Hopkins
+    ($126,500), 9010 Sawgrass Glen ($263,300) — and in the same window the
+    scraper minted more, so the stub count went 33 -> 34. Cleaning up after
+    a writer that keeps writing is a treadmill. Every stub is also VISIBLE
+    for up to a day: no market value, no owner, no imagery, em-dashes on the
+    property page.
 
-    async def fetch(self, trigger: str) -> list[dict[str, Any]]:
-        timeout = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=30.0)
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            headers=_headers(),
-            follow_redirects=True,
-        ) as client:
-            # 1. First page — also tells us totalPages / totalRecords.
-            first = await self._post_search(client, active_page=1)
-            data = first.get("data") or []
-            pagination = first.get("pagination") or {}
-            total_pages = int(pagination.get("totalPages") or 1)
-            total_records = int(pagination.get("totalRecords") or len(data))
+    Returns (parcel_id, how) exactly as _resolve_one does, or (None, reason).
+    The caller decides what to do with a decline — this NEVER guesses, and
+    'ambiguous_in_building' or 'ambiguous_address' must remain a placeholder
+    rather than a wrong parcel.
+    """
+    addr = (address or "").strip()
+    if not addr or _NOT_AN_ADDRESS_RE.search(addr):
+        return None, "not_an_address"
 
-            records: list[dict[str, Any]] = list(data)
+    m = _ADDR_UNIT_RE.match(addr)
+    if m:
+        house, street, unit = m.group(1), m.group(2), m.group(3)
+    else:
+        m = _ADDR_PLAIN_RE.match(addr)
+        if not m:
+            return None, "unparsed_address"
+        house, street, unit = m.group(1), m.group(2), ""
 
-            logger.info(
-                "Hennepin list page fetched",
-                source=self.source_name,
-                page=1,
-                total_pages=total_pages,
-                total_records=total_records,
-                rows=len(data),
-            )
+    timeout = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=30.0)
+    async with httpx.AsyncClient(timeout=timeout, headers=_headers(),
+                                 follow_redirects=True) as client:
+        return await _resolve_one(client, house, street, unit)
 
-            # 2. Remaining pages.
-            pages_to_fetch = min(total_pages, _MAX_PAGES)
-            for page in range(2, pages_to_fetch + 1):
-                await asyncio.sleep(_LIST_DELAY_SECONDS)
-                try:
-                    resp = await self._post_search(client, active_page=page)
-                except SourceUnavailableError:
-                    # One flaky page should not kill the whole run; log and
-                    # continue. We keep whatever we've gathered so far.
-                    logger.warning(
-                        "Hennepin list page failed; continuing",
-                        source=self.source_name,
-                        page=page,
-                    )
+
+async def run_hennepin_condo_resolver() -> dict[str, int]:
+    """Re-key condo foreclosure events onto their real parcels."""
+    max_events = int(os.environ.get("MAX_EVENTS", "0") or 0)
+    logger.info("Hennepin condo resolver starting",
+                max_events=max_events or "uncapped")
+
+    # Events on a placeholder whose parcel address carries a unit number.
+    resp = (
+        signals_table("distress_events")
+        .select("id, source_id, parcel_id, raw_data")
+        .eq("source", _SOURCE)
+        .like("parcel_id", "HENNEPIN-FC-%")
+        .execute()
+    )
+    # Any event with a usable address, not only condos. See _ADDR_PLAIN_RE.
+    events = []
+    for e in (resp.data or []):
+        a = ((e.get("raw_data") or {}).get("address") or "").strip()
+        if a and not _NOT_AN_ADDRESS_RE.search(a):
+            events.append(e)
+    logger.info("Hennepin condo resolver: candidates", count=len(events))
+
+    stats = {"candidates": len(events), "resolved": 0, "rekeyed": 0,
+             "unparsed_address": 0, "not_found": 0, "ambiguous": 0,
+             "parcel_missing": 0, "rekey_collision": 0, "failed": 0}
+    if not events:
+        return stats
+
+    timeout = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=30.0)
+    attempted = 0
+    async with httpx.AsyncClient(timeout=timeout, headers=_headers(),
+                                 follow_redirects=True) as client:
+        for ev in events:
+            # The cap bounds ATTEMPTS as well as re-keys. Run #1 was dispatched
+            # with max_events=10 and walked all 113 for ten minutes, because
+            # nothing was re-keyed and the cap only counted successes. A capped
+            # test that ignores its cap when things go wrong is not a test.
+            if max_events and (stats["rekeyed"] >= max_events
+                               or attempted >= max_events * 3):
+                logger.info("Hennepin condo resolver: MAX_EVENTS reached",
+                            cap=max_events, attempted=attempted,
+                            rekeyed=stats["rekeyed"])
+                break
+            attempted += 1
+
+            addr = ((ev.get("raw_data") or {}).get("address") or "").strip()
+            m = _ADDR_UNIT_RE.match(addr)
+            if m:
+                house, street, unit = m.group(1), m.group(2), m.group(3)
+            else:
+                m = _ADDR_PLAIN_RE.match(addr)
+                if not m:
+                    stats["unparsed_address"] += 1
                     continue
-                page_rows = resp.get("data") or []
-                records.extend(page_rows)
-                logger.info(
-                    "Hennepin list page fetched",
-                    source=self.source_name,
-                    page=page,
-                    rows=len(page_rows),
-                )
+                house, street, unit = m.group(1), m.group(2), ""
 
-            logger.info(
-                "Hennepin list collection complete",
-                source=self.source_name,
-                collected=len(records),
-                expected=total_records,
-            )
+            parcel_id, how = await _resolve_one(client, house, street, unit)
+            await asyncio.sleep(_PACE_SECONDS)
 
-            # 3. Detail enrichment per saleRecordNumber.
-            enriched = await self._enrich_details(client, records)
-
-        logger.info(
-            "Hennepin fetch complete",
-            source=self.source_name,
-            total_rows=len(enriched),
-        )
-        return enriched
-
-    async def _post_search(
-        self, client: httpx.AsyncClient, active_page: int
-    ) -> dict[str, Any]:
-        """POST the Search endpoint for one page, with light retries."""
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                resp = await client.post(
-                    _LIST_URL, json=_search_body(active_page)
-                )
-                if resp.status_code != 200:
-                    raise SourceUnavailableError(
-                        f"Hennepin Search page {active_page} returned "
-                        f"{resp.status_code}",
-                        source=self.source_name,
-                    )
-                return resp.json()
-            except (httpx.HTTPError, ValueError) as e:
-                last_err = e
-                logger.warning(
-                    "Hennepin Search POST attempt failed",
-                    source=self.source_name,
-                    page=active_page,
-                    attempt=attempt + 1,
-                    error_type=type(e).__name__,
-                    error_repr=repr(e),
-                )
-                await asyncio.sleep(2.0)
-        raise SourceUnavailableError(
-            f"Hennepin Search page {active_page} failed after retries: "
-            f"{type(last_err).__name__}: {last_err!r}",
-            source=self.source_name,
-        )
-
-    async def _enrich_details(
-        self,
-        client: httpx.AsyncClient,
-        records: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """GET each record's detail endpoint and merge it onto the list row."""
-        detail_ok = 0
-        detail_errors = 0
-
-        for rec in records:
-            record_no = _safe_str(rec.get("saleRecordNumber"))
-            if not record_no:
-                continue
-            url = _DETAIL_URL.format(record=record_no)
-            try:
-                await asyncio.sleep(_DETAIL_DELAY_SECONDS)
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    detail_errors += 1
-                    logger.warning(
-                        "Hennepin detail non-200",
-                        source=self.source_name,
-                        record=record_no,
-                        status_code=resp.status_code,
-                    )
-                    continue
-                detail = resp.json()
-                if isinstance(detail, dict):
-                    # Detail is the authoritative record; merge it over the
-                    # list fields (which it fully supersets).
-                    rec.update(detail)
-                    detail_ok += 1
-            except (httpx.HTTPError, ValueError) as e:
-                detail_errors += 1
-                logger.warning(
-                    "Hennepin detail fetch error",
-                    source=self.source_name,
-                    record=record_no,
-                    error_type=type(e).__name__,
-                    error=str(e),
-                )
-
-        logger.info(
-            "Hennepin detail enrichment complete",
-            source=self.source_name,
-            detail_ok=detail_ok,
-            detail_errors=detail_errors,
-            total=len(records),
-        )
-        return records
-
-    # ---- Parse records → signals ----
-
-    async def parse(
-        self, raw_records: list[dict[str, Any]]
-    ) -> list[DistressEventInsert]:
-        signals: list[DistressEventInsert] = []
-        today = date.today()
-        resolved_count = 0
-        synthetic_count = 0
-        unresolvable = 0
-        pins_resolved = 0
-        pins_declined: dict[str, int] = {}
-
-        for r in raw_records:
-            record_no = _safe_str(r.get("saleRecordNumber"))
-            if not record_no:
-                continue
-
-            sale_date = _parse_iso_date(r.get("dateOfSale"))
-            if sale_date is None:
-                # No usable sale date → cannot form a sheriff_sale event.
-                continue
-
-            redemption_date = _parse_iso_date(
-                r.get("redemptionExpirationDate")
-            )
-            owner = _mortgagor_names(r.get("mortgagors"))
-            address = _safe_str(r.get("address"))
-            city = _safe_str(r.get("city"))
-            final_bid = _safe_decimal(r.get("finalBidAmount"))
-
-            # === RESOLVE THE REAL PARCEL BEFORE INVENTING ONE (2026-08-17) ===
-            #
-            # This line used to read, unconditionally:
-            #
-            #     parcel_id = f"HENNEPIN-FC-{record_no}"
-            #
-            # Every sale therefore hung off a synthetic parcel carrying no
-            # market value, no coordinates, no owner and no lot size -- the
-            # em-dash rows. Measured 2026-08-17: this scraper minted 381 stub
-            # parcels in a single run at 11:18, and 377 of those 381 resolve to
-            # exactly ONE real Hennepin parcel by address. The sale record
-            # already carried `address` (read two lines up, stored in raw_data,
-            # passed to ParcelUpsert in write()) -- the county's own address,
-            # against the county's own spine. Nothing looked.
-            #
-            # The address rule lives in src/services/spine_resolver.py so the
-            # approve path, this scraper and the backfill SQL all apply the
-            # same normalisation. Street types are dropped and directionals are
-            # CANONICALISED, never stripped: 'N' and 'S' name different
-            # streets. Ambiguity returns None and keeps the synthetic id -- a
-            # wrong parcel attaches a foreclosure to somebody else's house.
-            resolved = None
-            if address:
-                try:
-                    resolved = resolve_by_address(self.county_code, address)
-                except SpineLookupUnavailable as e:
-                    # The spine could not be QUERIED. That is NOT evidence the
-                    # parcel is absent, and minting a stub on a dropped
-                    # connection is irreversible in practice -- the stub
-                    # acquires events, imagery and listings that must then be
-                    # re-pointed by hand. Skip the record; Hennepin republishes
-                    # the same list daily, so it returns on the next run.
-                    unresolvable += 1
-                    logger.warning(
-                        "Hennepin record skipped — spine unreachable",
-                        source=self.source_name,
-                        record_no=record_no,
-                        error=str(e),
-                    )
-                    continue
-
-            # === ASK THE COUNTY BEFORE INVENTING A PARCEL (2026-08-20) ===
-            #
-            # The spine match above is an EXACT normalised join, so it cannot
-            # resolve two shapes the county resolves easily:
-            #
-            #   * A CONDO UNIT. core.parcels holds one row per unit but does
-            #     not store the unit number in `address` — eleven Robbinsdale
-            #     parcels all read '4176 ADAIR AVE N' — so '#11' has nothing
-            #     to match against and the join returns eleven candidates.
-            #   * A STREET NAME WE SPELL DIFFERENTLY. PINS is fuzzier than we
-            #     are: it returns 27 CIRCLE WEST for a search of '27 Circle W'.
-            #
-            # PINS holds the unit and does the fuzzy match, so it answers both.
-            # Until tonight this ran only as a nightly clean-up job, which
-            # meant every stub was live — and visible with no market value, no
-            # owner and no imagery — for up to a day. It also could not keep
-            # up: the run at 02:55 re-keyed 3 events while the scraper minted
-            # more, taking the stub count from 33 to 34.
-            #
-            # Asking here costs one HTTP call for the records that would
-            # OTHERWISE BECOME STUBS — 4 on today's run, at 1.5s pacing.
-            #
-            # A DECLINE IS STILL A STUB. Two parcels for one unit is normal
-            # (a large building deeds its parking stalls separately and the
-            # stall carries the unit number), and picking either would attach
-            # a foreclosure to a neighbour's home or to a garage space. The
-            # placeholder is the honest answer; only an unambiguous hit moves.
-            if resolved is None and address:
-                try:
-                    pid, how = await resolve_address_via_pins(address)
-                except Exception as e:
-                    # The county being unreachable is not evidence about the
-                    # parcel. Fall through to the placeholder rather than
-                    # failing the run; the nightly resolver retries.
-                    pid, how = None, f"error:{type(e).__name__}"
-                    logger.warning(
-                        "Hennepin PINS lookup failed",
-                        source=self.source_name,
-                        record_no=record_no,
-                        error=str(e),
-                    )
-                if pid:
-                    resolved = {"parcel_id": pid}
-                    pins_resolved += 1
-                    logger.info(
-                        "Hennepin parcel resolved via county PINS",
-                        source=self.source_name,
-                        record_no=record_no,
-                        address=address,
-                        parcel_id=pid,
-                        how=how,
-                    )
+            if not parcel_id:
+                if how in ("ambiguous_in_building", "ambiguous_address"):
+                    stats["ambiguous"] += 1
                 else:
-                    pins_declined[how] = pins_declined.get(how, 0) + 1
-
-            if resolved is not None:
-                parcel_id = resolved["parcel_id"]
-                resolved_count += 1
-            else:
-                parcel_id = f"HENNEPIN-FC-{record_no}"
-                synthetic_count += 1
-
-            # Severity from the redemption window: an open (future) redemption
-            # period is the actionable window — the prior owner can still
-            # redeem and a buyer can engage. Expired/unknown is lower priority.
-            if redemption_date is not None and redemption_date >= today:
-                severity = "high"
-            elif redemption_date is not None and redemption_date < today:
-                severity = "low"
-            else:
-                severity = "medium"
-
-            title_bits = ["Sheriff foreclosure sale"]
-            if address:
-                title_bits.append(f"— {address}")
-            if city:
-                title_bits.append(f", {city}")
-            title = " ".join(title_bits)[:500]
-
-            desc_parts = [
-                f"Completed Hennepin County sheriff sale on "
-                f"{sale_date.isoformat()}."
-            ]
-            if owner:
-                desc_parts.append(f"Mortgagor: {owner}.")
-            if final_bid is not None:
-                desc_parts.append(f"Final bid: ${final_bid:,.0f}.")
-            if redemption_date is not None:
-                desc_parts.append(
-                    f"Redemption expires {redemption_date.isoformat()}."
-                )
-            if _safe_str(r.get("typeOfSale")):
-                desc_parts.append(f"Type: {r['typeOfSale']}.")
-            description = " ".join(desc_parts)[:2000]
-
-            signals.append(DistressEventInsert(
-                parcel_id=parcel_id,
-                # ADDED 2026-08-10. This scraper builds DistressEventInsert
-                # DIRECTLY (no to_event() projection), so it must set
-                # county_code itself -- it was set on the ParcelUpsert below
-                # but never on the event.
-                #
-                # A NULL county_code leaves the composite FK
-                # (county_code, parcel_id) -> core.parcels UNENFORCED and
-                # makes distress_events_dedup_key unable to collide, because
-                # NULL is not equal to anything.
-                #
-                # Measured 2026-08-10: 10 Hennepin events carried NULL and
-                # were exact duplicates of rows that already existed with the
-                # county set -- the dedup key should have refused every one.
-                county_code=self.county_code,
-                event_type="sheriff_sale",
-                event_subtype="completed_sale",
-                event_date=sale_date,
-                event_value=final_bid,
-                source=self.source_name,
-                source_id=record_no,
-                severity=severity,  # type: ignore[arg-type]
-                title=title,
-                description=description,
-                raw_data={
-                    # Store the full detail record so the redemption-window
-                    # UI can read redemptionExpirationDate directly, and so
-                    # nothing the API returns is lost.
-                    "saleRecordNumber": record_no,
-                    "dateOfSale": r.get("dateOfSale"),
-                    "typeOfSale": r.get("typeOfSale"),
-                    "address": address,
-                    "city": city,
-                    "mortgagors": r.get("mortgagors"),
-                    "mortgagee": r.get("mortgagee"),
-                    "toWhomSold": r.get("toWhomSold"),
-                    "finalBidAmount": r.get("finalBidAmount"),
-                    "redemptionExpirationDate": r.get(
-                        "redemptionExpirationDate"
-                    ),
-                    "lawFirm": r.get("lawFirm"),
-                    "mortgageDocumentNumber": r.get(
-                        "mortgageDocumentNumber"
-                    ),
-                    "comments": r.get("comments"),
-                    "noticeOfIntent": r.get("noticeOfIntent"),
-                    "_source": self.source_name,
-                },
-                observed_at=datetime.now(timezone.utc),
-            ))
-
-        # The number that matters on every run. A rising `synthetic` count
-        # means the spine is drifting from what the Sheriff publishes; a
-        # non-zero `unreachable` means records were DEFERRED, not lost.
-        # `pins_resolved` is the count that would have been stubs before
-        # 2026-08-20. `pins_declined` breaks down the refusals by reason so a
-        # rising 'ambiguous_in_building' reads as normal (stalls deeded with
-        # the unit number) while a rising 'no_response' reads as the county
-        # being unreachable.
-        logger.info(
-            "Hennepin parcel resolution",
-            source=self.source_name,
-            resolved=resolved_count,
-            synthetic=synthetic_count,
-            unreachable=unresolvable,
-            pins_resolved=pins_resolved,
-            pins_declined=pins_declined,
-            events=len(signals),
-        )
-        return signals
-
-    # ---- Write (mirror Anoka: resolve parcels + dedup events) ----
-
-    async def write(
-        self, signals: list[DistressEventInsert]
-    ) -> tuple[int, int, int]:
-        if not signals:
-            return 0, 0, 0
-
-        unique_parcels: dict[str, ParcelUpsert] = {}
-        for ev in signals:
-            if ev.parcel_id in unique_parcels:
+                    stats["not_found"] += 1
+                logger.info("Hennepin condo: unresolved",
+                            source_id=ev.get("source_id"), address=addr,
+                            reason=how)
                 continue
-            # === ONLY SYNTHETIC PARCELS ARE WRITTEN (2026-08-17) ===
-            #
-            # A resolved parcel_id already exists in core.parcels with real
-            # assessor data. Putting it through resolve_parcel would run the
-            # merge in _merge_parcel_payload, whose fill-in semantics write a
-            # value wherever the existing column is NULL -- so the Sheriff's
-            # address would land on a parcel whose assessor address happened
-            # to be empty, and data_sources would gain a source that did not
-            # supply the row. _IMMUTABLE_FIELDS protects the key columns; it
-            # does not protect the rest.
-            #
-            # Same reasoning as build_promotion_rows returning parcel_row=None
-            # on a resolved notice: the spine row is authoritative and the
-            # scraper has nothing to add to it. The distress_events row still
-            # points at it, which is the entire object of the exercise.
-            if not ev.parcel_id.startswith("HENNEPIN-FC-"):
-                continue
-            raw = ev.raw_data or {}
-            address = _safe_str(raw.get("address"))
-            city = _safe_str(raw.get("city"))
 
-            unique_parcels[ev.parcel_id] = ParcelUpsert(
-                parcel_id=ev.parcel_id,
-                county_code=self.county_code,
-                state="MN",
-                address=address,
-                city=city,
-                zip=None,
-                raw_data={
-                    "hennepin_foreclosure": raw,
-                    "_source": self.source_name,
-                },
-                data_sources=[self.source_name],
-                last_observed_at=datetime.now(timezone.utc),
+            stats["resolved"] += 1
+
+            # The parcel MUST already exist. This resolver never creates one:
+            # a parcel_id pointing at nothing would break the composite FK and
+            # would be a stub by another name.
+            chk = (
+                core_table("parcels")
+                .select("parcel_id")
+                .eq("county_code", _COUNTY)
+                .eq("parcel_id", parcel_id)
+                .limit(1)
+                .execute()
             )
+            if not (chk.data or []):
+                stats["parcel_missing"] += 1
+                logger.warning("Hennepin condo: resolved parcel not in spine",
+                               source_id=ev.get("source_id"),
+                               address=addr, parcel_id=parcel_id)
+                continue
 
-        parcels_failed = 0
-        for payload in unique_parcels.values():
-            if resolve_parcel(payload) is None:
-                parcels_failed += 1
+            raw = dict(ev.get("raw_data") or {})
+            raw["_condo_resolve"] = {
+                "from": ev.get("parcel_id"),
+                "to": parcel_id,
+                "address": addr,
+                "how": how,
+                "source": "hennepin PINS addrresult.jsp",
+            }
 
-        new_events, failed_events = write_events_dedup(signals)
-        logger.info(
-            "Hennepin write complete",
-            source=self.source_name,
-            # Stubs minted this run. Was one per sale record before
-            # 2026-08-17; should now be a small remainder.
-            parcels_synthetic=len(unique_parcels),
-            events_new=new_events,
-            failed=failed_events + parcels_failed,
-        )
-        return new_events, 0, failed_events + parcels_failed
+            try:
+                (
+                    signals_table("distress_events")
+                    .update({"parcel_id": parcel_id, "raw_data": raw})
+                    .eq("id", ev["id"])
+                    .execute()
+                )
+                stats["rekeyed"] += 1
+            except Exception as e:
+                # distress_events_source_identity_key is
+                # (county_code, source, source_id, event_date) and does NOT
+                # contain parcel_id, so a re-key should not collide. Counted
+                # separately rather than hidden in failed, because a collision
+                # here would mean that assumption is wrong.
+                stats["rekey_collision"] += 1
+                logger.warning("Hennepin condo: re-key failed",
+                               source_id=ev.get("source_id"),
+                               to_parcel=parcel_id,
+                               error_type=type(e).__name__,
+                               error_repr=repr(e)[:300])
+
+    logger.info("Hennepin condo resolver complete", **stats)
+    return stats
 
 
-__all__ = ["HennepinSheriffScraper"]
+if __name__ == "__main__":
+    sys.exit(0 if asyncio.run(run_hennepin_condo_resolver()) else 0)
+
+
+__all__ = ["run_hennepin_condo_resolver"]
