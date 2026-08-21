@@ -88,6 +88,16 @@ _PACE_SECONDS = 1.5
 _MAX_RETRIES = 3
 _LIST_PAGE_SIZE = 100
 
+# Ceiling on building-list pages. 410 Groveland Ave is 229 records, so three
+# pages covers it with room; a building needing more than 500 rows is not a
+# condo we can disambiguate anyway.
+_MAX_LIST_PAGES = 5
+
+# "Records 1 - 20 of 229" — the service states its own total, so the pager
+# never guesses how far to go.
+_TOTAL_RE = re.compile(r"Records\s+[\d,]+\s*-\s*[\d,]+\s+of\s+([\d,]+)",
+                       re.IGNORECASE)
+
 # BOTH PATTERNS ARE WRITTEN AGAINST CAPTURED MARKUP, NOT AGAINST SCREENSHOTS.
 #
 # The first version of this file guessed both from rendered pages and matched
@@ -122,6 +132,17 @@ _ROW_RE = re.compile(
     r'href="pidresult\.jsp\?pid=(\d+)".*?</td>\s*<td[^>]*>(.*?)</td>',
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _total_records(body: str) -> int:
+    """Total rows the service says the query has, 0 when it does not say."""
+    m = _TOTAL_RE.search(body or "")
+    if not m:
+        return 0
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
 
 
 def _clean_cell(text: str) -> str:
@@ -245,20 +266,76 @@ async def _resolve_one(
         return None, "address_not_found"
 
     # Path 1: ask for the unit directly.
+    #
+    # FIXED 2026-08-20. This asked the right question and then discarded the
+    # answer. It ran ONLY _PID_RE, which matches a single-property DETAIL
+    # page. When the county returns two or more parcels for one unit the
+    # response is a LIST page, _PID_RE finds nothing, and control fell
+    # through to the whole-building scan below — which then failed for a
+    # different reason and reported a misleading one.
+    #
+    # Verified by hand 2026-08-20 against the live service:
+    #   addrresult.jsp?house=410&street=Groveland&condo=202&ps=100
+    #   -> 27-029-24-33-0145 and 27-029-24-33-0498, both '410 GROVELAND
+    #      AVE #202'. Records 1-2 of 2.
+    #
+    # A large condo building deeds its PARKING STALLS separately and the
+    # stall carries the same unit number, so two parcels for one unit is
+    # normal rather than exceptional: 410 Groveland shows the same doubling
+    # on #1002, #1004, #1006, #1104, #1106, #1202, #1203, #1204 and #1302.
+    #
+    # So parse the rows. One row resolves. Two or more is AMBIGUOUS and must
+    # stay a decline — picking either would attach a foreclosure to a
+    # neighbour's parcel, or to a garage stall. This also skips the
+    # whole-building fetch entirely, which is a page of up to 229 rows.
     body = await _post(client, {"house": house, "street": street,
-                                "condo": unit, "ps": "20"})
+                                "condo": unit, "ps": str(_LIST_PAGE_SIZE)})
     if body:
         m = _PID_RE.search(body)
         if m:
             return _to_parcel_id(m.group(1)), "direct"
+        unit_rows = _ROW_RE.findall(body)
+        if len(unit_rows) == 1:
+            return unit_rows[0][0], "direct_list"
+        if len(unit_rows) > 1:
+            return None, "ambiguous_in_building"
 
     await asyncio.sleep(_PACE_SECONDS)
 
     # Path 2: the whole building, matched on trailing digits.
+    #
+    # PAGINATED 2026-08-20. This fetched ONE page of _LIST_PAGE_SIZE and
+    # stopped. 410 Groveland Ave holds 229 records, and the list is sorted
+    # as TEXT rather than numerically — '#1001, #1002, ... #101, #102 ...' —
+    # so a three-digit unit sits well past row 100 and was invisible. The
+    # miss was then reported as 'unit_not_in_building' about a unit the
+    # county holds.
+    #
+    # `sr` is the 1-based start row, read off the service's own paging links:
+    #   addrresult.jsp?house=410&street=Groveland&condo=&ps=100&sr=130
+    #
+    # Capped at _MAX_LIST_PAGES so a pathological building cannot spin.
     body = await _post(client, {"house": house, "street": street,
                                 "condo": "", "ps": str(_LIST_PAGE_SIZE)})
     if not body:
         return None, "no_response"
+
+    pages = [body]
+    total = _total_records(body)
+    if total > _LIST_PAGE_SIZE:
+        start = _LIST_PAGE_SIZE + 1
+        for _ in range(_MAX_LIST_PAGES - 1):
+            if start > total:
+                break
+            await asyncio.sleep(_PACE_SECONDS)
+            more = await _post(client, {"house": house, "street": street,
+                                        "condo": "", "ps": str(_LIST_PAGE_SIZE),
+                                        "sr": str(start)})
+            if not more:
+                break
+            pages.append(more)
+            start += _LIST_PAGE_SIZE
+    body = "".join(pages)
 
     want = _digits(unit)
     if not want:
