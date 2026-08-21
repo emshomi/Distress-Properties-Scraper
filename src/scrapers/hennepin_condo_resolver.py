@@ -424,6 +424,7 @@ async def run_hennepin_condo_resolver() -> dict[str, int]:
 
     stats = {"candidates": len(events), "resolved": 0, "rekeyed": 0,
              "unparsed_address": 0, "not_found": 0, "ambiguous": 0,
+             "unreachable": 0,
              "parcel_missing": 0, "rekey_collision": 0, "failed": 0}
     if not events:
         return stats
@@ -460,7 +461,20 @@ async def run_hennepin_condo_resolver() -> dict[str, int]:
             await asyncio.sleep(_PACE_SECONDS)
 
             if not parcel_id:
-                if how in ("ambiguous_in_building", "ambiguous_address"):
+                # THREE OUTCOMES, NOT TWO (2026-08-20).
+                #
+                # 'no_response' means the request to the county did not come
+                # back — a timeout, a 5xx, a network drop. That is a broken
+                # INSTRUMENT and says nothing about the property.
+                # Everything else is the county ANSWERING: it does not hold
+                # that address, or it holds it twice and we refuse to guess.
+                #
+                # Pooling the two made a healthy run indistinguishable from
+                # an unreachable county, which is what the runner's exit
+                # code was reading.
+                if how == "no_response" or how.startswith("error"):
+                    stats["unreachable"] += 1
+                elif how in ("ambiguous_in_building", "ambiguous_address"):
                     stats["ambiguous"] += 1
                 else:
                     stats["not_found"] += 1
