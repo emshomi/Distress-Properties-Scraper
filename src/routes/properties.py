@@ -1171,7 +1171,17 @@ def _extract_probate(raw: dict, row: dict) -> dict[str, Any]:
         "lat": None,
         "lng": None,
         "neighborhood": None,
-        "registered_date": raw.get("published_date"),
+        # FALLS BACK TO event_date (2026-08-21). Measured: fillmore_probate
+        # carries published_date on 48 of 48 rows, olmsted_probate on 0 of 15
+        # — the Column-API extractor never wrote the key. Both carry
+        # event_date on every row, and for a probate notice they are the SAME
+        # FACT: the date the notice was published. Without the fallback the
+        # list's first column, which is also its sort key, reads as an
+        # em-dash for every Olmsted estate.
+        #
+        # published_date is preferred where present because it carries a
+        # timestamp ('2026-04-27T06:05:34') rather than a bare date.
+        "registered_date": raw.get("published_date") or row.get("event_date"),
         "market_value": emv_f,
         "earliest_delq_year": None,
         "dwelling_type": raw.get("property_type"),
