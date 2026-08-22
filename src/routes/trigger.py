@@ -315,7 +315,28 @@ async def trigger_scraper_async(
     """
     scraper_class = _resolve_scraper(scraper_name)
 
-    # Don't start a second background run of the same scraper
+    # Don't start a second background run of the same scraper.
+    #
+    # TWO CHECKS, NOT ONE (2026-08-22). _BACKGROUND_TASKS only knows about
+    # tasks THIS endpoint scheduled, in THIS process. It cannot see a run
+    # started by the scheduler, by /trigger, or by a previous process. So a
+    # scrape already in flight from any of those was invisible here: the
+    # endpoint scheduled a second task, returned 202 "started", and the run
+    # then died inside the worker thread when base_scraper's _class_lock
+    # rejected it. _run_scraper_background logs exceptions rather than
+    # raising — there is no client left to raise to — so the failure went to
+    # the log and the caller was told the scrape had begun.
+    #
+    # Measured live 2026-08-22 17:30: a second trigger-async for
+    # ramsey_parcels while run 712 was mid-flight returned 202 and produced
+    # NO row in audit.scraper_runs. The guard worked; the response lied.
+    #
+    # _class_lock is the same lock base_scraper actually enforces, and it is
+    # created in __init_subclass__, so it exists as soon as the class is
+    # imported — which happens at this module's import time for every entry
+    # in _SCRAPER_REGISTRY. Checking it here makes the 409 honest and moves
+    # the rejection back in front of the caller, where /trigger already has
+    # it.
     existing = _BACKGROUND_TASKS.get(scraper_name)
     if existing is not None and not existing.done():
         raise HTTPException(
@@ -325,6 +346,21 @@ async def trigger_scraper_async(
                     f"Scraper '{scraper_name}' already running in background",
                     source=scraper_name,
                     context={"scraper_name": scraper_name},
+                )
+            ),
+        )
+
+    if scraper_class._class_lock.locked():
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=error_envelope(
+                ScraperAlreadyRunningError(
+                    f"Scraper '{scraper_name}' is already running",
+                    source=scraper_name,
+                    context={
+                        "scraper_name": scraper_name,
+                        "detected_by": "class_lock",
+                    },
                 )
             ),
         )
