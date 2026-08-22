@@ -77,6 +77,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any, ClassVar
 
+from src.db.supabase_client import signals_table
 from src.models.parcel import ParcelUpsert
 from src.models.signal import VbrListingInsert
 from src.scrapers.base_arcgis_scraper import (
@@ -107,6 +108,42 @@ _FEATURE_SERVICE_URL = (
     "https://services1.arcgis.com/9meaaHE3uiba0zr8"
     "/arcgis/rest/services/PAULIE/FeatureServer/53"
 )
+
+
+# ----- Retirement threshold for this full-snapshot source -----
+# A row absent from THIS many consecutive complete fetches is retired
+# (is_active = False). Present rows reset the counter to zero.
+#
+# WHY 3, AND WHY NOT 1 (2026-08-22)
+# where_clause is "1=1" — every run is the entire registry, so "absent from
+# the fetch" is meaningful here in a way it would not be on a paged or
+# date-filtered source. But absent-once is NOT sufficient evidence that a
+# building left the registry:
+#
+#   - mpls_vbr took a bare 403 from the City on 2026-08-16 and fetched zero
+#     rows. Under a one-miss rule that single bad morning would have retired
+#     all 311 Minneapolis registrations.
+#   - When THIS source repointed off the dead standalone service onto PAULIE
+#     on 2026-08-16, 8 rows the tombstone carried were not in PAULIE's 392.
+#     Six were Category 2 - Boarded, registered as far back as 2022. Six
+#     long-standing boarded buildings do not leave a registry on the same
+#     morning; that is a coverage difference between two datasets. A one-miss
+#     rule would have retired all eight and called it correct.
+#
+# 7 was rejected in the other direction: this source runs daily, so a week of
+# publishing a boarded building the City has released is too long to be wrong.
+# 3 daily runs means a genuine removal reaches subscribers in three days, and
+# no single anomaly or two-day outage can retire anything.
+_RETIREMENT_THRESHOLD: int = 3
+
+# PostgREST puts .in_() lists in the query string; chunk them so a full
+# registry cannot overflow the URL.
+_ID_CHUNK: int = 100
+
+
+def _chunk_ids(ids: list[int]) -> list[list[int]]:
+    """Split a list of row ids into _ID_CHUNK-sized batches."""
+    return [ids[i : i + _ID_CHUNK] for i in range(0, len(ids), _ID_CHUNK)]
 
 
 def _category_to_flags(category: Any) -> tuple[bool, bool, str]:
@@ -242,6 +279,97 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             condemned=condemned,
         )
 
+    # ---- Retirement (full-snapshot reconciliation) ----
+
+    @staticmethod
+    def _reg_key(parcel_id: Any, entered: Any) -> tuple[str, str | None]:
+        """Normalize (parcel_id, date_entered_registry) into a comparable key.
+
+        The DB returns date_entered_registry as an ISO string via PostgREST;
+        the in-memory signal carries a datetime.date or None. Both sides must
+        be reduced to the same shape or every row looks absent.
+        """
+        if entered is None:
+            key_date = None
+        elif isinstance(entered, date):
+            key_date = entered.isoformat()
+        else:
+            key_date = str(entered)[:10] or None
+        return (str(parcel_id), key_date)
+
+    def _retire_absent(
+        self,
+        signals: list[VbrListingInsert],
+    ) -> tuple[int, int, int]:
+        """
+        Reconcile the stored registry against this run's complete fetch.
+
+        Rows PRESENT in the fetch have consecutive_misses reset to 0 and
+        is_active restored to True — a building that reappears after a
+        transient miss must come back, or one bad fetch would retire it
+        permanently.
+
+        Rows ABSENT have consecutive_misses incremented, and are retired
+        (is_active = False) once the count reaches _RETIREMENT_THRESHOLD.
+
+        Keyed on (parcel_id, date_entered_registry) to match
+        signals.vacant_registrations_dedup. Scoped to this scraper's own
+        county and city so it can never touch Minneapolis rows.
+
+        Returns:
+            (rows_reset, rows_missed, rows_retired)
+        """
+        seen = {
+            self._reg_key(sig.parcel_id, sig.date_entered_registry)
+            for sig in signals
+        }
+
+        stored = (
+            signals_table("vacant_registrations")
+            .select("id,parcel_id,date_entered_registry,consecutive_misses,is_active")
+            .eq("county_code", self.county_code)
+            .eq("city", "Saint Paul")
+            .execute()
+        )
+        rows = stored.data or []
+
+        present_ids: list[int] = []
+        # Absent rows are grouped by their CURRENT miss count so each group can
+        # be written with one bulk update instead of one call per row.
+        absent_by_count: dict[int, list[int]] = {}
+
+        for row in rows:
+            key = self._reg_key(row.get("parcel_id"), row.get("date_entered_registry"))
+            if key in seen:
+                if row.get("consecutive_misses") or not row.get("is_active"):
+                    present_ids.append(row["id"])
+            else:
+                current = row.get("consecutive_misses") or 0
+                absent_by_count.setdefault(current, []).append(row["id"])
+
+        rows_reset = 0
+        rows_missed = 0
+        rows_retired = 0
+
+        for chunk in _chunk_ids(present_ids):
+            signals_table("vacant_registrations").update(
+                {"consecutive_misses": 0, "is_active": True}
+            ).in_("id", chunk).execute()
+            rows_reset += len(chunk)
+
+        for current, ids in absent_by_count.items():
+            new_count = current + 1
+            still_active = new_count < _RETIREMENT_THRESHOLD
+            for chunk in _chunk_ids(ids):
+                signals_table("vacant_registrations").update(
+                    {"consecutive_misses": new_count, "is_active": still_active}
+                ).in_("id", chunk).execute()
+                rows_missed += len(chunk)
+                if not still_active:
+                    rows_retired += len(chunk)
+
+        return rows_reset, rows_missed, rows_retired
+
     # ---- Write ----
 
     async def write(
@@ -376,20 +504,64 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         events = [sig.to_event() for sig in signals]
         new_events, failed_events = write_events_dedup(events)
 
+        # --- Step 4: Retire rows absent from this complete fetch ---
+        # Only meaningful because where_clause is "1=1". A partial fetch must
+        # never reach this: retiring on incomplete data marks live buildings
+        # inactive, which is worse than carrying a stale row.
+        #
+        # A failure here must NOT fail the run — the registry data itself is
+        # already written and correct at this point. It is logged and counted.
+        rows_reset = rows_missed = rows_retired = 0
+        retire_failed = 0
+        try:
+            rows_reset, rows_missed, rows_retired = self._retire_absent(signals)
+        except Exception as exc:
+            retire_failed = 1
+            logger.warning(
+                "Saint Paul retirement pass failed; registry rows unaffected",
+                source=self.source_name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
         logger.info(
             "Saint Paul vacant write complete",
             source=self.source_name,
             parcels_ok=parcels_ok,
             parcels_failed=parcels_failed,
-            typed_new=new_typed,
+            typed_upserted=new_typed,
             events_new=new_events,
-            failed=failed_typed + failed_events + parcels_failed,
+            rows_reset=rows_reset,
+            rows_missed=rows_missed,
+            rows_retired=rows_retired,
+            failed=failed_typed + failed_events + parcels_failed + retire_failed,
         )
 
+        # COUNTER SEMANTICS CORRECTED 2026-08-22.
+        # This returned (new_typed, 0, failures). Both leading values were
+        # wrong, and together they hid this source's real behaviour for weeks:
+        #
+        #   new_typed is the length of the upserted batch, because
+        #   write_typed_signals_dedup passes ignore_duplicates=False and
+        #   PostgREST returns every row it touched, inserted or updated. So
+        #   records_new read 392 of 392 on EVERY run — a registry that gains a
+        #   handful of buildings a month reported a few hundred new records a
+        #   day, and nothing could be alerted on it.
+        #
+        #   The middle slot is records_updated. It was a hardcoded literal 0,
+        #   which is why records_updated is 0 for every source in
+        #   audit.scraper_runs.
+        #
+        #   new_events — the only genuinely-new count available, since
+        #   write_events_dedup uses ON CONFLICT DO NOTHING and returns real
+        #   inserts — was computed and then discarded.
+        #
+        # records_new is now new_events (true inserts) and records_updated is
+        # the count of typed rows touched.
         return (
+            new_events,
             new_typed,
-            0,
-            failed_typed + failed_events + parcels_failed,
+            failed_typed + failed_events + parcels_failed + retire_failed,
         )
 
 
