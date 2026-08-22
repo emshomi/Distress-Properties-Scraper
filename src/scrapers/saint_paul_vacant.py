@@ -279,6 +279,27 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             condemned=condemned,
         )
 
+    # ---- Fetch (records the row count for the retirement guard) ----
+
+    # Number of features the last fetch returned, or None if it has not run.
+    # write() compares this against the parsed signal count to decide whether
+    # the retirement pass is safe. Set on the instance, never the class.
+    _fetched_count: int | None = None
+
+    async def fetch(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """Fetch the registry, remembering how many rows came back.
+
+        The base class returns the feature list and keeps no count, and
+        write() receives only the PARSED signals. Those two numbers differ
+        whenever parse() drops a row — parse_feature returns None for a
+        missing PIN, and a ParseError is logged and skipped. Without the
+        fetched count there is no way for write() to tell a genuine removal
+        from a parse failure, and both look identical to the retirement pass.
+        """
+        features = await super().fetch(*args, **kwargs)
+        self._fetched_count = len(features)
+        return features
+
     # ---- Retirement (full-snapshot reconciliation) ----
 
     @staticmethod
@@ -296,6 +317,41 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         else:
             key_date = str(entered)[:10] or None
         return (str(parcel_id), key_date)
+
+    # Minimum share of fetched rows that must survive parsing before the
+    # retirement pass is allowed to run. Saint Paul parses 392 of 392 today,
+    # so this has no effect in normal operation; it exists to stop a mass
+    # parse failure from being read as a mass removal.
+    _MIN_PARSE_RATIO: ClassVar[float] = 0.95
+
+    def _snapshot_is_complete(self, parsed: int) -> tuple[bool, str]:
+        """Decide whether this run's data may drive retirement.
+
+        Returns (ok, reason). The reason is logged when ok is False.
+
+        THREE WAYS A RUN CAN LOOK LIKE A REMOVAL WITHOUT BEING ONE:
+
+        1. A record cap. POST /trigger/saint_paul_vacant?max_records=50 sets
+           _max_records_override and the fetch stops at 50 rows. The other
+           ~340 are not gone; they were never asked for. Three capped runs
+           would retire the registry.
+
+        2. An empty fetch. mpls_vbr took a bare 403 from the City on
+           2026-08-16 and got zero rows back. Zero fetched is never evidence
+           that every building was released.
+
+        3. Mass parse failure. parse() logs and skips a ParseError and
+           parse_feature returns None on a missing PIN, so signals can be
+           far shorter than the fetch with the run still reporting success.
+           Those rows are in the registry and would be counted absent.
+        """
+        if self._max_records_override is not None:
+            return False, "record cap set for this run"
+        if not self._fetched_count:
+            return False, "fetch returned no rows"
+        if parsed < self._fetched_count * self._MIN_PARSE_RATIO:
+            return False, "too many rows dropped in parsing"
+        return True, ""
 
     def _retire_absent(
         self,
@@ -513,16 +569,28 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         # already written and correct at this point. It is logged and counted.
         rows_reset = rows_missed = rows_retired = 0
         retire_failed = 0
-        try:
-            rows_reset, rows_missed, rows_retired = self._retire_absent(signals)
-        except Exception as exc:
-            retire_failed = 1
+        ok, skip_reason = self._snapshot_is_complete(len(signals))
+        if not ok:
             logger.warning(
-                "Saint Paul retirement pass failed; registry rows unaffected",
+                "Saint Paul retirement pass SKIPPED — fetch not a complete "
+                "snapshot; registry rows written normally",
                 source=self.source_name,
-                error_type=type(exc).__name__,
-                error=str(exc),
+                reason=skip_reason,
+                fetched=self._fetched_count,
+                parsed=len(signals),
+                max_records_override=self._max_records_override,
             )
+        else:
+            try:
+                rows_reset, rows_missed, rows_retired = self._retire_absent(signals)
+            except Exception as exc:
+                retire_failed = 1
+                logger.warning(
+                    "Saint Paul retirement pass failed; registry rows unaffected",
+                    source=self.source_name,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
 
         logger.info(
             "Saint Paul vacant write complete",
