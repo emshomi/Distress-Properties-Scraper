@@ -77,7 +77,6 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any, ClassVar
 
-from src.db.supabase_client import signals_table
 from src.models.parcel import ParcelUpsert
 from src.models.signal import VbrListingInsert
 from src.scrapers.base_arcgis_scraper import (
@@ -89,6 +88,11 @@ from src.services.event_writer import (
     write_typed_signals_dedup,
 )
 from src.services.parcel_resolver import resolve_parcel
+from src.services.snapshot_reconciler import (
+    build_key,
+    reconcile_snapshot,
+    snapshot_is_complete,
+)
 from src.utils.errors import ParseError
 from src.utils.logger import logger
 from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
@@ -135,16 +139,6 @@ _FEATURE_SERVICE_URL = (
 # 3 daily runs means a genuine removal reaches subscribers in three days, and
 # no single anomaly or two-day outage can retire anything.
 _RETIREMENT_THRESHOLD: int = 3
-
-# PostgREST puts .in_() lists in the query string; chunk them so a full
-# registry cannot overflow the URL.
-_ID_CHUNK: int = 100
-
-
-def _chunk_ids(ids: list[int]) -> list[list[int]]:
-    """Split a list of row ids into _ID_CHUNK-sized batches."""
-    return [ids[i : i + _ID_CHUNK] for i in range(0, len(ids), _ID_CHUNK)]
-
 
 def _category_to_flags(category: Any) -> tuple[bool, bool, str]:
     """
@@ -301,130 +295,31 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         return features
 
     # ---- Retirement (full-snapshot reconciliation) ----
+    #
+    # The mechanics live in src/services/snapshot_reconciler.py. They were
+    # written here first, proven against this registry on 2026-08-22 (392
+    # rows matched, 8 confirmed-absent rows incremented, nothing falsely
+    # retired), then extracted so mpls_vbr and the Minnesota Judicial Branch
+    # weekly extract use the same tested code rather than a second copy.
+    #
+    # What stays here is only what is TRUE OF THIS SOURCE: the identity
+    # columns, the scope, and the threshold.
 
-    @staticmethod
-    def _reg_key(parcel_id: Any, entered: Any) -> tuple[str, str | None]:
-        """Normalize (parcel_id, date_entered_registry) into a comparable key.
+    # Matches signals.vacant_registrations_dedup:
+    #   (county_code, parcel_id, date_entered_registry) NULLS NOT DISTINCT
+    # county_code is carried in the scope below rather than the key, since
+    # every row this scraper owns has the same one.
+    _KEY_COLUMNS: ClassVar[tuple[str, ...]] = (
+        "parcel_id",
+        "date_entered_registry",
+    )
 
-        The DB returns date_entered_registry as an ISO string via PostgREST;
-        the in-memory signal carries a datetime.date or None. Both sides must
-        be reduced to the same shape or every row looks absent.
-        """
-        if entered is None:
-            key_date = None
-        elif isinstance(entered, date):
-            key_date = entered.isoformat()
-        else:
-            key_date = str(entered)[:10] or None
-        return (str(parcel_id), key_date)
-
-    # Minimum share of fetched rows that must survive parsing before the
-    # retirement pass is allowed to run. Saint Paul parses 392 of 392 today,
-    # so this has no effect in normal operation; it exists to stop a mass
-    # parse failure from being read as a mass removal.
-    _MIN_PARSE_RATIO: ClassVar[float] = 0.95
-
-    def _snapshot_is_complete(self, parsed: int) -> tuple[bool, str]:
-        """Decide whether this run's data may drive retirement.
-
-        Returns (ok, reason). The reason is logged when ok is False.
-
-        THREE WAYS A RUN CAN LOOK LIKE A REMOVAL WITHOUT BEING ONE:
-
-        1. A record cap. POST /trigger/saint_paul_vacant?max_records=50 sets
-           _max_records_override and the fetch stops at 50 rows. The other
-           ~340 are not gone; they were never asked for. Three capped runs
-           would retire the registry.
-
-        2. An empty fetch. mpls_vbr took a bare 403 from the City on
-           2026-08-16 and got zero rows back. Zero fetched is never evidence
-           that every building was released.
-
-        3. Mass parse failure. parse() logs and skips a ParseError and
-           parse_feature returns None on a missing PIN, so signals can be
-           far shorter than the fetch with the run still reporting success.
-           Those rows are in the registry and would be counted absent.
-        """
-        if self._max_records_override is not None:
-            return False, "record cap set for this run"
-        if not self._fetched_count:
-            return False, "fetch returned no rows"
-        if parsed < self._fetched_count * self._MIN_PARSE_RATIO:
-            return False, "too many rows dropped in parsing"
-        return True, ""
-
-    def _retire_absent(
-        self,
-        signals: list[VbrListingInsert],
-    ) -> tuple[int, int, int]:
-        """
-        Reconcile the stored registry against this run's complete fetch.
-
-        Rows PRESENT in the fetch have consecutive_misses reset to 0 and
-        is_active restored to True — a building that reappears after a
-        transient miss must come back, or one bad fetch would retire it
-        permanently.
-
-        Rows ABSENT have consecutive_misses incremented, and are retired
-        (is_active = False) once the count reaches _RETIREMENT_THRESHOLD.
-
-        Keyed on (parcel_id, date_entered_registry) to match
-        signals.vacant_registrations_dedup. Scoped to this scraper's own
-        county and city so it can never touch Minneapolis rows.
-
-        Returns:
-            (rows_reset, rows_missed, rows_retired)
-        """
-        seen = {
-            self._reg_key(sig.parcel_id, sig.date_entered_registry)
+    def _seen_keys(self, signals: list[VbrListingInsert]) -> set[tuple]:
+        """Identity of every registration this run actually saw."""
+        return {
+            build_key((sig.parcel_id, sig.date_entered_registry))
             for sig in signals
         }
-
-        stored = (
-            signals_table("vacant_registrations")
-            .select("id,parcel_id,date_entered_registry,consecutive_misses,is_active")
-            .eq("county_code", self.county_code)
-            .eq("city", "Saint Paul")
-            .execute()
-        )
-        rows = stored.data or []
-
-        present_ids: list[int] = []
-        # Absent rows are grouped by their CURRENT miss count so each group can
-        # be written with one bulk update instead of one call per row.
-        absent_by_count: dict[int, list[int]] = {}
-
-        for row in rows:
-            key = self._reg_key(row.get("parcel_id"), row.get("date_entered_registry"))
-            if key in seen:
-                if row.get("consecutive_misses") or not row.get("is_active"):
-                    present_ids.append(row["id"])
-            else:
-                current = row.get("consecutive_misses") or 0
-                absent_by_count.setdefault(current, []).append(row["id"])
-
-        rows_reset = 0
-        rows_missed = 0
-        rows_retired = 0
-
-        for chunk in _chunk_ids(present_ids):
-            signals_table("vacant_registrations").update(
-                {"consecutive_misses": 0, "is_active": True}
-            ).in_("id", chunk).execute()
-            rows_reset += len(chunk)
-
-        for current, ids in absent_by_count.items():
-            new_count = current + 1
-            still_active = new_count < _RETIREMENT_THRESHOLD
-            for chunk in _chunk_ids(ids):
-                signals_table("vacant_registrations").update(
-                    {"consecutive_misses": new_count, "is_active": still_active}
-                ).in_("id", chunk).execute()
-                rows_missed += len(chunk)
-                if not still_active:
-                    rows_retired += len(chunk)
-
-        return rows_reset, rows_missed, rows_retired
 
     # ---- Write ----
 
@@ -569,7 +464,11 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         # already written and correct at this point. It is logged and counted.
         rows_reset = rows_missed = rows_retired = 0
         retire_failed = 0
-        ok, skip_reason = self._snapshot_is_complete(len(signals))
+        ok, skip_reason = snapshot_is_complete(
+            fetched=self._fetched_count,
+            parsed=len(signals),
+            record_cap=self._max_records_override,
+        )
         if not ok:
             logger.warning(
                 "Saint Paul retirement pass SKIPPED — fetch not a complete "
@@ -582,7 +481,18 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             )
         else:
             try:
-                rows_reset, rows_missed, rows_retired = self._retire_absent(signals)
+                rows_reset, rows_missed, rows_retired = reconcile_snapshot(
+                    "signals",
+                    "vacant_registrations",
+                    # Scope must exclude Minneapolis, which shares this table.
+                    scope={
+                        "county_code": self.county_code,
+                        "city": "Saint Paul",
+                    },
+                    key_columns=self._KEY_COLUMNS,
+                    seen_keys=self._seen_keys(signals),
+                    threshold=_RETIREMENT_THRESHOLD,
+                )
             except Exception as exc:
                 retire_failed = 1
                 logger.warning(
