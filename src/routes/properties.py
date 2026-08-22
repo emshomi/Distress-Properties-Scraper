@@ -1188,6 +1188,29 @@ def _extract_probate(raw: dict, row: dict) -> dict[str, Any]:
         "probate_case_number": raw.get("case_number"),
         "probate_representative": pr_name,
         "probate_hearing_date": raw.get("hearing_date"),
+        # ADDED 2026-08-21 for the probate tab in the property list.
+        #
+        # `status` already embeds the decedent in a sentence, but a LIST
+        # needs it as its own sortable, scannable column — an estate is
+        # identified by the person, not by a court file number.
+        "probate_decedent": decedent,
+        # THE MATCH BASIS IS NOT DECORATION.
+        #
+        # Every one of the 63 probate events was linked to its parcel by
+        # 'owner_name_word_match' — the deed says JEFFREY A PEARSON and the
+        # published notice says JEFFREY ALAN PEARSON. That is a NAME
+        # SIMILARITY, not a filing that names the parcel. It is good enough
+        # to surface as a lead and not good enough to assert as fact, and a
+        # column that says "in probate" while hiding how we know is the same
+        # error as quoting an equity spread that omits a senior mortgage.
+        #
+        # Surfaced so the UI can label it. Never suppressed: if a future
+        # source matches on a recorded PID the value will differ, and the
+        # difference is the thing worth seeing.
+        "probate_match_basis": raw.get("match_basis"),
+        # Fillmore publishes a link to the newspaper notice; Olmsted (Column
+        # API) does not. Null is normal, and the row simply omits it.
+        "probate_notice_url": raw.get("notice_url"),
     }
 
 
