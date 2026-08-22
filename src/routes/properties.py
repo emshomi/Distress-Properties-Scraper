@@ -3428,10 +3428,24 @@ async def covered_counties() -> dict[str, Any]:
     # tax-forfeiture redemptions one tab over. Five tabs meant five guesses.
     #
     # NOTE the totals will NOT sum to `count`. Hennepin has 6,488 events but
-    # 5,184 across the five categories — the 1,304 mpls_311 code violations
+    # 5,184 across the categories — the 1,304 mpls_311 code violations
     # belong to no category yet. Reporting an uncategorised count here would
     # send users hunting for a tab that does not exist, so only categorised
     # events appear in this breakdown.
+    #
+    # PROBATE ADDED 2026-08-22, and THE VIEW WENT FIRST. The .select() is a
+    # star, so a new column arrives here automatically — but the dict
+    # comprehension below enumerates its keys literally, so the key had to be
+    # added too or the column would be fetched and dropped one line later.
+    #
+    # The ordering was the whole reason this sat unshipped since 2026-08-19.
+    # signals.county_category_counts had five FILTER clauses and no probate.
+    # Adding the key here first would have made row.get("probate") return
+    # None on every county, `or 0` would have turned that into a confident
+    # ZERO, and Fillmore — which holds 48 probate filings, its largest
+    # category by far — would have advertised none. A missing key degrades to
+    # "no breakdown"; a present key with a false zero is a lie the UI cannot
+    # tell from a fact.
     cat_by_slug: dict[str, dict[str, int]] = {}
     try:
         cats = (
@@ -3446,7 +3460,7 @@ async def covered_counties() -> dict[str, Any]:
             cat_by_slug[cslug] = {
                 k: (row.get(k) or 0)
                 for k in ("foreclosure", "tax_forfeit", "vacant",
-                          "tax_delinquent", "tax_assessment")
+                          "tax_delinquent", "tax_assessment", "probate")
             }
     except Exception as e:
         # Degrade quietly: without this the UI simply keeps its old, less
