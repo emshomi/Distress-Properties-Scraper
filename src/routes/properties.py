@@ -3793,7 +3793,18 @@ async def list_properties(
     _ctx: TierContext = TierResolved,
     category: Optional[str] = Query(
         default=None,
-        pattern="^(foreclosure|tax_forfeit|vacant|tax_delinquent|tax_assessment)$",
+        # `probate` ADDED 2026-08-21. _CATEGORY_FILTERS gained the category on
+        # 2026-08-19 and THIS PATTERN did not, so /properties?category=probate
+        # returned 422 "String should match pattern" — the tab rendered, the
+        # request was rejected, and the table read "Could not load properties".
+        #
+        # A SIXTH registration point for a category, on top of the five the
+        # comment at _CATEGORY_FILTERS already lists. Its own words: "a source
+        # can be half-registered and look fine." So can a category.
+        pattern=(
+            "^(foreclosure|tax_forfeit|vacant|tax_delinquent"
+            "|tax_assessment|probate)$"
+        ),
         description=(
             "Restrict to one signal category. The frontend table "
             "renders different columns per category."
