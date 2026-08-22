@@ -100,6 +100,11 @@ from src.services.event_writer import (
     write_typed_signals_dedup,
 )
 from src.services.parcel_resolver import resolve_parcel
+from src.services.snapshot_reconciler import (
+    build_key,
+    reconcile_snapshot,
+    snapshot_is_complete,
+)
 from src.utils.parcel_id_normalizer import safe_normalize_parcel_id
 from src.utils.logger import logger
 
@@ -206,6 +211,22 @@ def _classify_from_dates(
     return boarded, condemned, label
 
 
+# ----- Retirement threshold for this full-snapshot source -----
+# A registration absent from THIS many consecutive complete fetches is
+# retired (is_active = False). Present rows reset the counter to zero.
+#
+# 3, matching saint_paul_vacant, and for the same reasons. Absent-once is not
+# evidence: THIS scraper took a bare 403 from the City on 2026-08-16 and
+# fetched zero rows, which under a one-miss rule retires all 311 Minneapolis
+# registrations in a single morning. 7 was rejected in the other direction —
+# the source runs daily, so a week of publishing a condemned building the
+# City has released is too long to be wrong.
+#
+# The mechanics live in src/services/snapshot_reconciler.py, proven against
+# the Saint Paul registry on 2026-08-22 across three live runs.
+_RETIREMENT_THRESHOLD: int = 3
+
+
 class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
     """Minneapolis VBR + condemned buildings — City of Minneapolis source."""
 
@@ -226,6 +247,37 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
     # Coordinates come from geometry ONLY — this service has no lat/lng
     # attribute fields. The base class requests outSR=4326.
     return_geometry: ClassVar[bool] = True
+
+    # ---- Fetch (records the row count for the retirement guard) ----
+
+    # Rows the last fetch returned, or None if it has not run. write()
+    # compares this against the PARSED signal count: parse() logs and skips a
+    # ParseError and parse_feature returns None on a missing PIN, so the two
+    # differ whenever rows are dropped — and a dropped row is indistinguishable
+    # from a removed one unless the fetched count is known.
+    _fetched_count: int | None = None
+
+    # Matches signals.vacant_registrations_dedup:
+    #   (county_code, parcel_id, date_entered_registry) NULLS NOT DISTINCT
+    # county_code rides in the scope rather than the key, since every row this
+    # scraper owns carries the same one.
+    _KEY_COLUMNS: ClassVar[tuple[str, ...]] = (
+        "parcel_id",
+        "date_entered_registry",
+    )
+
+    async def fetch(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """Fetch the registry, remembering how many rows came back."""
+        features = await super().fetch(*args, **kwargs)
+        self._fetched_count = len(features)
+        return features
+
+    def _seen_keys(self, signals: list[VbrListingInsert]) -> set[tuple]:
+        """Identity of every registration this run actually saw."""
+        return {
+            build_key((sig.parcel_id, sig.date_entered_registry))
+            for sig in signals
+        }
 
     # ---- Feature parsing ----
 
@@ -504,19 +556,87 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             if (s.raw_data or {}).get("restoration_agreement_date") is not None
         )
 
+        # --- Step 4: Retire rows absent from this complete fetch ---
+        # Only meaningful because where_clause is "1=1". A partial fetch must
+        # never reach this: retiring on incomplete data marks live buildings
+        # inactive, which is worse than carrying a stale row — a stale row is
+        # visibly wrong, a missing row is invisible.
+        #
+        # A failure here must NOT fail the run. The registry data is already
+        # written and correct by this point; only reconciliation is lost.
+        rows_reset = rows_missed = rows_retired = 0
+        retire_failed = 0
+        ok, skip_reason = snapshot_is_complete(
+            fetched=self._fetched_count,
+            parsed=len(signals),
+            record_cap=self._max_records_override,
+        )
+        if not ok:
+            logger.warning(
+                "Minneapolis retirement pass SKIPPED — fetch not a complete "
+                "snapshot; registry rows written normally",
+                source=self.source_name,
+                reason=skip_reason,
+                fetched=self._fetched_count,
+                parsed=len(signals),
+                max_records_override=self._max_records_override,
+            )
+        else:
+            try:
+                rows_reset, rows_missed, rows_retired = reconcile_snapshot(
+                    "signals",
+                    "vacant_registrations",
+                    # Scope must exclude Saint Paul, which shares this table.
+                    scope={
+                        "county_code": self.county_code,
+                        "city": "Minneapolis",
+                    },
+                    key_columns=self._KEY_COLUMNS,
+                    seen_keys=self._seen_keys(signals),
+                    threshold=_RETIREMENT_THRESHOLD,
+                )
+            except Exception as exc:
+                retire_failed = 1
+                logger.warning(
+                    "Minneapolis retirement pass failed; registry rows unaffected",
+                    source=self.source_name,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+
         logger.info(
             "Minneapolis VBR write complete",
             parcels_ok=parcels_ok,
             parcels_failed=parcels_failed,
-            typed_new=new_typed,
+            typed_upserted=new_typed,
             events_new=new_events,
             condemned=condemned_count,
             boarded=boarded_count,
             restoration_agreements=restoration_agreement_count,
-            failed=failed_typed + failed_events + parcels_failed,
+            rows_reset=rows_reset,
+            rows_missed=rows_missed,
+            rows_retired=rows_retired,
+            failed=failed_typed + failed_events + parcels_failed + retire_failed,
         )
 
-        return (new_typed, 0, failed_typed + failed_events + parcels_failed)
+        # COUNTER SEMANTICS CORRECTED 2026-08-22, matching saint_paul_vacant.
+        # This returned (new_typed, 0, failures). new_typed is the LENGTH of
+        # the upserted batch — write_typed_signals_dedup passes
+        # ignore_duplicates=False and PostgREST returns every row it touched,
+        # inserted or updated — so records_new read 311 of 311 on EVERY run.
+        # A registry that gains a handful of buildings a month reported three
+        # hundred new records a day, and nothing could be alerted on it.
+        #
+        # The middle slot is records_updated and was a hardcoded literal 0,
+        # which is why records_updated is 0 for every source in
+        # audit.scraper_runs. new_events — the only genuinely-new count, since
+        # write_events_dedup uses ON CONFLICT DO NOTHING — was computed above
+        # and then discarded.
+        return (
+            new_events,
+            new_typed,
+            failed_typed + failed_events + parcels_failed + retire_failed,
+        )
 
 
 __all__ = ["MplsVacantBuildingScraper"]
