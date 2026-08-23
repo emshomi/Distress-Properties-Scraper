@@ -96,6 +96,23 @@ A retired event keeps its row, its resolved_at and its resolution, and stays
 queryable. Models learn from change. Nothing here deletes anything, and the
 restore pass exists precisely so that a row which reappears comes back rather
 than being stranded.
+
+The reconciled table can record the same pair (2026-08-23). Before that,
+retirement on signals.vacant_registrations wrote a boolean and a counter and
+nothing else: no when, and no why. observed_at was no help, because it
+correctly means LAST SEEN IN THE PUBLISHER'S FEED — the 8 Saint Paul rows
+retired on 2026-08-23 still read 2026-08-16 there, and should. The same
+retirement was therefore fully documented on the event and undocumented on
+the registry.
+
+Pass resolved_column and resolution_column to close that. Both are opt-in, so
+a table lacking the columns is unaffected, and both directions are handled:
+crossing the threshold stamps them, reactivation clears them. The value is
+the SAME timestamp written to the event, so the two rows join exactly.
+
+This matters most for the Minnesota Judicial Branch extracts, where the
+question "when did this record stop being public" is the one that has to be
+answerable.
 """
 
 from __future__ import annotations
@@ -194,6 +211,7 @@ def _project_event_state(
     resolve_keys: set[str],
     restore_keys: set[str],
     resolution: str,
+    stamp: str,
 ) -> tuple[int, int]:
     """Assert the resolved state of the events projected from these rows.
 
@@ -208,6 +226,10 @@ def _project_event_state(
         restore_keys: source_id values whose registry row is now active.
         resolution: value to write, and the only value the restore pass will
             clear.
+        stamp: retirement timestamp for this run. Passed in rather than
+            computed here so the registry row and its projected event carry
+            the IDENTICAL value — that makes a retirement joinable across the
+            two tables instead of matchable only within a time window.
 
     Returns:
         (events_resolved, events_restored) — rows actually changed, not rows
@@ -218,7 +240,6 @@ def _project_event_state(
         exclude rows already in the desired state.
     """
     table = get_client().schema(EVENT_SCHEMA).table(EVENT_TABLE)
-    stamp = datetime.now(timezone.utc).isoformat()
 
     events_resolved = 0
     events_restored = 0
@@ -276,6 +297,8 @@ def reconcile_snapshot(
     event_key_column: str = "parcel_id",
     event_county_column: str = "county_code",
     event_resolution: str = DEFAULT_EVENT_RESOLUTION,
+    resolved_column: str | None = None,
+    resolution_column: str | None = None,
 ) -> tuple[int, int, int, int, int]:
     """
     Reconcile stored rows against the keys a complete fetch actually saw, and
@@ -316,6 +339,14 @@ def reconcile_snapshot(
             be present in `scope` when event_source is set.
         event_resolution: resolution string to write, and the only one the
             restore pass will clear.
+        resolved_column: column on the RECONCILED table that records when a
+            row was retired, or None to record nothing. Opt-in for the same
+            reason event_source is: a table without the column would fail
+            every update, and the caller is the only thing that knows its
+            shape. Passing it also makes the reactivation branch clear the
+            value, so a row that comes back does not keep a retirement date.
+        resolution_column: column on the reconciled table recording WHY, using
+            the same vocabulary as event_resolution.
 
     Returns:
         (rows_reset, rows_missed, rows_retired, events_resolved,
@@ -410,22 +441,47 @@ def reconcile_snapshot(
 
     table = get_client().schema(schema).table(table_name)
 
+    # ONE timestamp for the whole run, shared with the event projection below.
+    # A retirement is a single fact; recording it with two clock reads that
+    # differ by milliseconds makes the registry row and its event look like
+    # separate events to anyone joining them later.
+    stamp = datetime.now(timezone.utc).isoformat()
+
     rows_reset = 0
     rows_retired = 0
 
+    # Reactivation must CLEAR the retirement stamp, not merely flip the
+    # boolean. Otherwise a building that comes back onto the registry is
+    # active while still carrying the date it was retired — a row that
+    # contradicts itself, and the kind of thing that is read as truth years
+    # later because nothing about it looks wrong.
+    reset_payload: dict[str, Any] = {miss_column: 0, active_column: True}
+    if resolved_column is not None:
+        reset_payload[resolved_column] = None
+    if resolution_column is not None:
+        reset_payload[resolution_column] = None
+
     for chunk in _chunk(present_ids):
-        table.update({miss_column: 0, active_column: True}).in_(
-            id_column, chunk
-        ).execute()
+        table.update(reset_payload).in_(id_column, chunk).execute()
         rows_reset += len(chunk)
 
     for current, ids in absent_by_count.items():
         new_count = current + 1
         still_active = new_count < threshold
+        absent_payload: dict[str, Any] = {
+            miss_column: new_count,
+            active_column: still_active,
+        }
+        # Stamped only on the run that CROSSES the threshold. A row on its
+        # first or second miss is still active and has not been retired, so
+        # writing a retirement date there would be false.
+        if not still_active:
+            if resolved_column is not None:
+                absent_payload[resolved_column] = stamp
+            if resolution_column is not None:
+                absent_payload[resolution_column] = event_resolution
         for chunk in _chunk(ids):
-            table.update(
-                {miss_column: new_count, active_column: still_active}
-            ).in_(id_column, chunk).execute()
+            table.update(absent_payload).in_(id_column, chunk).execute()
             if not still_active:
                 rows_retired += len(chunk)
 
@@ -442,6 +498,7 @@ def reconcile_snapshot(
             resolve_keys=resolve_keys,
             restore_keys=restore_keys,
             resolution=event_resolution,
+            stamp=stamp,
         )
 
     logger.info(
