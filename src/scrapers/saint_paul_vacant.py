@@ -531,6 +531,17 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                     # match a registry row, all 400 registry rows match an
                     # event, and no parcel carries two events.
                     event_key_column="parcel_id",
+                    # ADDED 2026-08-23. Before this, retirement on
+                    # signals.vacant_registrations wrote is_active=false and a
+                    # counter and nothing else — no when, no why. observed_at
+                    # is no help and should not be: it correctly means LAST
+                    # SEEN IN THE CITY'S FEED, which for these 8 rows is
+                    # 2026-08-16 and stays 2026-08-16. So the same retirement
+                    # was fully documented on the event and undocumented on
+                    # the registry. The reconciler writes the SAME timestamp
+                    # to both, so the two rows join exactly.
+                    resolved_column="resolved_at",
+                    resolution_column="resolution",
                 )
             except Exception as exc:
                 retire_failed = 1
