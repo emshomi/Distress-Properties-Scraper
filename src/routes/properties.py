@@ -2683,6 +2683,48 @@ def _compute_deal_math(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
         "liens may apply. Not an appraisal."
         % (int(ratio_row["n"]), scope, int(inwin["n"]))
     )
+
+    # ASSESSMENT VINTAGE (2026-08-23). The sentence above describes an
+    # assessment-PRACTICE adjustment: recent sales say this county's
+    # assessor runs a few points under market, so we scale by that. That is
+    # what the ratio means when the assessment is current.
+    #
+    # It is NOT what the ratio means when the assessment is old. Ramsey
+    # publishes EMVYear 2021 on all 163,880 parcels, so scoring.comp_ratios
+    # prices every Ramsey city between 1.147 and 1.414 while every other
+    # county sits between 1.116 and 1.195 - fifteen Ramsey rows holding the
+    # top fifteen positions, with no overlap. Those ratios are five years of
+    # market movement wearing the label "calibrated by recent sales".
+    #
+    # The correction is probably RIGHT - a 2021 assessment scaled by 1.31 is
+    # closer to a 2026 market than the raw 2021 figure. What is wrong is the
+    # justification, and a justification that names the wrong mechanism is
+    # worse than a shorter one: it survives being questioned only until
+    # someone asks why Saint Paul's ratio is 20 points above Minneapolis's.
+    #
+    # Written as a RULE, not a Ramsey special case: any county whose
+    # assessment year trails the calibrating sales by 2+ years gets the
+    # clause, and Ramsey stops getting it the day its assessments refresh -
+    # at which point every Ramsey ratio collapses toward 1.1 and every
+    # valuation moves ~20% in one refresh. That is worth a subscriber having
+    # been told in advance.
+    emv_year = shaped.get("emv_year")
+    try:
+        emv_year_i = int(emv_year) if emv_year is not None else None
+    except (TypeError, ValueError):
+        emv_year_i = None
+    if emv_year_i is not None:
+        # Sales calibrating the ratio are the trailing 12 months, so the gap
+        # is measured against last year rather than today.
+        lag = (_date.today().year - 1) - emv_year_i
+        if lag >= 2:
+            basis += (
+                " NOTE: this county's assessment dates from %d, %d years "
+                "before the sales used to calibrate it, so the adjustment "
+                "spans market movement as well as assessment practice."
+                % (emv_year_i, lag)
+            )
+
     if is_assoc:
         basis = (
             "FORECLOSING PARTY IS A COMMUNITY ASSOCIATION. Under Minn. Stat. "
