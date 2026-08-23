@@ -88,6 +88,10 @@ _EVENT_LABELS = {
     "tax_delinquent": "Tax-delinquent property",
     "tax_assessment": "Tax assessment",
     "vacant": "Vacant/registered building",
+    # ADDED 2026-08-22. Without it the generated free-tier title fell through
+    # to "Distressed property", which tells an anonymous visitor nothing about
+    # what the row is — the one thing the free tier is supposed to convey.
+    "probate_filing": "Probate estate",
 }
 
 
@@ -149,7 +153,24 @@ _VALUE_FIELDS = ("market_value", "amount", "original_principal")
 _LOCATOR_FIELDS = (
     "address", "city", "zip", "owner", "owner_mailing", "tax_parcel_no",
     "parcel_id", "municipality", "neighborhood", "lat", "lng",
-    "decedent", "personal_representative", "case_number", "notice_url",
+    # PROBATE. These are the PAYLOAD keys, which carry a `probate_` prefix —
+    # NOT the column headings ("Decedent", "Court file") and NOT the database
+    # column names. A first attempt on 2026-08-22 listed them unprefixed and
+    # matched nothing at all, so the lock silently did nothing and the names
+    # kept shipping. Verified against a live anonymous payload before landing.
+    "probate_decedent", "probate_representative", "probate_case_number",
+    "probate_notice_url",
+    # source_id and _eff_key both carry the parcel id in plain text on EVERY
+    # category, next to a `parcel_id` that is null and flagged locked:
+    #   probate  source_id "23-PR-25-425:250121010"  (case number + parcel)
+    #   sheriff  source_id "2302821410197-4459268"   (parcel + sale record)
+    #   _eff_key ["fillmore", "250121010"]           (county + parcel)
+    # The lock on parcel_id has therefore never done anything. _eff_key has no
+    # frontend reader at all; source_id survives only as the Premium
+    # Summarize call, which is above this tier and keeps its value. Row keys
+    # moved to `id` first (frontend 2026-08-22) so nulling this cannot collapse
+    # every React key to "<source>-undefined".
+    "source_id", "_eff_key",
 )
 
 # Tier 2 — exact dates are locators too (locked below STANDARD).
@@ -354,6 +375,22 @@ def redact_property(
         if "description" in p:
             p["description"] = _safe_description(p)
             p["description_locked"] = True
+        # `status` is the same hazard as title/description and was missed:
+        # scraper-written free text that bypasses every field-level lock. On
+        # probate it read "Estate of Robert Brogan in probate" — the decedent's
+        # name, in full, to an anonymous visitor, on a row whose owner column
+        # was correctly locked beside it.
+        #
+        # It is NOT simply locked, because on other categories it carries the
+        # relative cues the free tier is built on ("Expiring soon", "Sold").
+        # Instead it is replaced with the category label whenever it names
+        # someone. Only probate is known to embed a name today; the membership
+        # test is on the generated label rather than a name-detection heuristic,
+        # because guessing at what looks like a person's name is how this class
+        # of leak gets half-fixed.
+        if p.get("event_type") == "probate_filing" and p.get("status"):
+            p["status"] = "In probate"
+            p["status_locked"] = True
         for f in _LOCATOR_FIELDS:
             _lock(p, f)
         for f in _DATE_FIELDS:
