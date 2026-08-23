@@ -163,6 +163,47 @@ async def ai_search(
             price_max=f.get("price_max"),
             sale_date_from=f.get("sale_date_from"),
             sale_date_to=f.get("sale_date_to"),
+            # === EVERY PARAMETER MUST BE PASSED (2026-08-22) ===
+            #
+            # These nine were omitted, and omitting them is not the same as
+            # leaving them unset. list_properties is a FastAPI ENDPOINT: its
+            # defaults are Query(...) objects, resolved by the framework only
+            # when the framework dispatches the request. Called as a plain
+            # Python function, every argument not supplied arrives as the
+            # Query object ITSELF.
+            #
+            # What that did, measured live 2026-08-22:
+            #   `if observed_since:`            a Query object is truthy, so
+            #                                   PostgREST received
+            #                                   .gt("observed_at", <Query>)
+            #   `outcome is not None` (x4)      always True, so needs_fetch_all
+            #                                   was always True, and the
+            #                                   outcome/owner_type/absentee/
+            #                                   redeemed predicates then
+            #                                   compared shaped rows against
+            #                                   Query objects.
+            #
+            # Result: EVERY ai search returned zero rows. The proof is the
+            # search that extracted NO filters at all — "probate estates in
+            # Olmsted" read as "Showing all properties (no specific filters
+            # applied)" and still returned nothing, when unfiltered is 9,397
+            # rows. The emptiness came from here, never from the query.
+            #
+            # This is the exact failure already recorded in the working rules:
+            # "Calling FastAPI endpoints as Python functions does not resolve
+            # Query() defaults." Passing all 31 parameters explicitly is what
+            # keeps it fixed — a new parameter added to list_properties and
+            # not added here silently reintroduces it, so PASS EVERY ONE, even
+            # the ones the planner never sets.
+            observed_since=f.get("observed_since"),
+            outcome=f.get("outcome"),
+            redeemed=f.get("redeemed"),
+            max_amount=f.get("max_amount"),
+            lot_sqft_max=f.get("lot_sqft_max"),
+            equity_min=f.get("equity_min"),
+            equity_max=f.get("equity_max"),
+            owner_type=f.get("owner_type"),
+            absentee=f.get("absentee"),
             sort=f.get("sort", "event_date"),
             order=f.get("order", "asc"),
             limit=body.limit,
