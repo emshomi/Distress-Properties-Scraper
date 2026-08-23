@@ -35,17 +35,43 @@ nothing." Taken literally that means beating ratio = 1.0, which is a low bar:
 the statewide median ratio is 1.076 and rises ~2.3%/year, so a constant 1.076
 already beats it.
 
-This script therefore scores against TWO baselines:
+This script therefore scores against THREE baselines:
 
-  1. assessor      - predict ratio = 1.0 (emv_total unadjusted)
-  2. county_median - predict the county's median ratio from the TRAINING
-                     years only. No model, one GROUP BY, and it is the
-                     honest competitor.
+  1. assessor       - predict ratio = 1.0 (emv_total unadjusted)
+  2. county_median  - the county's median ratio from the TRAINING years only
+  3. county_year    - the county's median ratio in the most recent TRAINING
+                      year, which is what a table aware of the drift looks
+                      like
 
-The model ships only if it beats BOTH. §2.3 of the strategy document argues a
-calibrated rate table is itself a prediction and is the stronger product when
-it exposes its sample size — so if county_median wins, that is a real result
-and not a failure.
+The model ships only if it beats ALL THREE.
+
+=== THE v1 RESULT, KEPT BECAUSE IT IS THE POINT ===
+Run 2026-08-23, 141,800 train / 40,220 test:
+
+    assessor (ratio = 1.0)        15.81%
+    county_median                 12.16%   <-- WON
+    lgbm ln(ratio)                12.80%
+
+A one-line GROUP BY beat the gradient booster by 0.64 points. §2.3 of the
+strategy document predicted exactly this — "a calibrated rate IS a
+prediction ... an unexplained 0.73 is the weaker product here" — and the
+measurement agrees. Building the model was still necessary: without it there
+was no evidence the table is a CEILING rather than a floor.
+
+Two v1 defects plausibly explain the gap, and v2 fixes both rather than
+assuming the ceiling is real:
+
+  (a) The county median was not a FEATURE. The model had to rediscover a
+      39-number level shift from a county code and lat/lng, spending capacity
+      on something a GROUP BY already knew. v2 passes it in, so the model
+      starts AT the baseline and only has to improve on it.
+
+  (b) county was passed as cat.codes — a plain integer, implying
+      aitkin < anoka < becker is meaningful ordering. v2 declares it
+      categorical so LightGBM splits on set membership instead.
+
+If v2 still loses, the ceiling is genuine and the rate table is the product.
+That is a real answer, not a failure.
 
 === TEMPORAL VALIDATION, AND WHY THE WINDOW IS THREE YEARS ===
 Train on 2024-2025, test on 2026. Never a random split: it leaks future prices
@@ -80,7 +106,7 @@ import psycopg2
 
 TRAIN_END = date(2026, 1, 1)
 MODEL_NAME = "avm_ratio"
-MODEL_VERSION = "v1"
+MODEL_VERSION = "v2"
 
 # primary_parcel and the emv floor are applied in scoring.avm_training_set;
 # see that view. They are not optional filters — without primary_parcel the
@@ -180,8 +206,23 @@ def main() -> int:
         test_cmed = test["county_code"].map(cmed).fillna(global_med).astype(float).to_numpy()
         base_county = mdape(actual_price, emv * test_cmed)
 
+        # --- Baseline 3: county median in the LAST training year ---
+        # The ratio drifts ~2.3%/year as assessments fall behind a rising
+        # market, so a table that knows the year is a stronger competitor
+        # than one that averages three years together. Uses the most recent
+        # training year only; still no test-period data.
+        last_train_year = int(train["year"].max())
+        recent = train[train["year"] == last_train_year]
+        cmed_recent = recent.groupby("county_code")["sale_to_assessment"].median()
+        recent_global = float(recent["sale_to_assessment"].median())
+        test_cmed_recent = (
+            test["county_code"].map(cmed_recent).fillna(recent_global).astype(float).to_numpy()
+        )
+        base_county_year = mdape(actual_price, emv * test_cmed_recent)
+
         log(f"baseline assessor      (ratio=1.0)      MdAPE {base_assessor:.2f}%")
         log(f"baseline county_median (train medians)  MdAPE {base_county:.2f}%")
+        log(f"baseline county_year   ({last_train_year} medians)     MdAPE {base_county_year:.2f}%")
 
         # --- Model ---
         try:
@@ -190,21 +231,40 @@ def main() -> int:
             log("lightgbm unavailable; install it in the workflow")
             return 2
 
+        # THE BASELINE AS A FEATURE (v2). In v1 the model had to rediscover a
+        # 39-number county level shift from a county code and coordinates,
+        # and lost to the GROUP BY that already knew it. Passing the medians
+        # in means the model starts at the baseline and spends its capacity
+        # on what is left. Both are computed from TRAIN only and mapped onto
+        # both splits, so no test-period information enters.
+        train = train.assign(
+            county_med=train["county_code"].map(cmed).fillna(global_med).astype(float),
+            county_med_recent=train["county_code"].map(cmed_recent).fillna(recent_global).astype(float),
+        )
+        test = test.assign(
+            county_med=test["county_code"].map(cmed).fillna(global_med).astype(float),
+            county_med_recent=test["county_code"].map(cmed_recent).fillna(recent_global).astype(float),
+        )
+
         feats = [
             "t_months", "lat", "lng", "lot_sqft_f",
             "sqft_f", "has_sqft", "year_built_f", "has_year_built",
             "knn_f", "has_knn", "knn_count_f", "homestead_y",
+            "county_med", "county_med_recent",
         ]
         Xtr = train[feats].astype(float)
         Xte = test[feats].astype(float)
-        # County as a categorical rather than lat/lng alone: assessment
-        # practice is set county by county, so the level shift is a county
-        # fact, not a spatial one.
+        # County as a TRUE CATEGORICAL. v1 passed cat.codes as a plain float,
+        # which tells the tree that aitkin < anoka < becker is meaningful
+        # ordering. LightGBM splits a declared categorical on set membership
+        # instead, which is what a county actually is.
         ctr = train["county_code"].astype("category")
-        Xtr = Xtr.assign(county=ctr.cat.codes)
-        Xte = Xte.assign(
-            county=pd.Categorical(test["county_code"], categories=ctr.cat.categories).codes
-        )
+        Xtr["county"] = ctr.cat.codes.astype("int32")
+        Xte["county"] = pd.Categorical(
+            test["county_code"], categories=ctr.cat.categories
+        ).codes.astype("int32")
+        Xtr["county"] = Xtr["county"].astype("category")
+        Xte["county"] = pd.Categorical(Xte["county"], categories=Xtr["county"].cat.categories)
 
         model = LGBMRegressor(
             n_estimators=600,
@@ -215,31 +275,53 @@ def main() -> int:
             colsample_bytree=0.8,
             random_state=42,
         )
-        model.fit(Xtr, train["y"].astype(float))
+        model.fit(
+            Xtr,
+            train["y"].astype(float),
+            categorical_feature=["county"],
+        )
 
         pred_ratio = np.exp(model.predict(Xte))
         model_mdape = mdape(actual_price, emv * pred_ratio)
-        log(f"model  lgbm ln(ratio)                   MdAPE {model_mdape:.2f}%")
+        log(f"model  lgbm ln(ratio) v2                MdAPE {model_mdape:.2f}%")
 
+        # Which features the model actually leaned on. If county_med
+        # dominates, the model is reproducing the table and the honest
+        # answer is to ship the table.
+        imp = sorted(
+            zip(list(Xtr.columns), model.feature_importances_),
+            key=lambda kv: -kv[1],
+        )
+        log("feature importance: " + ", ".join(f"{k}={v}" for k, v in imp))
+
+        best_baseline = min(base_assessor, base_county, base_county_year)
         beats_assessor = model_mdape < base_assessor
         beats_county = model_mdape < base_county
-        verdict = "SHIP" if (beats_assessor and beats_county) else "DO NOT SHIP"
+        beats_county_year = model_mdape < base_county_year
+        ship = beats_assessor and beats_county and beats_county_year
+        verdict = "SHIP" if ship else "DO NOT SHIP"
         log(
             f"verdict: {verdict} "
-            f"(beats assessor={beats_assessor}, beats county_median={beats_county})"
+            f"(assessor={beats_assessor}, county={beats_county}, "
+            f"county_year={beats_county_year}; best baseline {best_baseline:.2f}%)"
         )
 
         metrics = {
             "mdape_model": round(model_mdape, 3),
             "mdape_baseline_assessor": round(base_assessor, 3),
             "mdape_baseline_county_median": round(base_county, 3),
+            "mdape_baseline_county_year": round(base_county_year, 3),
+            "best_baseline": round(best_baseline, 3),
             "train_rows": int(len(train)),
             "test_rows": int(len(test)),
             "counties": int(df.county_code.nunique()),
+            "last_train_year": last_train_year,
             "target": "ln(purchase_amt / emv_total)",
             "features": feats + ["county"],
+            "feature_importance": {k: int(v) for k, v in imp},
             "beats_assessor": bool(beats_assessor),
             "beats_county_median": bool(beats_county),
+            "beats_county_year": bool(beats_county_year),
             "verdict": verdict,
         }
         print(json.dumps(metrics, indent=2))
@@ -263,10 +345,11 @@ def main() -> int:
                     date.today(),
                     len(train),
                     json.dumps(metrics),
-                    bool(beats_assessor and beats_county),
+                    bool(ship),
                     "Target ln(sale_to_assessment). is_active set only when the "
-                    "model beats BOTH the unadjusted assessor and the county "
-                    "median ratio table.",
+                    "model beats ALL THREE baselines: the unadjusted assessor, "
+                    "the county median ratio table, and the county median in "
+                    "the last training year.",
                 ),
             )
         conn.commit()
