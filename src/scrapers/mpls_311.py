@@ -230,6 +230,66 @@ class MplsThreeOneOneScraper(BaseArcGISScraper[CodeViolationInsert]):
             except ValueError:
                 violation_date = None
 
+        # A COMPLETION DATE IN THE FUTURE IS NOT A COMPLETION (2026-08-23).
+        #
+        # where_clause bounds Completed_Date below at _WINDOW_START and not
+        # above, so a mistyped year in the City's own data passes straight
+        # through. Measured: case CE1341491, a VBR Monitoring inspection with
+        # Inspection_Result VO at 1916 JACKSON ST NE, carried
+        # Completed_Date 1798502400000 = 2026-12-29 — four months ahead. Its
+        # Scheduled_Date was 2025-11-09, so the inspection is real and only
+        # the completion year is wrong.
+        #
+        # One row of 1,321, but the damage is out of proportion to the count,
+        # and the WORST part is not the display:
+        #
+        #   * parse() below collapses inspections to one row per case and
+        #     rule 1 is "latest violation_date wins". A future date is ALWAYS
+        #     the latest, so the bad row wins the case and every correctly
+        #     dated inspection on it is DISCARDED IN MEMORY, never written.
+        #     Case CE1341491 holds exactly one row in the database for that
+        #     reason.
+        #   * event_date drives source_max_date, so this source reads as the
+        #     freshest on the platform indefinitely.
+        #   * date-descending is the default sort, so it sits above all 2,023
+        #     other rows in the vacant category.
+        #
+        # Nulling rather than dropping is deliberate, and rule 3 of the
+        # collapse is why: "rows with no date lose to any row that has one".
+        # A nulled row stops being a candidate the moment a real inspection
+        # exists on the same case, and survives only when it is the only
+        # inspection there — which is the honest outcome. 666 live events
+        # across four sources already carry a null event_date, and the view
+        # handles them: redemption_days_left null, redemption_sort_bucket
+        # populated on all 666.
+        #
+        # THE GUARD BELONGS HERE, BEFORE THE COLLAPSE. In parse() the bad row
+        # would already have won.
+        #
+        # Log loudly. One row is a City typo. Fifty next month means
+        # Completed_Date has changed meaning, and this warning naming the case
+        # number is the only way that becomes visible.
+        if violation_date is not None:
+            today = datetime.now(timezone.utc).date()
+            if violation_date > today:
+                logger.warning(
+                    "Minneapolis Completed_Date is in the future — treating "
+                    "the case as undated rather than letting it win the "
+                    "per-case collapse",
+                    source=self.source_name,
+                    case_number=str(case_number).strip(),
+                    inspection_id=attributes.get(
+                        "Violation_Case_Inspection_ID"
+                    ),
+                    completed_date=violation_date.isoformat(),
+                    scheduled_date=arcgis_date_to_date_only(
+                        attributes.get("Scheduled_Date")
+                    ),
+                    inspection_result=result,
+                    today=today.isoformat(),
+                )
+                violation_date = None
+
         return CodeViolationInsert(
             parcel_id=parcel_id,
             county_code=self.county_code,
