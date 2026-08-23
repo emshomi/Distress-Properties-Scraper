@@ -385,8 +385,28 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         # These are five-year-old assessments. In a market that rose over that
         # period the derived equity spread UNDERSTATES equity, which is the
         # safe direction to be wrong, but the vintage has to be surfaced
-        # rather than implied. core.parcels has no emv_year column yet; the
-        # value stays in raw_data until it does.
+        # rather than implied.
+        #
+        # MAPPED 2026-08-23 (core.parcels.emv_year added the same day). It
+        # stopped being optional once scoring.comp_ratios was rebuilt: every
+        # Ramsey city now prices between 1.147 and 1.414 while every other
+        # county sits between 1.116 and 1.195 - fifteen Ramsey rows holding
+        # the top fifteen positions, no overlap. The ratio is measuring five
+        # years of market movement, and the deal-math basis string calls it
+        # "calibrated by recent sales". Without this column nothing can tell
+        # a stale assessment from a low one.
+        #
+        # Parsed with a 4-digit guard rather than _safe_int: EMVTotal arrives
+        # as "262000.0" and EMVYear as "2021" - two formats in one payload,
+        # and a regex written for one silently returns nothing on the other.
+        # That cost a wrong conclusion earlier the same day.
+        raw_emv_year = _safe_str(attributes.get("EMVYear"))
+        emv_year = None
+        if raw_emv_year and len(raw_emv_year) == 4 and raw_emv_year.isdigit():
+            parsed_year = int(raw_emv_year)
+            if 1900 <= parsed_year <= 2100:
+                emv_year = parsed_year
+
         emv_land = _safe_decimal(attributes.get("EMVLand"))
         emv_building = _safe_decimal(attributes.get("EMVBuilding"))
         if (
@@ -417,6 +437,7 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "property_type": property_type,
             "estimated_market_value": mkt_val,
             "emv_total": mkt_val,
+            "emv_year": emv_year,
             "emv_land": emv_land,
             "emv_building": emv_building,
             "sqft": sqft,
@@ -481,6 +502,7 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     # since 2026-07-14 and 2026-08-13; nothing was in the
                     # way except the call site.
                     emv_total=sig.get("emv_total"),
+                    emv_year=sig.get("emv_year"),
                     emv_land=sig.get("emv_land"),
                     emv_building=sig.get("emv_building"),
                     sqft=sig.get("sqft"),
