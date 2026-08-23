@@ -119,9 +119,37 @@ def _safe_description(p: dict[str, Any]) -> str:
 _VALUE_FIELDS = ("market_value", "amount", "original_principal")
 
 # Tier 2 — LOCATOR fields (locked below STANDARD).
+#
+# PROBATE FIELDS ADDED 2026-08-22. The probate category shipped on
+# 2026-08-19/20 (payload fields on _extract_probate, then the tab) and NONE of
+# its fields were ever added here, so `decedent`, `personal_representative`,
+# `case_number` and `notice_url` were serving at EVERY tier — including
+# anonymous. Measured on the live incognito view: a signed-out visitor read
+# "Alan G. Ihde · Rebecca L. Ihde · 55-PR-26-5497" in full, while the
+# foreclosure tab beside it correctly locked every owner name.
+#
+# These are the same KIND of field under different column names:
+#   decedent                — the owner of record; `owner` by another name
+#   personal_representative — the person to contact about the estate
+#   case_number             — the court file, which opens the whole record
+#   notice_url              — a direct link to the published notice, which
+#                             carries the name, the address and the
+#                             representative together. One click past every
+#                             other lock on this list.
+#
+# `match_basis` deliberately stays visible at all tiers: it is the amber
+# "Name match" confidence badge, not a locator, and hiding a caveat while
+# showing what it qualifies is the same error as an equity spread that omits
+# a senior mortgage.
+#
+# THE LESSON, since this is the third instance in one day: this tuple is a
+# hand-written literal and nothing checks it against the payload. Adding a
+# category means adding its fields HERE as well as to the six registration
+# points, or the new fields default to fully public.
 _LOCATOR_FIELDS = (
     "address", "city", "zip", "owner", "owner_mailing", "tax_parcel_no",
     "parcel_id", "municipality", "neighborhood", "lat", "lng",
+    "decedent", "personal_representative", "case_number", "notice_url",
 )
 
 # Tier 2 — exact dates are locators too (locked below STANDARD).
