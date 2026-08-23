@@ -26,8 +26,47 @@ from src.llm.client import call_claude
 # The ALLOWLIST — the only filters Claude may set, mirroring the
 # /properties endpoint exactly. Any key/value outside this is rejected.
 # ------------------------------------------------------------
-_CATEGORIES = {"foreclosure", "tax_forfeit", "vacant", "tax_delinquent", "tax_assessment"}
-_COUNTIES = {"Anoka", "Dakota", "Hennepin", "Ramsey", "Washington", "Scott", "Carver", "Statewide"}
+# === THESE ARE HAND-WRITTEN LITERALS AND NOTHING CHECKS THEM ===
+# _validate does an exact membership test against both sets, so a value the
+# model gets RIGHT is silently dropped if it is missing here. There is no
+# compiler error and no log line — the filter simply does not appear, and the
+# search reads as "Showing all properties (no specific filters applied)".
+#
+# Measured live 2026-08-22: "probate estates in Olmsted" extracted NOTHING.
+# Both terms were correct and both were dropped — probate was absent from
+# _CATEGORIES (it shipped 2026-08-19) and Olmsted from _COUNTIES (which held
+# only the seven metro counties while the product covers 53).
+#
+# WHEN A CATEGORY OR COUNTY LANDS, UPDATE: _CATEGORIES, the category enum in
+# _SYSTEM_PROMPT, its rule line in the prompt, and cat_label in _describe —
+# four places for one category, none of them checked against PropertyCategory.
+_CATEGORIES = {
+    "foreclosure", "tax_forfeit", "vacant", "tax_delinquent",
+    "tax_assessment", "probate",
+}
+
+# Every county /counties returns — i.e. every county we actually hold signals
+# in. Taken verbatim from the live endpoint on 2026-08-22 (53 of Minnesota's
+# 87), NOT from a list of all counties: a county in here that we hold nothing
+# for produces a search that reads correctly and returns zero rows, which is
+# indistinguishable from a broken filter.
+#
+# Spelling matters — the membership test is exact. "St. Louis" carries the
+# period exactly as the endpoint spells it.
+_COUNTIES = {
+    "Aitkin", "Anoka", "Beltrami", "Benton", "Blue Earth", "Carlton",
+    "Carver", "Cass", "Chippewa", "Chisago", "Clay", "Clearwater",
+    "Crow Wing", "Dakota", "Dodge", "Fillmore", "Hennepin", "Houston",
+    "Isanti", "Itasca", "Lac Qui Parle", "Lake", "Le Sueur", "Lyon",
+    "Martin", "McLeod", "Mille Lacs", "Morrison", "Mower", "Olmsted",
+    "Pennington", "Pine", "Pipestone", "Polk", "Pope", "Ramsey",
+    "Red Lake", "Redwood", "Rice", "Rock", "Roseau", "Scott", "Sherburne",
+    "Sibley", "St. Louis", "Stearns", "Steele", "Stevens", "Todd",
+    "Waseca", "Washington", "Wright", "Yellow Medicine",
+    # Not a county. Kept because _validate has always accepted it, but the
+    # prompt never offers it, so the model cannot return it.
+    "Statewide",
+}
 _REDEMPTION = {"in_redemption", "expiring_soon", "expired"}
 _STATUS = {"active", "postponed"}
 _PROPERTY_TYPES = {
@@ -73,8 +112,8 @@ fences.
 
 The JSON may contain ONLY these keys (omit any that don't apply):
 
-- "category": one of ["foreclosure","tax_forfeit","vacant","tax_delinquent","tax_assessment"]
-- "county": one of ["Anoka","Dakota","Hennepin","Ramsey","Washington","Scott","Carver"]
+- "category": one of ["foreclosure","tax_forfeit","vacant","tax_delinquent","tax_assessment","probate"]
+- "county": a Minnesota county name, title-cased, WITHOUT the word "County" (e.g. "Hennepin", "Olmsted", "St. Louis", "Blue Earth", "Lac Qui Parle"). Coverage is statewide, not metro-only — never refuse a county because it is rural.
 - "redemption": one of ["in_redemption","expiring_soon","expired"] (foreclosure redemption window state)
 - "multi_signal": an integer 2 or 3 (2 = on 2+ government lists; 3 = on 3+, "triple distress")
 - "min_amount": a number (minimum dollar amount OWED — the foreclosure debt/bid)
@@ -103,6 +142,7 @@ set "county". (e.g. Minneapolis -> Hennepin, Saint Paul -> Ramsey.)
 - "tax forfeited", "forfeit" -> category=tax_forfeit.
 - "behind on taxes", "tax delinquent" -> category=tax_delinquent.
 - "foreclosure", "sheriff sale", "foreclosed" -> category=foreclosure.
+- "probate", "probate estate", "estate", "deceased owner", "inherited", "died", "heirs" -> category=probate.
 - "built after 2010", "built since 2010", "2010 or newer", "newer than 2010" -> year_built_min=2010 (use the stated year).
 - "built before 1990", "older than 1990", "pre-1990" -> year_built_max=1990 (use the stated year).
 - "built between 1990 and 2010" -> year_built_min=1990 AND year_built_max=2010.
@@ -221,6 +261,10 @@ def _describe(filters: dict[str, Any], notes: list[str]) -> str:
         "vacant": "vacant / condemned properties",
         "tax_delinquent": "tax-delinquent properties",
         "tax_assessment": "special-assessment properties",
+        # ADDED 2026-08-22 with probate. A category missing HERE still filters
+        # correctly but describes itself as the generic "properties", so the
+        # user cannot tell whether their category was understood.
+        "probate": "probate estates",
     }
     parts.append(cat_label.get(filters.get("category", ""), "properties"))
 
