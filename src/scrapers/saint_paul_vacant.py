@@ -462,7 +462,26 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         #
         # A failure here must NOT fail the run — the registry data itself is
         # already written and correct at this point. It is logged and counted.
+        #
+        # EVENT PROJECTION ADDED 2026-08-23. Until today this call retired the
+        # row in signals.vacant_registrations and stopped. Nothing
+        # subscriber-facing reads that table: the API reads
+        # signals.distress_with_parcel, which filters on
+        # signals.distress_events.resolved_at IS NULL.
+        #
+        # The threshold was reached for the first time on 2026-08-23 at 12:15
+        # UTC. All 8 rows flipped to is_active = false exactly as designed —
+        # and all 8 were still served by the API, anonymously, forty-five
+        # minutes later. Verified by GET on each event id: eight SERVED, and
+        # the vacant category total did not move off 2,032. Six of the eight
+        # were Category 2 - Boarded buildings the City had already released.
+        #
+        # Passing event_source makes reconcile_snapshot assert both halves.
+        # The assertion is desired-state, not edge-triggered, so the 8 rows
+        # that had ALREADY flipped are repaired on the next ordinary run
+        # rather than needing a one-off backfill.
         rows_reset = rows_missed = rows_retired = 0
+        events_resolved = events_restored = 0
         retire_failed = 0
         ok, skip_reason = snapshot_is_complete(
             fetched=self._fetched_count,
@@ -481,10 +500,21 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             )
         else:
             try:
-                rows_reset, rows_missed, rows_retired = reconcile_snapshot(
+                (
+                    rows_reset,
+                    rows_missed,
+                    rows_retired,
+                    events_resolved,
+                    events_restored,
+                ) = reconcile_snapshot(
                     "signals",
                     "vacant_registrations",
                     # Scope must exclude Minneapolis, which shares this table.
+                    # It also bounds the event statements: reconcile_snapshot
+                    # raises if county_code is absent from the scope while
+                    # event_source is set, because an event update keyed only
+                    # on source_id could reach another county. Minnesota PINs
+                    # are not globally unique.
                     scope={
                         "county_code": self.county_code,
                         "city": "Saint Paul",
@@ -492,6 +522,15 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                     key_columns=self._KEY_COLUMNS,
                     seen_keys=self._seen_keys(signals),
                     threshold=_RETIREMENT_THRESHOLD,
+                    event_source=self.source_name,
+                    # parse_feature sets registration_number=pid, which
+                    # to_event() carries into distress_events.source_id — so
+                    # the registry's parcel_id IS the event's source_id.
+                    # Measured 2026-08-23 rather than assumed: 400 of 400
+                    # Saint Paul events have source_id = parcel_id, all 400
+                    # match a registry row, all 400 registry rows match an
+                    # event, and no parcel carries two events.
+                    event_key_column="parcel_id",
                 )
             except Exception as exc:
                 retire_failed = 1
@@ -512,6 +551,8 @@ class SaintPaulVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             rows_reset=rows_reset,
             rows_missed=rows_missed,
             rows_retired=rows_retired,
+            events_resolved=events_resolved,
+            events_restored=events_restored,
             failed=failed_typed + failed_events + parcels_failed + retire_failed,
         )
 
