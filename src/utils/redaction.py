@@ -174,7 +174,19 @@ _LOCATOR_FIELDS = (
 )
 
 # Tier 2 — exact dates are locators too (locked below STANDARD).
-_DATE_FIELDS = ("sale_date", "sale_time", "redemption_ends_at", "registered_date")
+_DATE_FIELDS = (
+    "sale_date", "sale_time", "redemption_ends_at", "registered_date",
+    # ADDED 2026-08-22, one round after the other four probate fields — it was
+    # missed because it is the only probate field whose payload key is a DATE
+    # rather than a name, so it sat in a different tuple and survived the sweep.
+    #
+    # A hearing date is not a locator by itself. Combined with the county and
+    # the court it is one: Olmsted probate, Sep 4 2026 pulls the day's calendar
+    # and recovers the decedent, the representative and the address — the exact
+    # three fields locked one tuple above. That is the slow path to the same
+    # place, and the bypass rule exists for the slow paths.
+    "probate_hearing_date",
+)
 
 # Tier 2 — parcel attributes patched from core.parcels (2026-07-09:
 # forfeit-land surfacing — lot size + property-type name). Not strictly
