@@ -350,6 +350,62 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         mkt_val = _safe_decimal(attributes.get("EMVTotal"))
         cleaned_raw = _clean_raw_data(attributes)
 
+        # ASSESSOR FIELDS — ADDED 2026-08-23.
+        #
+        # EMVTotal was read (above) and written to estimated_market_value ONLY.
+        # That is a parallel LEGACY column. signals.distress_with_parcel, the
+        # equity spread on every row of the data page, the Premium deal math
+        # and the AVM's target all read core.parcels.emv_total, which this
+        # loader never wrote.
+        #
+        # Measured 2026-08-23: 163,883 Ramsey parcels, 163,880 carrying
+        # EMVTotal in raw_data, and emv_total populated on 5,877 — 3.6%. So
+        # 96% of a core county showed NO equity spread, from data already in
+        # the row. Same shape in three other counties: hennepin 18,318,
+        # olmsted 2,969, fillmore 93. 179,386 parcels in total.
+        #
+        # EMVLand + EMVBuilding = EMVTotal on 157,903 of 158,006, verified
+        # before writing them. Where the split does not reconcile the parts
+        # are left out rather than written wrong — a total with no breakdown
+        # is honest; a breakdown that does not add up is the exact signature
+        # used to identify the 863 rows where two different assessments had
+        # been mixed.
+        #
+        # LivingAreaSquareFeet is present on 143,556 rows and sqft was
+        # populated on 744. The AI strategy document records interior square
+        # footage at 9% platform-wide and concludes the AVM must be a spatial
+        # model rather than a hedonic one. On this county at least, that 9%
+        # is a MAPPING artefact, not a data gap.
+        #
+        # HomesteadYN carries THREE values — Y, N and P (partial). It is
+        # stored as the county's own text, never coerced to a boolean, which
+        # would silently mislabel every P row.
+        #
+        # ASSESSMENT VINTAGE: EMVYear is 2021 on all 163,880 rows, uniformly.
+        # These are five-year-old assessments. In a market that rose over that
+        # period the derived equity spread UNDERSTATES equity, which is the
+        # safe direction to be wrong, but the vintage has to be surfaced
+        # rather than implied. core.parcels has no emv_year column yet; the
+        # value stays in raw_data until it does.
+        emv_land = _safe_decimal(attributes.get("EMVLand"))
+        emv_building = _safe_decimal(attributes.get("EMVBuilding"))
+        if (
+            emv_land is None
+            or emv_building is None
+            or mkt_val is None
+            or emv_land + emv_building != mkt_val
+        ):
+            emv_land = None
+            emv_building = None
+
+        sqft = _safe_int(attributes.get("LivingAreaSquareFeet"))
+        if sqft is not None and sqft <= 0:
+            sqft = None
+
+        lot_sqft = _safe_int(attributes.get("ParcelSquareFeet"))
+        if lot_sqft is not None and lot_sqft <= 0:
+            lot_sqft = None
+
         return {
             "parcel_id": pid,
             "address": address,
@@ -360,6 +416,20 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "year_built": year_built,
             "property_type": property_type,
             "estimated_market_value": mkt_val,
+            "emv_total": mkt_val,
+            "emv_land": emv_land,
+            "emv_building": emv_building,
+            "sqft": sqft,
+            "lot_sqft": lot_sqft,
+            "annual_tax": _safe_decimal(attributes.get("TotalTax")),
+            "special_assessments": _safe_decimal(
+                attributes.get("SpecialAssessmentDue")
+            ),
+            "homestead_status": _safe_str(attributes.get("HomesteadYN")),
+            "school_district": _safe_str(
+                attributes.get("SchoolDistrictNumber")
+            ),
+            "num_units": _safe_int(attributes.get("LivingUnit")),
             "raw_data": cleaned_raw,
         }
 
@@ -404,6 +474,22 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     year_built=sig.get("year_built"),
                     property_type=sig.get("property_type"),  # type: ignore[arg-type]
                     estimated_market_value=sig.get("estimated_market_value"),
+                    # ADDED 2026-08-23 — see parse_feature. These are the
+                    # columns the view and the UI actually read; the loader
+                    # wrote only the legacy estimated_market_value beside
+                    # them. ParcelUpsert has declared every one of these
+                    # since 2026-07-14 and 2026-08-13; nothing was in the
+                    # way except the call site.
+                    emv_total=sig.get("emv_total"),
+                    emv_land=sig.get("emv_land"),
+                    emv_building=sig.get("emv_building"),
+                    sqft=sig.get("sqft"),
+                    lot_sqft=sig.get("lot_sqft"),
+                    annual_tax=sig.get("annual_tax"),
+                    special_assessments=sig.get("special_assessments"),
+                    homestead_status=sig.get("homestead_status"),
+                    school_district=sig.get("school_district"),
+                    num_units=sig.get("num_units"),
                     raw_data=sig.get("raw_data"),
                     data_sources=[self.source_name],
                     last_observed_at=datetime.now(timezone.utc),
