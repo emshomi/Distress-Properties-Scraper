@@ -178,6 +178,26 @@ class ParcelUpsert(BaseModel):
     emv_total: Decimal | None = Field(default=None, ge=0)
     emv_land: Decimal | None = Field(default=None, ge=0)
     emv_building: Decimal | None = Field(default=None, ge=0)
+    # ADDED 2026-08-23. The ASSESSMENT YEAR the three figures above belong to,
+    # as the county publishes it — not the year we loaded them.
+    #
+    # Why it earns a column rather than living in raw_data: without it nothing
+    # in the platform can tell a stale assessment from a low one, and the
+    # difference is visible to subscribers today. scoring.comp_ratios shows
+    # every Ramsey city between 1.147 and 1.414 while every other county sits
+    # between 1.116 and 1.195 — fifteen Ramsey rows occupying the top fifteen
+    # positions, with no overlap. That is not Saint Paul outperforming
+    # Minneapolis. Ramsey publishes EMVYear 2021 on all 163,880 parcels, so
+    # the ratio is measuring five years of market movement and the deal-math
+    # basis string calls it "calibrated by recent sales".
+    #
+    # It is also fragile in a way a reader would not guess: the day Ramsey
+    # refreshes to 2026 values, every Ramsey ratio collapses toward 1.1 and
+    # every Ramsey valuation moves ~20% overnight with nothing explaining it.
+    #
+    # Range bound rather than free integer: a four-digit year is the only
+    # sane value and 1900/2100 catches a mis-parsed epoch or a swapped field.
+    emv_year: int | None = Field(default=None, ge=1900, le=2100)
     num_units: int | None = Field(default=None, ge=0)
     use_class: str | None = Field(default=None, max_length=200)
     school_district: str | None = Field(default=None, max_length=50)
@@ -310,6 +330,8 @@ class Parcel(BaseModel):
     estimated_market_value: Decimal | None = None
     estimated_equity: Decimal | None = None
     estimated_mortgage_balance: Decimal | None = None
+    emv_total: Decimal | None = None
+    emv_year: int | None = None
     vacancy_status: str | None = None
     raw_data: dict[str, Any] | None = None
     data_sources: list[str] = Field(default_factory=list)
