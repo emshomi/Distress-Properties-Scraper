@@ -564,7 +564,26 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
         #
         # A failure here must NOT fail the run. The registry data is already
         # written and correct by this point; only reconciliation is lost.
+        #
+        # EVENT PROJECTION ADDED 2026-08-23, matching saint_paul_vacant. Until
+        # today this call retired the row in signals.vacant_registrations and
+        # stopped. Nothing subscriber-facing reads that table: the API reads
+        # signals.distress_with_parcel, which filters on
+        # signals.distress_events.resolved_at IS NULL.
+        #
+        # Saint Paul reached the threshold for the first time on 2026-08-23
+        # and proved it: 8 rows flipped to is_active = false exactly as
+        # designed, and all 8 were still served anonymously by the API
+        # forty-five minutes later. Minneapolis has never had an absent row,
+        # so it carried the same latent defect with nothing to reveal it.
+        #
+        # This source has the higher exposure of the two. mpls_vbr took a bare
+        # 403 on 2026-08-16 and fetched zero rows; the guard above is what
+        # stops that morning from retiring all 311 registrations, and now that
+        # retirement withdraws rows from the product rather than writing a
+        # boolean nobody reads, the guard is load-bearing in a way it was not.
         rows_reset = rows_missed = rows_retired = 0
+        events_resolved = events_restored = 0
         retire_failed = 0
         ok, skip_reason = snapshot_is_complete(
             fetched=self._fetched_count,
@@ -583,10 +602,21 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             )
         else:
             try:
-                rows_reset, rows_missed, rows_retired = reconcile_snapshot(
+                (
+                    rows_reset,
+                    rows_missed,
+                    rows_retired,
+                    events_resolved,
+                    events_restored,
+                ) = reconcile_snapshot(
                     "signals",
                     "vacant_registrations",
                     # Scope must exclude Saint Paul, which shares this table.
+                    # It also bounds the event statements: reconcile_snapshot
+                    # raises if county_code is absent from the scope while
+                    # event_source is set, because an event update keyed only
+                    # on source_id could reach another county. Minnesota PINs
+                    # are not globally unique.
                     scope={
                         "county_code": self.county_code,
                         "city": "Minneapolis",
@@ -594,6 +624,17 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                     key_columns=self._KEY_COLUMNS,
                     seen_keys=self._seen_keys(signals),
                     threshold=_RETIREMENT_THRESHOLD,
+                    event_source=self.source_name,
+                    # parse_feature sets registration_number=parcel_id, which
+                    # to_event() carries into distress_events.source_id — so
+                    # the registry's parcel_id IS the event's source_id. That
+                    # holds for the MPLS-VBR-{oid} synthetic too, since the
+                    # same value is written to both columns.
+                    # Measured 2026-08-23 rather than assumed: 311 of 311
+                    # Minneapolis events have source_id = parcel_id, all 311
+                    # match a registry row, all 311 registry rows match an
+                    # event, and no parcel carries two events.
+                    event_key_column="parcel_id",
                 )
             except Exception as exc:
                 retire_failed = 1
@@ -616,6 +657,8 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
             rows_reset=rows_reset,
             rows_missed=rows_missed,
             rows_retired=rows_retired,
+            events_resolved=events_resolved,
+            events_restored=events_restored,
             failed=failed_typed + failed_events + parcels_failed + retire_failed,
         )
 
