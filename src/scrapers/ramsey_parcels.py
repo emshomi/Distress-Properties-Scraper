@@ -226,6 +226,25 @@ _CSZ_RE = re.compile(
 _classify_owner = classify_owner
 
 
+def _parse_ts(value: Any) -> datetime | None:
+    """Parse a PostgREST timestamp, returning None on anything unexpected.
+
+    Never raises: a row whose created_at cannot be read must not fail a
+    163,880-row load, and counting it as an update (the caller's fallback) is
+    the conservative direction — it understates new parcels rather than
+    inventing them.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def _build_owner_row(
     parcel_id: str, county_code: str, attrs: dict[str, Any], now_iso: str
 ) -> dict[str, Any] | None:
@@ -359,8 +378,14 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         if not signals:
             return 0, 0, 0
 
-        now_iso = datetime.now(timezone.utc).isoformat()
+        # One timestamp for the whole call, captured BEFORE any write. Rows
+        # returned with created_at at or after this are inserts — see
+        # _upsert_batch. Taken once rather than per batch so a row inserted
+        # mid-call cannot be missed by a later, later-captured mark.
+        run_started = datetime.now(timezone.utc)
+        now_iso = run_started.isoformat()
         records_new = 0
+        records_updated = 0
         records_failed = 0
         batch: list[dict[str, Any]] = []
         owner_batch: list[dict[str, Any]] = []
@@ -406,8 +431,9 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 owner_batch.append(owner_row)
 
             if len(batch) >= _DB_BATCH_SIZE:
-                n, f = self._upsert_batch(batch)
+                n, u, f = self._upsert_batch(batch, run_started)
                 records_new += n
+                records_updated += u
                 records_failed += f
                 batch = []
             if len(owner_batch) >= _DB_BATCH_SIZE:
@@ -415,17 +441,49 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 owner_batch = []
 
         if batch:
-            n, f = self._upsert_batch(batch)
+            n, u, f = self._upsert_batch(batch, run_started)
             records_new += n
+            records_updated += u
             records_failed += f
         if owner_batch:
             self._upsert_owner_batch(owner_batch)
 
-        return records_new, 0, records_failed
+        return records_new, records_updated, records_failed
 
-    def _upsert_batch(self, batch: list[dict[str, Any]]) -> tuple[int, int]:
+    def _upsert_batch(
+        self,
+        batch: list[dict[str, Any]],
+        run_started: datetime,
+    ) -> tuple[int, int, int]:
+        """Upsert one batch. Returns (inserted, updated, failed).
+
+        === WHY created_at TELLS US WHICH IS WHICH (2026-08-22) ===
+        This returned (written, 0) — the whole batch counted as NEW and
+        records_updated hardcoded to zero. Run 713 therefore reported 163,880
+        new parcels and 0 updated against a table that already held all
+        163,883 rows: not one row was recognised as an update. A refresh of a
+        complete county roll reads identically to a first-ever load, so
+        nothing can be alerted on parcel growth and nobody can tell a working
+        refresh from a duplicate load.
+
+        Same shape as write_typed_signals_dedup and saint_paul_vacant's
+        return before 2026-08-22: PostgREST's upsert returns EVERY row it
+        touched, inserted or updated, so len(result.data) is the batch size
+        and never a count of anything.
+
+        PostgREST does not report which rows were inserted, but the row it
+        hands back does. core.parcels.created_at DEFAULTS to now() and is NOT
+        in the payload (ParcelUpsert sets last_observed_at only, see write()),
+        so it is stamped on INSERT and left alone on UPDATE. A returned row
+        whose created_at falls on or after this run's start is therefore new;
+        everything else already existed. Verified against pg_attrdef before
+        relying on it — a nullable column with no default would make every
+        insert NULL and reproduce the original bug by a different route.
+
+        No extra round trip: the discriminator is already in the response.
+        """
         if not batch:
-            return 0, 0
+            return 0, 0, 0
         try:
             result = (
                 core_table("parcels")
@@ -435,8 +493,21 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 .upsert(batch, on_conflict="county_code,parcel_id")
                 .execute()
             )
-            written = len(result.data) if result.data else len(batch)
-            return written, 0
+            rows = result.data or []
+            if not rows:
+                # No representation returned. The write itself succeeded, so
+                # the rows are not failures — but the split is unknowable, and
+                # calling them all new is the very thing this fix removes.
+                # Report them as updates: on a county roll that is the common
+                # case, so it understates growth rather than inventing it.
+                return 0, len(batch), 0
+
+            inserted = 0
+            for r in rows:
+                created = _parse_ts(r.get("created_at"))
+                if created is not None and created >= run_started:
+                    inserted += 1
+            return inserted, len(rows) - inserted, 0
         except Exception as e:
             logger.warning(
                 "Batch upsert to core.parcels failed",
@@ -444,7 +515,7 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 batch_size=len(batch),
                 error=str(e)[:500],
             )
-            return 0, len(batch)
+            return 0, 0, len(batch)
 
     def _upsert_owner_batch(self, batch: list[dict[str, Any]]) -> None:
         """Upsert owner rows (one current owner per parcel per source).
@@ -537,6 +608,7 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
         total_fetched = 0
         total_new = 0
+        total_updated = 0
         total_failed = 0
         seen_pids: set[str] = set()
         error_message: str | None = None
@@ -590,8 +662,9 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
 
                     # --- WRITE this page immediately ---
                     if page_signals:
-                        n, _u, f = await self.write(page_signals)
+                        n, u, f = await self.write(page_signals)
                         total_new += n
+                        total_updated += u
                         total_failed += f
 
                     # --- Progress logging ---
@@ -644,7 +717,7 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                 status=status,  # type: ignore[arg-type]
                 records_fetched=total_fetched,
                 records_new=total_new,
-                records_updated=0,
+                records_updated=total_updated,
                 records_failed=total_failed,
                 error_message=error_message,
                 duration_seconds=duration,
@@ -678,7 +751,7 @@ class RamseyParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             duration_seconds=duration,
             records_fetched=total_fetched,
             records_new=total_new,
-            records_updated=0,
+            records_updated=total_updated,
             records_failed=total_failed,
             error_message=error_message,
         )
