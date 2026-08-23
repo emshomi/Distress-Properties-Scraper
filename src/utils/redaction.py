@@ -120,7 +120,29 @@ def _safe_description(p: dict[str, Any]) -> str:
 # ------------------------------------------------------------------
 
 # Tier 1 — the sacred VALUE fields (locked below BASIC).
-_VALUE_FIELDS = ("market_value", "amount", "original_principal")
+_VALUE_FIELDS = (
+    "market_value", "amount", "original_principal",
+    # ADDED 2026-08-22, found by listing every non-null field an ANONYMOUS
+    # caller receives per category rather than by re-reading these tuples.
+    # Both are dollar figures that shipped free since their categories landed:
+    #
+    #   special_assessment_due  the assessment OWED. The spec's first lock is
+    #                           "exact equity and amount owed... locked until
+    #                           Basic" — this is an amount owed, and it is the
+    #                           headline number of the whole tax_assessment
+    #                           category. It was the one figure that category
+    #                           exists to sell.
+    #   annual_tax              the annual tax bill. Worse than it looks: with
+    #                           the county's assessment ratio it back-solves to
+    #                           an approximate market value, which is the exact
+    #                           figure market_value sits in this tuple to
+    #                           protect. A locked field is not locked if
+    #                           another field reconstructs it.
+    #
+    # vacancy_years is deliberately NOT here — see the note in _LEVERAGE_FIELDS:
+    # it derives from a public registry date and is a duration, not a value.
+    "annual_tax", "special_assessment_due",
+)
 
 # Tier 2 — LOCATOR fields (locked below STANDARD).
 #
