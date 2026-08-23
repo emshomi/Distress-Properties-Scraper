@@ -635,6 +635,22 @@ class MplsVacantBuildingScraper(BaseArcGISScraper[VbrListingInsert]):
                     # match a registry row, all 311 registry rows match an
                     # event, and no parcel carries two events.
                     event_key_column="parcel_id",
+                    # ADDED 2026-08-23, matching saint_paul_vacant. Before
+                    # this, retirement on signals.vacant_registrations wrote
+                    # is_active=false and a counter and nothing else — no
+                    # when, no why. observed_at is no help and should not be:
+                    # it correctly means LAST SEEN IN THE CITY'S FEED. So a
+                    # retirement was fully documented on the event and
+                    # undocumented on the registry. The reconciler writes the
+                    # SAME timestamp to both, so the two rows join exactly.
+                    #
+                    # Minneapolis has never retired a row, so nothing here has
+                    # ever been exercised. It is in place for the first time
+                    # the City drops a registration rather than being added
+                    # afterwards, which is how the event projection came to be
+                    # missing for three days.
+                    resolved_column="resolved_at",
+                    resolution_column="resolution",
                 )
             except Exception as exc:
                 retire_failed = 1
