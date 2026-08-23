@@ -60,6 +60,31 @@ def equity_band(value: Optional[float]) -> Optional[str]:
     return "low"
 
 
+def _equity_from(
+    market_value: Optional[float],
+    amount_owed: Optional[float],
+) -> Optional[float]:
+    """Equity = assessed value minus the amount owed, or None.
+
+    BOTH are required. A row with an assessment and no debt figure — every
+    vacant registration, every probate notice — has no knowable equity, and
+    None is the honest answer. Returning the market value there is exactly
+    the defect this replaced: it made 'high' mean 'this building is worth
+    something', on rows where nothing is owed at all.
+
+    Mirrors signals.distress_with_parcel.equity_spread, which is
+    `p.emv_total - de.event_value` and is null whenever either side is.
+    Values arrive from PostgREST as strings or Decimals depending on the
+    path, so both are coerced rather than assumed to be floats.
+    """
+    if market_value is None or amount_owed is None:
+        return None
+    try:
+        return float(market_value) - float(amount_owed)
+    except (TypeError, ValueError):
+        return None
+
+
 def redemption_relative(state: Optional[str]) -> Optional[str]:
     """Map an exact redemption_state to a non-locating relative cue.
     'expiring_soon' -> 'ending_soon', 'in_redemption' -> 'active',
@@ -378,7 +403,39 @@ def redact_property(
 
     # ---- Always derive non-locating cues from the (still-present) values,
     #      BEFORE we lock anything, so free/basic keep something informative.
-    equity_source = p.get("market_value")
+    #
+    # === THIS BANDS EQUITY, NOT VALUE (FIXED 2026-08-23) ===
+    # This line read `equity_source = p.get("market_value")`, so the band
+    # answered "is this property assessed above $100,000?" and the label —
+    # and _safe_description's sentence "Estimated equity band: high" — called
+    # the answer EQUITY. Almost every Minnesota property is assessed above
+    # 100k, so almost every row banded "high" and the field carried no
+    # information at all.
+    #
+    # Worse than uninformative: it was WRONG in the direction that matters.
+    # Verified on the live anonymous API 2026-08-23, event 154768 — a Saint
+    # Paul sheriff sale with $382,049.98 owed against a $331,300 assessment,
+    # underwater by $50,749.98 — was published to anonymous visitors as
+    # equity_band=high. Event 154762, genuinely +$341,301, returned the same
+    # string. The band could not tell them apart.
+    #
+    # The thresholds were always equity-shaped (100k / 40k), and
+    # equity_band() already handles both edge cases correctly: v <= 0 returns
+    # None, so an underwater property gets an honest em-dash rather than a
+    # reassuring word, and None returns None, so a row with no debt figure —
+    # a vacant registration, most of the 2,024-row vacant category — says
+    # nothing instead of claiming high equity. Only the SOURCE was wrong.
+    #
+    # This defect was latent until 2026-08-23. Ramsey held emv_total on 3.6%
+    # of its parcels, so market_value was null on most rows and the band was
+    # an honest em-dash by accident. Backfilling 158,006 assessments that
+    # afternoon made every Ramsey row band "high", which is how it surfaced.
+    #
+    # `amount` is the shaped key for signals.distress_events.event_value; the
+    # view computes the same figure as emv_total - event_value. Computed here
+    # rather than read from the view because _shape_property_row does not
+    # carry equity_spread into the payload at all.
+    equity_source = _equity_from(p.get("market_value"), p.get("amount"))
     p.setdefault("equity_band", equity_band(equity_source))
     p.setdefault("redemption_relative", redemption_relative(p.get("redemption_state")))
 
