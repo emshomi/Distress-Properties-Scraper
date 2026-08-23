@@ -1580,7 +1580,7 @@ def _load_parcel_enrichment(county_code: str, parcel_id: str) -> Optional[dict[s
             core_table("parcels")
             .select(
                 "year_built, sqft, lot_sqft, last_sale_price, last_sale_date, "
-                "emv_land, emv_building, emv_total, annual_tax, "
+                "emv_land, emv_building, emv_total, emv_year, annual_tax, "
                 "special_assessments, num_units, use_class, school_district, "
                 "homestead_status, garage, garage_sqft, basement, heating, "
                 "cooling, legal_description, property_type, "
@@ -3041,6 +3041,24 @@ def _shape_property_row(
         "postponement_count": row.get("postponement_count") or 0,
         "prior_sale_dates": row.get("prior_sale_dates"),
         "first_known_sale_date": row.get("first_known_sale_date"),
+        # ADDED 2026-08-23. The ASSESSMENT YEAR behind market_value.
+        #
+        # Emitted HERE, in the common merge, and deliberately not in the
+        # fifteen per-source extractors that each build their own
+        # market_value. Fifteen hand-written copies is the failure mode this
+        # file already records twice; one line here reaches every source, and
+        # `**extracted` merges after it, so a source that genuinely knows its
+        # own vintage can still override.
+        #
+        # Why it is on the payload at all: for 163,880 Ramsey parcels
+        # market_value is a 2021 assessment. scoring.comp_ratios therefore
+        # prices every Ramsey city between 1.147 and 1.414 while every other
+        # county sits between 1.116 and 1.195, and _recompute_deal_math's
+        # basis string calls that "calibrated by recent sales" — describing
+        # an assessment-practice adjustment when what is happening is a
+        # five-year time-shift. A justification that names the wrong
+        # mechanism is worse than a shorter one.
+        "emv_year": row.get("emv_year"),
         **extracted,
         **redemption,
     }
@@ -4108,7 +4126,7 @@ async def list_properties(
                 # tracker key on the same value.
                 "id, source_id, source, parcel_id, event_type, event_date, "
                 "event_value, severity, title, description, raw_data, "
-                "observed_at, year_built, sqft, lot_sqft, emv_total, "
+                "observed_at, year_built, sqft, lot_sqft, emv_total, emv_year, "
                 "property_type, school_district, "
                 # ADDED 2026-08-19. Derived in signals.distress_with_parcel from
                 # signals.distress_event_history via a lateral join on event_id.
