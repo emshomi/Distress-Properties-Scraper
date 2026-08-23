@@ -1,0 +1,48 @@
+# .github/workflows/avm-train.yml
+#
+# AVM training. Offline by design — the strategy document's cross-cutting
+# section requires that nothing in the request path calls a model. This
+# workflow reads scoring.avm_training, fits, scores against two baselines,
+# and writes at most one row to scoring.models. It never writes a prediction
+# anywhere a subscriber can see.
+#
+# DRY_RUN defaults to "1". A run that trains and reports but writes nothing
+# is the normal case; set it to "0" deliberately.
+#
+# Secret name matches the existing cloud workflows (outcome-checker.yml):
+# DATABASE_URL, a direct Postgres connection string. Direct Postgres rather
+# than PostgREST because this pulls 182,020 rows in one query.
+#
+# NOT SCHEDULED. Training is not a cadence job — it runs when the training
+# set changes, and scoring.avm_training is built by hand. Add a schedule
+# only once the table has a refresh job of its own.
+
+name: avm-train
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (1 = train and report, write nothing to scoring.models)"
+        required: false
+        default: "1"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary pandas numpy lightgbm scikit-learn
+
+      - name: Train AVM
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '1' }}
+        run: python ml/train_avm.py
