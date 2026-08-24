@@ -29,8 +29,12 @@
 -- ============================================================
 -- THE BASE RATE
 -- ============================================================
--- 40.9% of resolved sheriff-sale redemption windows end in redemption
--- (92 of 225, measured 2026-08-24). First time this has been measured.
+-- 36.5% of resolved sheriff-sale redemption windows end in redemption
+-- (92 of 252, measured 2026-08-24). First time this has been measured.
+--
+-- Read 40.9% (92 of 225) before the LEFT join fix below. The 27 rows an inner
+-- join dropped are all washington and all foreclosed -- none of them redeemed
+-- -- so excluding them inflated the rate by 4.4 points.
 --
 -- That is the number every bucket below should be read against. A bucket at
 -- 47% is mildly above base; one at 72% is a different situation.
@@ -155,7 +159,24 @@ WITH base AS (
            ELSE '80%+'
          END                                                    AS bid_to_value
   FROM outcomes.redemption_tracker t
-  JOIN core.parcels p
+  -- LEFT join, not inner (fixed 2026-08-24 the same day this view shipped).
+  --
+  -- An inner join silently dropped 27 of 252 resolved rows -- 11% of the
+  -- population -- and pulled the base rate from 36.5% to 40.9%. Every one is
+  -- a washington row keyed 'WASHINGTON-FC-0202821420118': a valid 13-digit
+  -- PIN behind a stub prefix, which outcome_checker.py learned to read
+  -- through on 2026-08-24 but core.parcels joins still cannot.
+  --
+  -- Those rows have a REAL outcome. They belong in the base rate and in the
+  -- county cut. They simply cannot contribute to homestead or bid_to_value,
+  -- which need parcel data, and a LEFT join expresses exactly that: present
+  -- in the population, absent from the cuts that need a parcel.
+  --
+  -- The permanent fix is re-keying those rows to their bare PINs. That is
+  -- destructive and needs its own guard -- 18 of the washington stubs have no
+  -- twin row and would be destroyed by a careless retirement, while 66 have a
+  -- resolved twin and would duplicate. Until then, LEFT join.
+  LEFT JOIN core.parcels p
          ON p.county_code = t.county_code
         AND p.parcel_id   = t.parcel_id
   LEFT JOIN signals.distress_events e ON e.id = t.source_id
@@ -202,13 +223,18 @@ FROM (
 -- ============================================================
 -- VERIFY — a green CREATE is not evidence
 -- ============================================================
--- Expected 2026-08-24:
---   all           225 rows   40.9%
---   county        hennepin 121 (49.6%), dakota 54 (29.6%), washington 50 (32.0%)
---   homestead     homestead 134 (47.0%), non-homestead 81 (33.3%)
+-- Expected 2026-08-24 AFTER the LEFT join fix:
+--   all           252 rows   36.5%   <- was 225 / 40.9% with an inner join
+--   county        hennepin 121 (49.6%), washington 77, dakota 54 (29.6%)
+--   homestead     homestead 140 (45.7%), non-homestead 85 (32.9%)
 --   buyer_type    lender credit-bid 104 (47.1%), third-party buyer 17 (64.7%)
---   bid_to_value  (no bid data) 104, 50-80% 67 (47.8%), 80%+ 29 (34.5%),
---                 under 50% 25 (72.0%)
+--   bid_to_value  50-80% 67 (47.8%), 80%+ 29 (34.5%), under 50% 25 (72.0%)
+--
+-- The 'all' row MUST read 252. If it reads 225 the join reverted to inner and
+-- 27 washington rows with real outcomes are being dropped from the base rate.
+--
+-- washington's county n rises from 50 to 77 for the same reason -- those 27
+-- rows were always washington, they were just invisible.
 --
 --   SELECT now() AS run_at, scope, bucket, n, redeemed, redeem_pct
 --   FROM scoring.redemption_rates ORDER BY scope, n DESC;
