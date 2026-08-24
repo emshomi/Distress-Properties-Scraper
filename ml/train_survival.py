@@ -38,6 +38,45 @@ long from the sale until this resolves" is answering the question a
 subscriber has. days_expiry_to_event is kept as a REPORTING quantity because
 "65 days before the deadline" is how a person thinks about it.
 
+=== LEAKAGE: WHY has_* INDICATORS AND COUNTY TERMS ARE GONE (v2) ===
+v1 scored C-index 0.84 to 0.89 across all four fits and the gate said SHIP.
+The gate was wrong, and it was wrong because it checked the SCORE and not
+what produced it.
+
+Every fit was dominated by MISSING-DATA INDICATORS:
+
+    owner_exit        has_paid_vs_value 0.39, homestead_known 0.36,
+                      homestead_yes 0.35, has_bid_to_value 0.32,
+                      has_year_built 0.28
+    foreclosure_sale  county_washington 0.96 (p=0.0), has_sqft 0.42,
+                      has_paid_vs_value 0.38, homestead_known 0.32
+
+has_paid_vs_value is not a fact about a property. It is "this row has data",
+and DATA AVAILABILITY IS A COUNTY PROXY: finalBidAmount exists only on
+hennepin_sheriff rows, homestead was 99% in ramsey and 1.3% in hennepin until
+2026-08-24, sqft is absent from hennepin entirely. County predicts outcome for
+real -- 49.6% / 29.6% / 20.8% -- so a model that infers county from which
+fields are populated scores well while having learned NOTHING about
+redemption. It learned our data pipeline.
+
+homestead_known (0.36) outranking homestead_yes (0.35) is the tell in one
+line: that homestead is RECORDED predicts more than what it says.
+
+This is the same family as outcome_detected_at -- a variable that correlates
+with the outcome for reasons unrelated to the thing being predicted.
+
+v2 therefore:
+  * drops every has_* indicator from the design matrix
+  * drops the county indicators
+  * imputes missing numerics at the median and says so, rather than letting
+    absence carry signal
+  * reports county as a STRATUM instead, so county-level baseline hazard
+    differences are absorbed without becoming a rankable covariate
+
+If C-index falls to ~0.55 after this, that is the honest answer and the
+Kaplan-Meier curve is the product. It is already publishable: 86.2% of
+windows are still unresolved a year after the sheriff sale, 119 events.
+
 === THREE KINDS OF CENSORING, AND ONE OF THEM IS SUSPICIOUS ===
     pending      2,208   still running, observed to today
     unknown        109   ladder exhausted, observation stopped at EXPIRY
@@ -65,7 +104,7 @@ import pandas as pd
 import psycopg2
 
 MODEL_NAME = "redemption_survival"
-MODEL_VERSION = "v1"
+MODEL_VERSION = "v2"
 
 # A model must beat the marginal curve by this margin in C-index to ship.
 # 0.5 is where a no-covariate baseline sits by construction; anything within
@@ -126,7 +165,23 @@ def build_target(df: pd.DataFrame, target: str) -> pd.DataFrame:
 
 
 def prep_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """Numeric design matrix. Missing indicators, never silent zeros."""
+    """Numeric design matrix. NO missingness indicators, NO county terms.
+
+    Both were in v1 and both leaked. See the module docstring: the top five
+    terms in every fit were has_* flags, and data availability is a county
+    proxy on this platform -- finalBidAmount only exists on hennepin_sheriff
+    rows, homestead was 1.3% in hennepin and 99% in ramsey, sqft is absent
+    from hennepin entirely.
+
+    Missing numerics are imputed at the median WITHOUT a companion flag. That
+    loses information, and losing it is the point: the information being lost
+    is which scraper wrote the row.
+
+    County is passed back separately for use as a STRATUM, not a covariate.
+    Stratifying lets each county have its own baseline hazard -- which is
+    real, 49.6% / 29.6% / 20.8% -- without letting the model rank a window
+    higher merely for being in Hennepin.
+    """
     X = pd.DataFrame(index=df.index)
     X["duration"] = df["duration"].astype(float)
     X["event"] = df["event"].astype(int)
@@ -137,7 +192,6 @@ def prep_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     for col in ("emv_total", "amount_owed", "bid_to_value",
                 "paid_vs_value", "sqft", "lot_sqft", "year_built"):
         v = pd.to_numeric(df[col], errors="coerce")
-        X[f"has_{col}"] = v.notna().astype(int)
         X[col] = v.fillna(v.median() if v.notna().any() else 0.0)
 
     # log the money columns: emv_total spans 100 to 533,960,200 and a linear
@@ -146,20 +200,15 @@ def prep_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         X[f"log_{col}"] = np.log1p(X[col].clip(lower=0))
         X.drop(columns=[col], inplace=True)
 
+    # Real property facts only. A missing homestead reads as non-homestead
+    # rather than as its own category, because "we do not know" is not a
+    # third kind of property -- it is a fact about our loaders.
     X["homestead_yes"] = (df["homestead"] == "homestead").astype(int)
-    X["homestead_known"] = df["homestead"].notna().astype(int)
     X["third_party_buyer"] = (df["buyer_type"] == "third_party_buyer").astype(int)
-    X["buyer_known"] = df["buyer_type"].notna().astype(int)
     X["notice_of_intent"] = df["notice_of_intent"].fillna(False).astype(int)
-    X["notice_known"] = df["notice_of_intent"].notna().astype(int)
-
-    # County as indicators, not a code. hennepin/dakota/washington are the
-    # only counties with resolved outcomes; anything else collapses to a
-    # reference level rather than inventing an ordering.
-    for c in ("hennepin", "dakota", "washington"):
-        X[f"county_{c}"] = (df["county_code"] == c).astype(int)
 
     feats = [c for c in X.columns if c not in ("duration", "event")]
+    X["_county"] = df["county_code"].fillna("(unknown)")
     return X, feats
 
 
@@ -207,15 +256,23 @@ def fit_and_score(X: pd.DataFrame, feats: list[str], label: str) -> dict:
         return {"label": label, "skipped": "too few events in holdout",
                 "holdout_events": int(te["event"].sum())}
 
+    # STRATIFIED BY COUNTY. Each county gets its own baseline hazard, so the
+    # real 49.6% / 29.6% / 20.8% difference is absorbed without county
+    # becoming a rankable covariate. Concordance is then measured on whether
+    # the model orders windows WITHIN a county, which is the question a
+    # subscriber has -- they are already looking at one county.
     cph = CoxPHFitter(penalizer=0.1)
+    strata = ["_county"] if tr["_county"].nunique() > 1 else None
     try:
-        cph.fit(tr[feats + ["duration", "event"]],
-                duration_col="duration", event_col="event")
+        cols = feats + ["duration", "event"] + (["_county"] if strata else [])
+        cph.fit(tr[cols], duration_col="duration", event_col="event",
+                strata=strata)
     except Exception as e:
         return {"label": label, "skipped": f"fit failed: {type(e).__name__}",
                 "error": str(e)[:200]}
 
-    risk = -cph.predict_partial_hazard(te[feats])
+    pred_cols = feats + (["_county"] if strata else [])
+    risk = -cph.predict_partial_hazard(te[pred_cols])
     c = float(concordance_index(te["duration"], risk, te["event"]))
 
     coef = cph.summary[["coef", "p"]].round(4)
@@ -281,9 +338,29 @@ def main() -> int:
                     log(f"{target} [{tag}] SKIPPED: {r.get('skipped')}")
                 results.append(r)
 
-        ship = any(r.get("beats_baseline") for r in results)
+        # === THE GATE CHECKS WHAT PRODUCED THE SCORE, NOT JUST THE SCORE ===
+        # v1 approved four fits at C-index 0.84-0.89 whose top terms were all
+        # missing-data flags. A high number is not evidence on its own; it is
+        # a question about where it came from.
+        #
+        # Any term matching these names means the model is reading our data
+        # pipeline rather than the property. They are removed from the design
+        # matrix in v2, so seeing one here means something reintroduced them.
+        LEAK_PREFIXES = ("has_", "county_", "_known", "known_")
+        leaked = []
+        for r in results:
+            for term in (r.get("significant_terms") or {}):
+                if any(p in term for p in LEAK_PREFIXES):
+                    leaked.append(f"{r.get('label')}:{term}")
+        if leaked:
+            log("LEAK CHECK FAILED — availability terms are significant: "
+                + ", ".join(leaked[:8]))
+
+        ship = any(r.get("beats_baseline") for r in results) and not leaked
         verdict = "SHIP" if ship else "DO NOT SHIP"
         log(f"verdict: {verdict}")
+        if leaked:
+            log("  blocked by the leak check regardless of C-index")
         if not ship:
             log("  the Kaplan-Meier curve is the product; publish it with "
                 "its event count and no model")
@@ -291,6 +368,7 @@ def main() -> int:
         metrics = {
             "targets": results,
             "min_c_index": MIN_C_INDEX,
+            "leak_check_failed": leaked,
             "min_events": MIN_EVENTS,
             "verdict": verdict,
         }
