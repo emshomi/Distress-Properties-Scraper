@@ -104,7 +104,7 @@ import pandas as pd
 import psycopg2
 
 MODEL_NAME = "redemption_survival"
-MODEL_VERSION = "v2"
+MODEL_VERSION = "v3"
 
 # A model must beat the marginal curve by this margin in C-index to ship.
 # 0.5 is where a no-covariate baseline sits by construction; anything within
@@ -275,6 +275,58 @@ def fit_and_score(X: pd.DataFrame, feats: list[str], label: str) -> dict:
     risk = -cph.predict_partial_hazard(te[pred_cols])
     c = float(concordance_index(te["duration"], risk, te["event"]))
 
+    # === IS THE C-INDEX COMING FROM THE COVARIATES OR FROM THE STRATA? ===
+    # v2 scored 0.80 with exactly ONE significant term across all four fits:
+    # homestead_yes. A single binary covariate cannot rank 643 windows that
+    # well. So something else is ordering them, and the candidate is the
+    # stratification itself: concordance pooled across the holdout includes
+    # cross-county pairs, and if county baseline hazards differ sharply --
+    # they do, 49.6% / 29.6% / 20.8% -- the partial-hazard ordering inherits
+    # that separation without county ever being a covariate.
+    #
+    # That would mean v2 MOVED the leak rather than removed it.
+    #
+    # Two controls settle it:
+    #
+    #   c_within_county   concordance computed inside each county and
+    #                     sample-size weighted. This is the number that
+    #                     matters -- a subscriber is looking at one county,
+    #                     so ranking ACROSS counties is not a capability they
+    #                     can use.
+    #
+    #   c_covariate_free  the same fit with NO covariates, strata only. By
+    #                     construction every subject in a stratum gets an
+    #                     identical hazard, so this should be ~0.5. If it
+    #                     comes back high, the strata are doing the work and
+    #                     the covariates are decoration.
+    c_within = None
+    try:
+        num = 0.0
+        den = 0
+        for cty, grp in te.groupby("_county"):
+            if int(grp["event"].sum()) < 5:
+                continue
+            g_risk = -cph.predict_partial_hazard(grp[pred_cols])
+            num += float(concordance_index(
+                grp["duration"], g_risk, grp["event"])) * len(grp)
+            den += len(grp)
+        c_within = round(num / den, 4) if den else None
+    except Exception:
+        c_within = None
+
+    c_free = None
+    if strata:
+        try:
+            cph0 = CoxPHFitter(penalizer=0.1)
+            cph0.fit(tr[["duration", "event", "_county"]],
+                     duration_col="duration", event_col="event",
+                     strata=strata)
+            r0 = -cph0.predict_partial_hazard(te[["_county"]])
+            c_free = round(float(concordance_index(
+                te["duration"], r0, te["event"])), 4)
+        except Exception:
+            c_free = None
+
     coef = cph.summary[["coef", "p"]].round(4)
     strong = coef[coef["p"] < 0.05].sort_values("coef", key=abs,
                                                 ascending=False)
@@ -285,7 +337,15 @@ def fit_and_score(X: pd.DataFrame, feats: list[str], label: str) -> dict:
         "events_train": int(tr["event"].sum()),
         "events_test": int(te["event"].sum()),
         "c_index": round(c, 4),
-        "beats_baseline": bool(c >= MIN_C_INDEX),
+        # The honest headline. Ranking within a county is the capability a
+        # subscriber can use; ranking across counties is the rate table's job
+        # and it already does it with sample sizes attached.
+        "c_index_within_county": c_within,
+        "c_index_covariate_free": c_free,
+        "beats_baseline": bool(
+            c >= MIN_C_INDEX
+            and (c_within is None or c_within >= MIN_C_INDEX)
+        ),
         "significant_terms": {
             k: {"coef": float(v["coef"]), "p": float(v["p"])}
             for k, v in strong.head(8).to_dict("index").items()
@@ -331,7 +391,9 @@ def main() -> int:
                 r["target"] = target
                 r["population"] = tag
                 if "c_index" in r:
-                    log(f"{target} [{tag}] Cox C-index {r['c_index']} "
+                    log(f"{target} [{tag}] Cox C={r['c_index']} "
+                        f"within-county={r.get('c_index_within_county')} "
+                        f"covariate-free={r.get('c_index_covariate_free')} "
                         f"(bar {MIN_C_INDEX}) -> "
                         f"{'BEATS' if r['beats_baseline'] else 'does not beat'}")
                 else:
