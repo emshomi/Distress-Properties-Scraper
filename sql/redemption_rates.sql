@@ -209,16 +209,25 @@ FROM base WHERE buyer_type IS NOT NULL
 GROUP BY buyer_type HAVING count(*) >= 15
 
 UNION ALL
-SELECT 'bid_to_value', bucket, n, redeemed, pct
-FROM (
-  SELECT coalesce(bid_to_value, '(no bid data)') AS bucket,
-         count(*) AS n,
-         count(*) FILTER (WHERE redeemed) AS redeemed,
-         round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1) AS pct
-  FROM base
-  GROUP BY coalesce(bid_to_value, '(no bid data)')
-  HAVING count(*) >= 20
-) b;
+-- NULLS EXCLUDED, not bucketed (fixed 2026-08-24, hours after this view
+-- shipped). This block used to coalesce them into a '(no bid data)' bucket,
+-- which reached 131 rows at 24.4% once the LEFT join admitted washington.
+--
+-- That bucket was a lie in the shape of a statistic. It sits in the
+-- bid_to_value scope and reads on a page as though MISSING INFORMATION
+-- predicted a low redemption rate. It does not. finalBidAmount is a
+-- hennepin_sheriff payload field; dakota_sheriff and washington_sheriff
+-- publish a different set and carry no bid at all. '(no bid data): 24.4%'
+-- means 'not Hennepin', and nothing else.
+--
+-- The three other scopes already do this with WHERE ... IS NOT NULL. This one
+-- is now consistent with them: a property with no bid matches no bid bucket,
+-- and the API's matcher drops the scope entirely for those rows rather than
+-- showing an absence as a finding.
+SELECT 'bid_to_value', bid_to_value, count(*), count(*) FILTER (WHERE redeemed),
+       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1)
+FROM base WHERE bid_to_value IS NOT NULL
+GROUP BY bid_to_value HAVING count(*) >= 20;
 
 -- ============================================================
 -- VERIFY — a green CREATE is not evidence
@@ -229,6 +238,8 @@ FROM (
 --   homestead     homestead 140 (45.7%), non-homestead 85 (32.9%)
 --   buyer_type    lender credit-bid 104 (47.1%), third-party buyer 17 (64.7%)
 --   bid_to_value  50-80% 67 (47.8%), 80%+ 29 (34.5%), under 50% 25 (72.0%)
+--                 THREE buckets, no '(no bid data)' row. If a fourth appears
+--                 the null exclusion reverted.
 --
 -- The 'all' row MUST read 252. If it reads 225 the join reverted to inner and
 -- 27 washington rows with real outcomes are being dropped from the base rate.
@@ -239,5 +250,7 @@ FROM (
 --   SELECT now() AS run_at, scope, bucket, n, redeemed, redeem_pct
 --   FROM scoring.redemption_rates ORDER BY scope, n DESC;
 --
--- After hennepin_parcels lands, the homestead n should rise sharply — that
--- run maps HMSTD_CD1 on 443,614 rows against 5,578 typed today.
+-- hennepin_parcels ran 2026-08-24 12:10 and took homestead from 5,578 to
+-- 427,472 county-wide. The homestead cut here did NOT move: all 121 hennepin
+-- tracker rows already carried a value. The gap was on the other 443,000
+-- parcels nobody had foreclosed on.
