@@ -47,7 +47,14 @@
 --     event                 n      median days vs expiry
 --     owner exit           92      −65   (owner sold, in-window)
 --     foreclosure sale    119     +100   (REO/third-party sale, post-expiry)
---     censored          2,209      —     (window still running)
+--     censored          2,358      —     see below -- NOT one population
+--
+-- The censored 2,358 are three different situations and the view says which:
+--     pending          2,208   window still running, censored at TODAY
+--     unknown            109   ladder exhausted, censored at EXPIRY,
+--                              outcome_ambiguous = true
+--     foreclosed          41   lender holds it, no sale date exists,
+--                              censored at TODAY
 --
 -- These are COMPETING RISKS: a window ends one way or the other, and
 -- observing one censors the other. Fit them separately or use a competing-
@@ -157,7 +164,39 @@ SELECT
   (t.outcome_event_date - t.anchor_date)                 AS days_anchor_to_event,
 
   -- For censored rows: how long we have observed them without an event.
-  (current_date - t.anchor_date)                         AS days_observed,
+  --
+  -- NOT always today. The 109 'unknown' rows have check_stage >= 4 -- the
+  -- ladder is fully exhausted, median 250 days past expiry with nothing
+  -- recorded -- so observation STOPPED at expiry. Censoring them at
+  -- current_date tells a model they are still being watched when they are
+  -- not, and inflates their at-risk time by months.
+  --
+  -- Pending rows really are still observed, so they censor at today.
+  -- 'foreclosed' rows are an REO name match with no date; the lender holds
+  -- it and we are still watching for a sale, so they censor at today too.
+  CASE
+    WHEN t.outcome = 'unknown' THEN t.redemption_expiry_date
+    ELSE current_date
+  END                                                    AS observation_end,
+  (CASE
+     WHEN t.outcome = 'unknown' THEN t.redemption_expiry_date
+     ELSE current_date
+   END - t.anchor_date)                                  AS days_observed,
+
+  -- === EXCLUDE THESE IN A SENSITIVITY CHECK ===
+  -- 'unknown' means: ladder exhausted, no REO match, no post-expiry sale.
+  -- STAGE2_SURVIVAL_FINDINGS records that this pattern "is what a redemption
+  -- looks like from every angle we can observe" -- 82 of 117 had no
+  -- post-expiry deed in eCRV at all.
+  --
+  -- They are CENSORED, not events, because inferring an event from an absence
+  -- is exactly what that document warns against. But censoring them alongside
+  -- genuinely-running windows biases the curve toward foreclosure, because
+  -- the population most likely to have redeemed is the one we cannot confirm.
+  --
+  -- Fit with and without them. If the curves diverge materially, say so in
+  -- the model card rather than picking the flattering one.
+  (t.outcome = 'unknown')                                AS outcome_ambiguous,
 
   -- ---- Survival framing ----
   -- Three states, and they are COMPETING RISKS. 'foreclosed' is censored:
@@ -248,12 +287,17 @@ LEFT JOIN signals.distress_events e ON e.id = t.source_id;
 -- VERIFY — a green CREATE is not evidence
 -- ============================================================
 -- Expected 2026-08-24:
---   total rows            2,461
+--   total rows            2,569
 --   event_type owner_exit        92, median days_expiry_to_event  −65
 --   event_type foreclosure_sale 119, median days_expiry_to_event +100
---   censored                  2,250  (2,209 pending + 41 foreclosed)
---   bid_to_value non-null     1,150  (hennepin only)
---   homestead non-null        ~2,400
+--   censored                  2,358  (2,208 pending + 109 unknown + 41 fc)
+--   outcome_ambiguous true      109
+--   bid_to_value non-null       578  (hennepin only)
+--   homestead non-null          916
+--
+-- 2,569 is the WHOLE tracker: one row in, one row out, verified 2026-08-24 by
+-- checking that neither join can return more than one match. If the count
+-- differs from outcomes.redemption_tracker, a join has started fanning.
 --
 --   SELECT now() AS run_at, event_type, censored, count(*) AS n,
 --          round(percentile_cont(0.5) WITHIN GROUP (
