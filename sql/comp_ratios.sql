@@ -155,6 +155,62 @@ WITH sales AS (
     -- the thousands and survive the clamp below by being clipped, not cut.
     AND p.emv_total >= 10000
     AND (es.purchase_amt / NULLIF(p.emv_total, 0)) BETWEEN 0.4 AND 2.0
+
+  UNION ALL
+
+  -- TAXPIN BRANCH — added 2026-08-24, and it is DEFECT 6.
+  --
+  -- The 2026-08-23 rebuild replaced the hardcoded three-county VALUES list
+  -- with a join to outcomes.ecrv_county_map, and filtered that join to
+  -- join_field = 'parcel_id'. That silently excluded Dakota, whose join_field
+  -- is raw_data->>'TAXPIN' — a full metro county, 167,354 parcels with
+  -- 167,154 assessments, absent from the calibration entirely. Every Dakota
+  -- property was falling through to the statewide metro ratio on the Premium
+  -- deal-math surface.
+  --
+  -- Fixing one hand-written list by introducing a filter that drops a county
+  -- is the same class of error the list itself was. The audit that caught it
+  -- is worth repeating after any change here:
+  --
+  --   SELECT m.county_slug, m.join_field,
+  --          (c.county_code IS NOT NULL) AS in_comp_ratios
+  --   FROM outcomes.ecrv_county_map m
+  --   LEFT JOIN (SELECT DISTINCT county_code FROM scoring.comp_ratios
+  --              WHERE scope = 'county') c ON c.county_code = m.county_slug
+  --   ORDER BY in_comp_ratios, m.county_slug;
+  --
+  -- Measured 2026-08-24: 36 of 57 mapped counties present, and Dakota was the
+  -- ONLY one absent for a join-field reason. The other 20 are absent because
+  -- they have no assessments loaded or fall below the n >= 30 threshold,
+  -- which is correct.
+  --
+  -- Dakota is the only TAXPIN county today. The branch is written against
+  -- join_field rather than against 'dakota' because the column exists
+  -- precisely so the next one costs nothing.
+  --
+  -- eCRV publishes the 12-digit TAX PIN; core.parcels.parcel_id holds the
+  -- 13-digit PLSS GIS PIN. NO ARITHMETIC CONVERTS ONE TO THE OTHER. TAXPIN
+  -- matches parcel_norm directly with no digit normalisation, and
+  -- parcels_dakota_taxpin_idx (partial, WHERE county_code = 'dakota') serves
+  -- it. Measured before writing: 98.5% join, 21,532 with an assessment,
+  -- 19,158 primary-parcel.
+  SELECT p.county_code,
+         lower(regexp_replace(p.city, '^City Of ', '', 'i')) AS city_norm,
+         es.purchase_amt / NULLIF(p.emv_total, 0) AS ratio
+  FROM outcomes.ecrv_sales es
+  JOIN outcomes.ecrv_county_map cm
+         ON cm.county_cde = es.county_cde
+        AND cm.join_field = 'raw_data->>''TAXPIN'''
+  JOIN core.parcels p
+         ON p.county_code = cm.county_slug
+        AND (p.raw_data->>'TAXPIN') = es.parcel_norm
+  WHERE COALESCE(es.non_market_price, false) = false
+    AND COALESCE(es.related_ind, false) = false
+    AND es.primary_parcel = true
+    AND es.deed_date >= (CURRENT_DATE - INTERVAL '1 year')
+    AND es.purchase_amt >= 30000
+    AND p.emv_total >= 10000
+    AND (es.purchase_amt / NULLIF(p.emv_total, 0)) BETWEEN 0.4 AND 2.0
 )
 SELECT 'city'::text AS scope,
        county_code,
@@ -185,9 +241,11 @@ FROM sales;
 -- ============================================================
 -- VERIFY — a green CREATE is not evidence
 -- ============================================================
--- Expected 2026-08-23: city 204 rows, county 36, metro 1 (n = 57,391).
--- A county count of 3 means the ecrv_county_map join did not take and the
--- rebuild silently reverted to the old coverage.
+-- Expected 2026-08-24: city 216 rows, county 37, metro 1 (n = 63,779).
+-- (Before the TAXPIN branch: 204 / 36 / 57,391.)
+-- A county count of 3 means the ecrv_county_map join did not take. A count of
+-- 36 means the TAXPIN branch did not — check the join_field literal, which is
+-- an exact string match against the map.
 --
 --   SELECT now() AS run_at, scope, count(*) AS rows,
 --          min(n) AS min_n, max(n) AS max_n,
