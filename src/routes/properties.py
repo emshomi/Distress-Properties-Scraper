@@ -1936,6 +1936,19 @@ import time as _time_mod
 _DEAL_CALIBRATION_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
 _DEAL_CALIBRATION_TTL_S = 600
 
+# ---------------------------------------------------------------
+# REDEMPTION RATES (scoring.redemption_rates)
+# ---------------------------------------------------------------
+# The first FORWARD-LOOKING number on the platform. Everything else — market
+# value, equity spread, the in-window band — describes what a property IS.
+# This describes what is likely to HAPPEN to it.
+#
+# Twelve rows, so the whole table is cached whole and matched in memory. Same
+# TTL and stale-if-error discipline as the deal calibration above: a rates
+# failure must degrade to no rates, never to a guess.
+_REDEMPTION_RATES_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_REDEMPTION_RATES_TTL_S = 600
+
 
 # ============================================================
 # ASSESSOR OWNERS (core.owners — backfilled 2026-07-08, 163,880 Ramsey
@@ -1979,6 +1992,25 @@ def _recompute_deal_math(shaped_rows: list[dict[str, Any]]) -> None:
         if not isinstance(s.get("market_value"), (int, float)):
             continue
         s["deal_math"] = _compute_deal_math(s)
+
+
+def _apply_redemption_rates(shaped_rows: list[dict[str, Any]]) -> None:
+    """Attach `redemption_rates` to every shaped row that matches a bucket.
+
+    Runs AFTER _recompute_deal_math, because the bid-to-value bucket reads
+    deal_math.payoff_floor. Order matters and is not incidental.
+
+    Separate from _recompute_deal_math rather than folded into its loop: that
+    loop deliberately skips rows which already produced deal math, and rates
+    are wanted on every row regardless.
+
+    Attaches nothing when no bucket matches, so a property outside the three
+    counties with outcome history gets no block rather than an empty one.
+    """
+    for s in shaped_rows:
+        rates = _redemption_rates_for(s)
+        if rates is not None:
+            s["redemption_rates"] = rates
 
 
 def _apply_imagery_flags(shaped_rows: list[dict[str, Any]]) -> None:
@@ -2342,6 +2374,141 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
                 s["owner_type"] = o.get("owner_type")
             if s.get("is_absentee") is None:
                 s["is_absentee"] = o.get("is_absentee")
+
+
+def _load_redemption_rates() -> Optional[list[dict[str, Any]]]:
+    """Load scoring.redemption_rates whole. Twelve rows; cached.
+
+    Same stale-if-error contract as _load_deal_calibration: a failure returns
+    the last good copy, and a cold failure returns None so the caller emits
+    no rates rather than a fabricated one.
+    """
+    now = _time_mod.monotonic()
+    if (
+        _REDEMPTION_RATES_CACHE["data"] is not None
+        and now - _REDEMPTION_RATES_CACHE["at"] < _REDEMPTION_RATES_TTL_S
+    ):
+        return _REDEMPTION_RATES_CACHE["data"]
+    try:
+        rows = _fetch_all_rows_in_schema(
+            scoring_table, "redemption_rates",
+            "scope, bucket, n, redeemed, redeem_pct"
+        )
+    except Exception as e:
+        logger.warning(
+            "redemption rates load failed (rates disabled this request)",
+            error_type=type(e).__name__,
+        )
+        return _REDEMPTION_RATES_CACHE["data"]  # stale-if-error
+    if not rows:
+        return None
+    _REDEMPTION_RATES_CACHE["data"] = rows
+    _REDEMPTION_RATES_CACHE["at"] = now
+    return rows
+
+
+def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Every rate bucket this property matches, with its sample size.
+
+    === WHY ALL MATCHING BUCKETS AND NOT ONE NUMBER ===
+    A Hennepin homesteaded property bought at 45% of assessed value matches
+    three buckets: county 49.6% (n=121), homesteaded 45.7% (n=140), bid under
+    50% 72.0% (n=25). Those are three different numbers for one property and
+    the honest thing is to show all three.
+
+    The alternatives were considered and rejected:
+
+      * Show the strongest cut only. Discards information, needs an arbitrary
+        tie-break, and presents one marginal rate as though it were the
+        answer.
+
+      * Compute the JOINT rate — Hennepin AND homesteaded AND under-50% bid.
+        That is the real answer and it is n<=6. Unpublishable. This is
+        precisely what a model would be for, and precisely why the data
+        cannot support one yet: 225 resolved outcomes do not survive being
+        cut three ways.
+
+    Ordered by sample size descending, so the most reliable figure reads
+    first and the sharpest-but-thinnest reads last with its n visible beside
+    it. "62 comparable properties, 47% redeemed" survives a subscriber asking
+    why; an unexplained single number does not.
+
+    Returns None — not an empty list — when nothing matches, so the caller
+    omits the block entirely rather than rendering an empty panel.
+    """
+    rows = _load_redemption_rates()
+    if not rows:
+        return None
+
+    county = (shaped.get("county") or "").strip().lower().replace(" ", "_")
+    homestead_raw = (shaped.get("homestead_status") or "").strip().upper()
+    if homestead_raw in ("Y", "YES") or homestead_raw.startswith("FULL HOMESTEAD"):
+        homestead = "homestead"
+    elif homestead_raw in ("N", "NO") or homestead_raw.startswith("NON HOMESTEAD"):
+        homestead = "non-homestead"
+    elif homestead_raw in ("P", "FRACTIONAL"):
+        homestead = "partial"
+    else:
+        homestead = None
+
+    # bid_to_value is HENNEPIN-ONLY: finalBidAmount is a hennepin_sheriff
+    # payload field, and dakota/washington publish a different set. Rather
+    # than match those properties to the view's '(no bid data)' bucket — which
+    # would read on a page as though missing data predicted a low rate when
+    # it only means "not Hennepin" — they match no bid bucket at all.
+    bid_bucket = None
+    dm = shaped.get("deal_math") or {}
+    bid = dm.get("payoff_floor")
+    mv = shaped.get("market_value")
+    try:
+        if bid is not None and mv:
+            ratio = float(bid) / float(mv)
+            if ratio < 0.5:
+                bid_bucket = "under 50%"
+            elif ratio < 0.8:
+                bid_bucket = "50-80%"
+            else:
+                bid_bucket = "80%+"
+    except (TypeError, ValueError, ZeroDivisionError):
+        bid_bucket = None
+
+    wanted = [
+        ("county", county),
+        ("homestead", homestead),
+        ("bid_to_value", bid_bucket),
+    ]
+    matched = [
+        {
+            "scope": r["scope"],
+            "bucket": r["bucket"],
+            "n": r["n"],
+            "redeem_pct": float(r["redeem_pct"]),
+        }
+        for r in rows
+        if any(r["scope"] == sc and r["bucket"] == bk for sc, bk in wanted if bk)
+    ]
+    if not matched:
+        return None
+    matched.sort(key=lambda m: -m["n"])
+
+    base = next(
+        (float(r["redeem_pct"]) for r in rows if r["scope"] == "all"), None
+    )
+    base_n = next((r["n"] for r in rows if r["scope"] == "all"), None)
+
+    return {
+        "base_rate_pct": base,
+        "base_n": base_n,
+        "buckets": matched,
+        "basis": (
+            "Observed redemption rates from %s resolved redemption windows. "
+            "Each figure is the share of comparable properties whose owner "
+            "redeemed, with the number of comparables shown. These are "
+            "observed rates, not a prediction for this property, and they "
+            "describe WHETHER an owner redeemed - not when."
+            % (base_n if base_n is not None else "resolved")
+        ),
+    }
 
 
 def _load_deal_calibration() -> Optional[dict[str, Any]]:
@@ -4523,6 +4690,7 @@ async def list_properties(
             # Camera glyph source. Bulk, free, no Google call.
             _apply_imagery_flags(shaped)
             _recompute_deal_math(shaped)
+            _apply_redemption_rates(shaped)
 
             
 
@@ -4651,6 +4819,7 @@ async def list_properties(
         _apply_assessor_owners(_shaped_page)
         _apply_imagery_flags(_shaped_page)
         _recompute_deal_math(_shaped_page)
+        _apply_redemption_rates(_shaped_page)
         return success_envelope({
             "properties": [
                 redact_property(s, tier=_ctx.tier)
@@ -4770,6 +4939,7 @@ async def get_property_by_id(
         )
         _apply_assessor_owners([shaped])
         _recompute_deal_math([shaped])
+        _apply_redemption_rates([shaped])
         shaped["raw"] = raw_data
 
         # The view already computes both halves of the composite key, so take
@@ -4890,6 +5060,7 @@ async def get_property(
         shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map, delq_map)
         _apply_assessor_owners([shaped])
         _recompute_deal_math([shaped])
+        _apply_redemption_rates([shaped])
         shaped["raw"] = rows[0].get("raw_data") or {}
 
         # Attach enriched property characteristics from core.parcels, keyed by
