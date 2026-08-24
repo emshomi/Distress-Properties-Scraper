@@ -1,0 +1,50 @@
+# .github/workflows/survival-train.yml
+#
+# Redemption survival models. Offline by design -- nothing in the request
+# path calls a model, per GOVIRE_AI_PREDICTION_STRATEGY's cross-cutting
+# section. This reads scoring.redemption_features, fits two competing-risk
+# targets, scores each against a no-covariate Kaplan-Meier baseline, and
+# writes at most one row to scoring.models.
+#
+# DRY_RUN defaults to "1". A run that fits and reports but writes nothing is
+# the normal case; set it to "0" deliberately.
+#
+# NOT SCHEDULED, and that is not an oversight. A scheduled retrain silently
+# replaces a working model with a worse one and nobody notices until a
+# subscriber acts on it. Training runs when someone decides the label set has
+# grown enough to matter -- and the label set grows slowly: 211 events today,
+# up from 306 total resolved rows two days ago.
+#
+# lifelines rather than scikit-survival: pure Python, no compiler needed on
+# the runner. Same DATABASE_URL secret as outcome-checker.yml and
+# avm-train.yml.
+
+name: survival-train
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (1 = fit and report, write nothing to scoring.models)"
+        required: false
+        default: "1"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary pandas numpy lifelines
+
+      - name: Train survival models
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '1' }}
+        run: python ml/train_survival.py
