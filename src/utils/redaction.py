@@ -256,6 +256,17 @@ _LEVERAGE_FIELDS = (
     # Deal math (payoff floor / calibrated value / negotiation band) is the
     # sharpest leverage on the platform — premium only.
     "deal_math",
+    # Redemption rates (2026-08-24) — the first FORWARD-LOOKING number on the
+    # platform. Everything else here describes what a property IS; this is
+    # what is likely to HAPPEN to it, from 225 resolved redemption windows.
+    #
+    # Premium by the same reasoning as deal_math, and more so: it cannot be
+    # read off the public record at any level of access. A Standard
+    # subscriber sees every field in the source data and could in principle
+    # reconstruct a market value; nobody can reconstruct "properties bought
+    # at under 50% of assessed value redeem 72% of the time" without the
+    # outcome history behind it.
+    "redemption_rates",
     # Vacancy cost estimates (cumulative VBR fees + PVE exposure) are the
     # motivated-seller leverage for vacant properties — premium only.
     # (vacancy_years itself stays visible: it derives from a public date.)
