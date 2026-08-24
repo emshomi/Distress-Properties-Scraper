@@ -367,6 +367,64 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
         # -- that column's semantics are not changed by this fix.
         emv_total = mkt_val if (mkt_val is not None and mkt_val > 0) else None
 
+        # THREE MORE FIELDS THE PAYLOAD CARRIES AND THIS LOADER DISCARDED
+        # (2026-08-24). The comment above named the symptom in 2026-08-15 --
+        # "no market value, no deal math, no owner mailing, NO HOMESTEAD" --
+        # and only the market value half was fixed.
+        #
+        # Measured before this change:
+        #   HMSTD_CD1   present on 443,614 rows, homestead_status on   5,578 (1.3%)
+        #   SALE_PRICE  present on 443,614 rows, last_sale_price on    4,684 (1.1%)
+        #   SALE_DATE   present on 390,356 rows
+        #
+        # Homestead matters beyond display: it separates the redemption rate
+        # 47.0% homesteaded against 33.3% not (n=134/81 on resolved tracker
+        # rows), and an owner living in the property is a different animal
+        # from an absentee landlord. At 1.3% coverage that cut is measuring
+        # almost nothing on the county that holds half the tracker.
+        #
+        # HMSTD_CD1 is a clean two-state flag: H 328,888 and N 114,726, no
+        # third value. Cross-tabulated against the 5,578 already-typed rows it
+        # agrees on 5,561 and disagrees on 17 (0.3%) -- consistent with a
+        # re-observation between loads, not with an inverted mapping. Anything
+        # that is not exactly H or N becomes NULL rather than a guess.
+        homestead_code = _safe_str(attributes.get("HMSTD_CD1"))
+        homestead_status = None
+        if homestead_code == "H":
+            homestead_status = "Yes"
+        elif homestead_code == "N":
+            homestead_status = "No"
+
+        # ZERO IS A PARSE FAILURE HERE TOO. 54,226 of 443,614 rows carry
+        # SALE_PRICE = 0 -- the same shape as the 18,303 MKT_VAL_TOT zeros the
+        # comment above documents, and for the same reason: the county's feed
+        # returns 0 rather than omitting the field. A $0 last sale price
+        # rendered on a property page is a fabricated fact.
+        sale_price = _safe_decimal(attributes.get("SALE_PRICE"))
+        if sale_price is not None and sale_price <= 0:
+            sale_price = None
+
+        # SALE_DATE IS YYYYMM, NOT A DATE. Six digits, no day: 191111 is
+        # November 1911, 202607 is July 2026. Verified across all 390,356
+        # rows -- every one is six digits, none before 1900, none after 2026,
+        # and zero bad months.
+        #
+        # Stored as the FIRST OF THE MONTH, which is an approximation of up to
+        # 30 days. That is acceptable for a last-sale reference and for the
+        # AVM's temporal features; it is NOT acceptable anywhere a day-level
+        # date is load-bearing, and any consumer needing one must go to
+        # outcomes.ecrv_sales.deed_date instead.
+        #
+        # 134,895 of these are 2020 or later, which is the population with
+        # predictive value.
+        sale_date = None
+        raw_sale_date = _safe_str(attributes.get("SALE_DATE"))
+        if raw_sale_date and len(raw_sale_date) == 6 and raw_sale_date.isdigit():
+            sd_year = int(raw_sale_date[:4])
+            sd_month = int(raw_sale_date[4:])
+            if 1900 <= sd_year <= 2100 and 1 <= sd_month <= 12:
+                sale_date = f"{sd_year:04d}-{sd_month:02d}-01"
+
         return {
             "parcel_id": pid,
             "address": address,
@@ -378,6 +436,9 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
             "property_type": property_type,
             "estimated_market_value": mkt_val,
             "emv_total": emv_total,
+            "homestead_status": homestead_status,
+            "last_sale_price": sale_price,
+            "last_sale_date": sale_date,
             "raw_data": cleaned_raw,
         }
 
@@ -417,6 +478,14 @@ class HennepinParcelsScraper(BaseArcGISScraper[dict[str, Any]]):
                     property_type=sig.get("property_type"),  # type: ignore[arg-type]
                     estimated_market_value=sig.get("estimated_market_value"),
                     emv_total=sig.get("emv_total"),
+                    # ADDED 2026-08-24 alongside the parse_feature mapping.
+                    # Selecting a field in parse_feature is not enough -- this
+                    # call is hand-written, and a field missing here reaches
+                    # the dict and never the database. Same trap the
+                    # emv_total fix hit in 2026-08-15.
+                    homestead_status=sig.get("homestead_status"),
+                    last_sale_price=sig.get("last_sale_price"),
+                    last_sale_date=sig.get("last_sale_date"),
                     raw_data=sig.get("raw_data"),
                     data_sources=[self.source_name],
                     last_observed_at=datetime.now(timezone.utc),
