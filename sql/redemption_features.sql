@@ -213,7 +213,22 @@ SELECT
   END                                                    AS buyer_type,
   (e.raw_data->>'noticeOfIntent')::boolean                AS notice_of_intent,
   e.raw_data->'mortgagors'->0->>'display'                AS mortgagor,
-  e.postponement_count,
+  -- postponement_count is NOT here, and the reason is worth recording so
+  -- nobody adds it back on the strength of the argument alone.
+  --
+  -- It is not a column on signals.distress_events at all -- it is computed
+  -- in signals.distress_with_parcel and in signals.event_postponement_history
+  -- (keyed on event_id, which tracker.source_id points at, so the join would
+  -- be trivial).
+  --
+  -- The MECHANISM is compelling: a postponed sheriff sale is a lender
+  -- agreeing to wait, which usually means a workout in progress, and a
+  -- workout is the most direct precursor to a redemption there is.
+  --
+  -- The DATA is not there. Measured 2026-08-24 across 2,570 tracker rows:
+  -- 84 carry a postponement count and FOUR were ever postponed, max count 1.
+  -- A feature present on four rows teaches a model nothing. Revisit when
+  -- postponements are being captured at volume.
   e.source                                               AS anchor_source
 
 FROM outcomes.redemption_tracker t
