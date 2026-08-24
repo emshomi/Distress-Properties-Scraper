@@ -219,9 +219,30 @@ def next_ladder_date(expiry, today):
 
 
 def decide(cfg, row, attrs, today):
-    """Return (outcome, ambiguous, detection_source, notes, next_check, stage).
+    """Return (outcome, ambiguous, detection_source, notes, next_check, stage,
+    event_date).
 
     outcome is None when the record stays pending.
+
+    === event_date ADDED 2026-08-24 ===
+    WHEN THE OUTCOME HAPPENED, not when we noticed. Written to
+    outcomes.redemption_tracker.outcome_event_date.
+
+    outcome_detected_at is the CHECKER RUN TIME and is useless as a
+    time-to-event target: measured across resolved rows it runs from 177 days
+    BEFORE a redemption window closed to 413 days after, because every
+    resolved row was stamped on a handful of run dates. A survival model
+    trained on it learns the 30/60/90/180-day ladder offsets and nothing else.
+
+    Until today the real date existed only inside detection_notes as English
+    prose, and NO SINGLE REGEX COULD EXTRACT IT — the arcgis notes put the
+    sale date first of two, ecrv_repeat_seller_post_expiry puts a DETECTION
+    date first and the event second, and hand-written notes carry three. That
+    is why it is now returned as a value rather than parsed back out of a
+    sentence.
+
+    None is honest and expected: the REO branches match a lender name in the
+    owner field and have no date attached at all — 41 of 244 resolved rows.
     """
     expiry = row["redemption_expiry_date"]
     src = cfg["check_source"]
@@ -231,9 +252,10 @@ def decide(cfg, row, attrs, today):
         if nxt is None:
             return ("unknown", True, src,
                     "PID not found in county parcels layer after full ladder "
-                    "(possible split/reformat)", None, len(LADDER_OFFSETS))
+                    "(possible split/reformat)", None, len(LADDER_OFFSETS),
+                    None)
         return (None, False, None, "PID not found in this pull", nxt,
-                min(row["check_stage"] + 1, len(LADDER_OFFSETS)))
+                min(row["check_stage"] + 1, len(LADDER_OFFSETS)), None)
 
     owner_values = [attrs.get(f) or "" for f in cfg["owner_fields"]]
     sale_dt = esri_ms_to_date(attrs.get(cfg["sale_date_field"]))
@@ -243,21 +265,23 @@ def decide(cfg, row, attrs, today):
 
     reo_hit = match_reo(owner_values)
     if reo_hit:
+        # No date: an owner-name match says the lender HOLDS it, not when
+        # title moved. All 41 REO rows are undated and that is correct.
         return ("foreclosed", False, src + "_owner_reo_match",
                 "REO/lender pattern '%s' matched owner(s) %s"
                 % (reo_hit, " / ".join("'%s'" % v for v in owner_values)),
-                None, row["check_stage"])
+                None, row["check_stage"], None)
 
     if forfeit in ("Y", "T", "1"):
         return ("foreclosed", True, src + "_forfeit_flag",
                 "Forfeit flag=%s (tax forfeiture path, review)" % forfeit,
-                None, row["check_stage"])
+                None, row["check_stage"], None)
 
     if sale_dt and sale_dt > expiry:
         return ("foreclosed_sold", False, src + "_sale_after_expiry",
                 "County last-sale %s (value %s) is after redemption expiry %s"
                 % (sale_dt, attrs.get(cfg["sale_price_field"]), expiry),
-                None, row["check_stage"])
+                None, row["check_stage"], sale_dt)
 
     if sale_dt and row["anchor_date"] < sale_dt <= expiry:
         # Sale recorded inside the redemption window: could be an
@@ -267,10 +291,10 @@ def decide(cfg, row, attrs, today):
             return ("unknown", True, src + "_sale_in_window",
                     "Sale %s recorded inside redemption window; ladder "
                     "exhausted without REO signal" % sale_dt,
-                    None, len(LADDER_OFFSETS))
+                    None, len(LADDER_OFFSETS), sale_dt)
         return (None, True, None,
                 "Sale %s inside redemption window, re-checking" % sale_dt,
-                nxt, min(row["check_stage"] + 1, len(LADDER_OFFSETS)))
+                nxt, min(row["check_stage"] + 1, len(LADDER_OFFSETS)), sale_dt)
 
     # No signal.
     nxt = next_ladder_date(expiry, today)
@@ -278,9 +302,9 @@ def decide(cfg, row, attrs, today):
         return ("unknown", True, src,
                 "No REO match, no post-expiry sale after full ladder. "
                 "Possible redemption; needs eCRV/recorder confirmation.",
-                None, len(LADDER_OFFSETS))
+                None, len(LADDER_OFFSETS), None)
     return (None, False, None, "No signal yet", nxt,
-            min(row["check_stage"] + 1, len(LADDER_OFFSETS)))
+            min(row["check_stage"] + 1, len(LADDER_OFFSETS)), None)
 
 
 # ---------------------------------------------------------------------------
@@ -452,8 +476,8 @@ def process(conn, dry_run, today):
                 for pid in batch:
                     attrs = attrs_by_pin.get(pid)
                     for row in by_pid[pid]:
-                        outcome, ambiguous, source, notes, nxt, stage = \
-                            decide(cfg, row, attrs, today)
+                        (outcome, ambiguous, source, notes, nxt, stage,
+                         event_date) = decide(cfg, row, attrs, today)
 
                         owner = None
                         reo_hit = None
@@ -487,6 +511,7 @@ def process(conn, dry_run, today):
                                 SET outcome = %s,
                                     ambiguous = %s,
                                     outcome_detected_at = now(),
+                                    outcome_event_date = %s,
                                     detection_source = %s,
                                     detection_notes = %s,
                                     check_stage = %s,
@@ -494,8 +519,8 @@ def process(conn, dry_run, today):
                                     updated_at = now()
                                 WHERE id = %s
                                 """,
-                                (outcome, ambiguous, source, notes, stage,
-                                 row["id"]),
+                                (outcome, ambiguous, event_date, source,
+                                 notes, stage, row["id"]),
                             )
                             stamped[outcome] += 1
                         else:
