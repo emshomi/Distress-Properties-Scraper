@@ -382,13 +382,14 @@ def process(conn, dry_run, today):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, county_code, parcel_id, anchor_date,
-                   redemption_expiry_date, check_stage
+            SELECT id, county_code, parcel_id,
+                   regexp_replace(parcel_id, '\\D', '', 'g') AS pin_norm,
+                   anchor_date, redemption_expiry_date, check_stage
             FROM outcomes.redemption_tracker
             WHERE outcome = 'pending'
               AND next_check_date <= %s
               AND county_code = ANY(%s)
-              AND parcel_id ~ '^[0-9]{13}$'
+              AND regexp_replace(parcel_id, '\\D', '', 'g') ~ '^[0-9]{13}$'
             ORDER BY county_code, redemption_expiry_date
             """,
             (today, list(COUNTY_CONFIG.keys())),
@@ -403,8 +404,29 @@ def process(conn, dry_run, today):
 
     by_county = {}
     for row in due:
+        # GROUP ON pin_norm, NOT parcel_id (2026-08-24).
+        #
+        # The selection above matches on the DIGITS of parcel_id rather than
+        # on the raw string, which admits Washington's PIN-in-stub rows —
+        # 'WASHINGTON-FC-0103221230009' carries a valid 13-digit PIN behind a
+        # prefix. 139 of 156 pending Washington rows are that shape, 57 of
+        # them already past next_check_date, and 18 have no twin row at all,
+        # so today they are the ONLY record of those redemption windows and
+        # nothing can ever resolve them.
+        #
+        # Grouping on the raw value would hand 'WASHINGTON-FC-0103221230009'
+        # to cfg["pin_variants"], whose Washington lambda slices by character
+        # position to build the dotted form — pin[0:2], pin[2:5] and so on.
+        # On a prefixed string that produces 'WA.SHI.NG.TO.N-FC' and the
+        # county layer returns nothing, silently, for every such row.
+        #
+        # by_pid values are LISTS and the loop below iterates all of them, so
+        # two tracker rows normalising to the same PIN are both decided
+        # against the same attributes rather than one overwriting the other.
+        # That was already true; it matters more now that collisions are
+        # possible.
         by_county.setdefault(row["county_code"], {}) \
-                 .setdefault(row["parcel_id"], []).append(row)
+                 .setdefault(row["pin_norm"], []).append(row)
 
     for county, by_pid in by_county.items():
         cfg = COUNTY_CONFIG[county]
