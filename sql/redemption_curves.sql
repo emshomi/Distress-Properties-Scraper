@@ -56,43 +56,68 @@
 -- ============================================================
 -- WHY A CURVE AND NOT THE COX MODEL
 -- ============================================================
--- A Cox proportional-hazards model was built, and it works. Measured
--- 2026-08-25 on a time-ordered holdout, stratified by county:
+-- *** THE REASON RECORDED HERE UNTIL 2026-08-25 EVENING WAS WRONG, AND IT
+-- *** WAS WRONG BECAUSE OF THE STATUTE-MIXING DEFECT ABOVE.
 --
---     target             full C   homestead-only C   the other 9 features
---     owner_exit          0.803        0.742              +0.061
---     foreclosure_sale    0.805        0.761              +0.044
+-- It read: the Cox model scores C=0.803/0.805, but homestead_yes ALONE
+-- scores 0.74-0.76 and every other term is noise, so a per-property hazard
+-- would be "a model-shaped wrapper around a fact scoring.redemption_rates
+-- already publishes". A second argument sat beside it: the model found
+-- homestead significant at p=0.000 while the county curves could not
+-- reproduce a homestead effect in any single county, and that unresolved
+-- disagreement was itself a reason not to ship.
 --
--- It survived every check written to break it. A covariate-free control
--- scored exactly 0.500, so the county strata contribute no ranking.
--- Within-county concordance MATCHED or BEAT the pooled figure -- 0.866
--- against 0.805 for foreclosure_sale -- which is the opposite of what a
--- stratification artefact looks like.
+-- BOTH ARGUMENTS ARE NOW OBSOLETE. Refit 2026-08-25 evening on
+-- sheriff-sale rows only:
 --
--- *** BUT ONE BINARY COVARIATE CARRIES IT. *** homestead_yes alone scores
--- 0.74-0.76. Every other term is noise:
+--                        BEFORE (1,671 rows)   AFTER (1,336 rows)
+--     C-index                 0.803 / 0.805       0.661 / 0.669
+--     within-county                   0.866       0.647 / 0.699
+--     covariate-free                  0.500               0.500
+--     homestead-only            0.742 / 0.761       0.594 / 0.618
+--     homestead p                     0.000       0.121 / 0.331
 --
---     log_amount_owed   p=0.133
---     year_built        p=0.349
---     notice_of_intent  p=0.297, and it FLIPS SIGN between the two targets
---     bid_to_value      p=0.836 / 0.781, coefficient ~0
+-- homestead_yes IS NO LONGER SIGNIFICANT and its solo C-index is BELOW the
+-- 0.60 bar. It does not carry the model, so the first argument is gone.
+--
+-- And the model-versus-curve disagreement did not get RESOLVED -- it
+-- EVAPORATED. The 315 tax-forfeiture rows are overwhelmingly
+-- non-homesteaded parcels that never fail, so including them made
+-- "homesteaded" look predictive of resolution when it was partly
+-- predicting "is this a mortgage foreclosure at all". The county curves
+-- were right and the model's homestead term was partly an artefact.
+--
+-- The 0.83 was never real either. It was 0.803-0.805 inflated by 315 rows
+-- that COULD NOT FAIL and were therefore trivially easy to rank.
+--
+-- === THE REASON NOT TO SHIP, RESTATED HONESTLY ===
+-- The gate says SHIP on all four fits: C 0.66-0.70 against a 0.60 bar, a
+-- covariate-free control at exactly 0.500, and within-county BEATING pooled
+-- for foreclosure_sale (0.699 vs 0.669), which is the opposite of a
+-- stratification artefact. The gate is doing its job.
+--
+-- It still should not ship, and the reason is now WEAKER than the one it
+-- replaces, which is worth saying plainly:
+--
+--   * ONE weakly significant term across 109 events. log_amount_owed at
+--     p=0.029/0.040 for owner_exit, coefficient +0.148 -- larger debt,
+--     faster owner exit. NOTHING is significant for foreclosure_sale.
+--   * C=0.66 is nearer a coin than the 0.83 that was previously on the
+--     table, and that 0.83 was itself inflated.
+--   * The curve publishes 33.0% of 1,336 with its n attached. A
+--     per-property hazard would assert an ordering built on one covariate
+--     at p=0.03. Those are not the same class of claim.
 --
 -- bid_to_value deserves a note, because it is the strongest cut in
--- scoring.redemption_rates. It contributes NOTHING here. Either it is
--- collinear with a term already in the fit, or that gradient was a Hennepin
--- subset effect that vanishes once county is stratified out. It separates as
--- a marginal rate and does not rank windows.
+-- scoring.redemption_rates and contributes NOTHING here -- p=0.899/0.883,
+-- coefficient ~0. Either collinear with a term already in the fit, or that
+-- gradient is a marginal-rate effect that does not RANK windows.
 --
--- 2026-08-25 EVENING UPDATE: the bid_to_value gradient is now STEEPER and
--- better populated than when that was written, and it survives excluding
--- every inferred outcome -- 64.3% (n=28) / 49.3% (n=67) / 21.3% (n=47) on
--- confirmed rows only. That is new evidence on the disagreement, not a
--- resolution of it. The Cox p-value has not been re-measured on the larger
--- label set.
---
--- A per-property hazard whose ordering is 92% "is this owner-occupied" would
--- be a model-shaped wrapper around a fact scoring.redemption_rates already
--- publishes with its sample size attached. The honest product is the curve.
+-- Its gradient is now steeper and better populated than when that was first
+-- written, and survives excluding every inferred outcome: 64.3% (n=28) /
+-- 49.3% (n=67) / 21.3% (n=47) on confirmed rows only. So a real cut in the
+-- rate table still fails to rank in the hazard model. THAT disagreement is
+-- unresolved and outlived the homestead one.
 --
 -- The Cox fit stays in ml/train_survival.py, gated. It is the evidence that
 -- the curve is a ceiling, not a floor -- the same role ml/train_avm.py plays
