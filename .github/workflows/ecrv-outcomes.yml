@@ -1,0 +1,73 @@
+name: eCRV Outcome Detection
+# MANUAL FOR NOW. Once a real run has been seen end to end, the intended
+# home is a step in eCRV Ingest, alongside the AVM rebuild, so outcomes are
+# detected whenever new sales land.
+#
+# === WHY THIS EXISTS ===
+# The eCRV outcome logic existed in NO FILE. 140 tracker rows carry ecrv_*
+# detection sources; measured 2026-08-25 they were written across 17
+# DISTINCT MINUTES over seven weeks, two of the five sources entirely
+# within a single minute. That is a person running statements in an editor.
+#
+# It matters more than the other unautomated writers found the same day
+# because it is THE ONLY SOURCE OF redeemed_by_owner -- 90 of the tracker's
+# 108 redemptions. outcome_checker.py structurally cannot infer redemption;
+# its docstring says negative-inference 'redeemed' needs eCRV or recorder
+# confirmation.
+#
+# Last run 2026-08-17. Two eCRV ingests landed after it. On 2026-08-25
+# there were 45 pending tracker rows with an arms-length sale inside their
+# redemption window and no outcome, so the published Premium figure --
+# "36.5% redeemed, 252 outcomes" -- had a frozen numerator and a growing
+# denominator. The rate was biased LOW.
+#
+# === SAFE TO RUN ===
+# Writes only to rows still outcome='pending' and not superseded, and
+# re-asserts every guard inside the UPDATE. dry_run prints the decision for
+# every candidate and writes nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print decisions but do NOT write (1 = dry run)'
+        required: true
+        default: '1'
+      source_file:
+        description: 'eCRV extract that triggered this (optional, for the log)'
+        required: false
+        default: ''
+jobs:
+  detect:
+    name: Detect eCRV outcomes
+    runs-on: ubuntu-latest
+    # One indexed join over ecrv_sales and the tracker, then one UPDATE per
+    # matched row. Seconds, not minutes -- 20 is generous and still fails
+    # rather than hanging if the join plan degrades.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Detect eCRV outcomes
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "1" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ -n "${{ inputs.source_file }}" ]; then
+            ARGS="$ARGS --source-file ${{ inputs.source_file }}"
+          fi
+          echo "[workflow] python -m outcome_capture.ecrv_outcome_detector $ARGS"
+          python -m outcome_capture.ecrv_outcome_detector $ARGS
