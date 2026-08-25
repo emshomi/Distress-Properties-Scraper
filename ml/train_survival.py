@@ -90,6 +90,70 @@ windows biases the owner_exit curve DOWN.
 
 Every fit therefore runs twice, with and without them. If the curves diverge
 materially that is reported, not smoothed over.
+
+=== 2026-08-25 EVENING: v4 REFIT ON SHERIFF SALES ONLY, AND WHAT IT KILLED
+
+The QUERY below gained `WHERE anchor_type = 'sheriff_sale'`. The reason and
+the arithmetic are documented there. This note records what the refit did to
+the CONCLUSIONS, because two of them were wrong and one file still carried
+them as settled.
+
+                       BEFORE (1,671 rows)   AFTER (1,336 rows)
+    C-index                 0.803 / 0.805       0.661 / 0.669
+    within-county                   0.866       0.647 / 0.699
+    covariate-free                  0.500               0.500
+    homestead-only            0.742 / 0.761       0.594 / 0.618
+    homestead p                     0.000       0.121 / 0.331
+
+*** homestead_yes IS NO LONGER SIGNIFICANT. *** Its solo C-index is now
+BELOW the 0.60 bar. The standing argument against shipping -- "one binary
+covariate carries the whole model" -- does not hold on this population.
+
+*** AND THE MODEL-VERSUS-CURVE DISAGREEMENT EVAPORATED RATHER THAN
+RESOLVING. *** sql/redemption_curves.sql recorded that this model found
+homestead significant at p=0.000 while the county curves could not reproduce
+a homestead effect in any single county, and treated that contradiction as
+itself a reason not to ship.
+
+The 315 tax_judgment_sale rows are overwhelmingly non-homesteaded parcels
+that never fail. Including them made "homesteaded" look predictive of
+resolution when it was partly predicting "is this a mortgage foreclosure at
+all". THE CURVES WERE RIGHT AND THIS MODEL'S HOMESTEAD TERM WAS PARTLY AN
+ARTEFACT.
+
+The 0.83 was never real either -- 0.803-0.805 inflated by 315 rows that
+COULD NOT FAIL and were therefore trivially easy to rank. A C-index drop
+after this filter is not the model getting worse; it is the model losing
+free pairs.
+
+=== WHAT SURVIVES, AND WHY IT STILL DOES NOT SHIP ===
+The gate says SHIP on all four fits: C 0.66-0.70 against a 0.60 bar,
+covariate-free at exactly 0.500, and within-county BEATING pooled for
+foreclosure_sale (0.699 vs 0.669) -- the opposite of a stratification
+artefact. The gate is working.
+
+The reason to withhold is now WEAKER than the one it replaces, and that is
+worth stating rather than dressing up:
+
+  * ONE weakly significant term across 109 events. log_amount_owed at
+    p=0.029/0.040 for owner_exit, coefficient +0.148 -- larger debt, faster
+    owner exit. NOTHING is significant for foreclosure_sale.
+  * C=0.66 is nearer a coin than the 0.83 previously on the table, and that
+    0.83 was itself inflated.
+  * scoring.redemption_curves publishes 33.0% of 1,336 with its n attached.
+    A per-property hazard would assert an ordering built on one covariate at
+    p=0.03. Not the same class of claim.
+
+bid_to_value remains the live disagreement and OUTLIVED the homestead one:
+strongest cut in scoring.redemption_rates -- 64.3% / 49.3% / 21.3% on
+confirmed rows only -- and p=0.899/0.883 with a coefficient near zero here.
+A real marginal rate that does not RANK windows. Unexplained.
+
+=== THE LIFELINES CROSS-CHECK IS RESTORED ===
+This script and the SQL view agree to four decimals at 365 days on the NEW
+population: owner_exit 0.8504, foreclosure_sale 0.6697. Two independent
+implementations agreeing is the strongest check available here, and it now
+holds on the corrected data rather than only on the old.
 """
 
 from __future__ import annotations
