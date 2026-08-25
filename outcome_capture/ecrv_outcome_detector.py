@@ -126,10 +126,70 @@ LENDER_RX = (
 REDEMPTION_DEEDS = ("WARRNTY", "SPECWARNTY", "PERREPDEED", "PROBATE",
                     "CONFORDEED", "TRUSTEE")
 
-# The core join. One row per tracker: DISTINCT ON takes the earliest
-# window the sale could have resolved.
+# Sellers appearing on this many DISTINCT tracked foreclosures are
+# certificate holders, not owners who redeemed.
+#
+# MEASURED 2026-08-25 rather than assumed. At 3+ distinct trackers, EVERY
+# seller in the whole eCRV-to-tracker join is corporate, a trust or a
+# lender: Realty Pros 8, Alabama 2 8, Federal Home Loan Mortgage 8,
+# PA Hagen Legacy Trust 5, US Bank 5, Creative Real Estate 4, Mongoose 4,
+# Freedom Mortgage 4, Blackstone 1 3, Slate 3, Mana Holdings 3, Pinewood 3,
+# Renovo 3, Wings Financial 3, Lakeview Loan 3, Secretary of Veterans
+# Affairs 3.
+#
+# NOT ONE INDIVIDUAL appears at 3+. Individuals top out at 2 -- Amy L.
+# Revak and Patrick N. Andersen -- and both of those are known
+# DOUBLE-COUNTS, one sale stamped against two windows, not repeat sellers.
+# So 3 is where the population changes character, and 2 would catch the
+# double-counts rather than flippers.
+#
+# The existing hand-written ecrv_repeat_seller_post_expiry rows used 5 and
+# describe the same inference: "Corporate seller resolving that many
+# foreclosed properties post-redemption is a certificate holder, not an
+# owner who redeemed."
+REPEAT_SELLER_MIN_TRACKERS = 3
+
+# Below this share of assessed value, a sale is flagged ambiguous rather
+# than dropped.
+#
+# THERE IS NO PRICE FLOOR IN THE PUBLISHED ROWS, and that was measured
+# after assuming otherwise. The 90 hand-written redemptions run down to
+# 0.063 -- a WARRANTY deed, $20,000 against a $318,700 assessment, sold by
+# individuals -- plus 0.137, 0.138 and 0.297. The operator applied a
+# deed-type filter and nothing else.
+#
+# Dropping those rows would discard records the operator accepted, on a
+# threshold this file invented. Flagging them keeps the row, keeps the
+# count honest, and marks the four questionable published ones for review.
+LOW_CONSIDERATION_RATIO = 0.4
+
+# One row per SALE, not per tracker.
+#
+# The first version used DISTINCT ON (rt.id) and deduped NOTHING: duplicate
+# windows on one parcel are DIFFERENT tracker ids, so every pair survived.
+# The 2026-08-25 dry run stamped parcel 213124210030 twice from a single
+# $248,000 sale, which is the exact defect this was meant to prevent.
+#
+# Keyed on (county_code, parcel_id, deed_date) and ordered so the window
+# with the EARLIEST expiry after the deed wins -- the first window that
+# sale could have resolved. Deliberately not the latest, which would let
+# one sale close a window opened months afterwards.
 CANDIDATE_SQL = """
-SELECT DISTINCT ON (rt.id)
+WITH repeat_sellers AS (
+  SELECT lower(btrim(array_to_string(es.sellers, '; '))) AS seller_key,
+         count(DISTINCT rt.id) AS trackers
+  FROM outcomes.redemption_tracker rt
+  JOIN outcomes.ecrv_county_map m ON m.county_slug = rt.county_code
+  JOIN outcomes.ecrv_sales es
+         ON es.county_cde = m.county_cde
+        AND regexp_replace(rt.parcel_id, '\\D', '', 'g') = es.parcel_norm
+  WHERE rt.superseded_by IS NULL
+    AND es.primary_parcel
+    AND es.purchase_amt > 0
+  GROUP BY 1
+  HAVING count(DISTINCT rt.id) >= %(repeat_min)s
+)
+SELECT DISTINCT ON (rt.county_code, rt.parcel_id, es.deed_date)
        rt.id                       AS tracker_id,
        rt.county_code,
        rt.parcel_id,
@@ -139,16 +199,27 @@ SELECT DISTINCT ON (rt.id)
        es.deed_type,
        es.deed_date,
        es.purchase_amt,
+       p.emv_total,
+       CASE WHEN COALESCE(p.emv_total,0) > 0
+            THEN round((es.purchase_amt / p.emv_total)::numeric, 3)
+       END                                                       AS price_to_emv,
        array_to_string(es.sellers, '; ') AS sellers,
        array_to_string(es.buyers,  '; ') AS buyers,
-       (upper(array_to_string(es.sellers, ' ')) ~ %(lender_rx)s) AS seller_is_lender,
-       (es.deed_type = ANY(%(deeds)s))                           AS deed_conveys
+       (upper(array_to_string(es.sellers, ' ')) ~ %(lender_rx)s)  AS seller_is_lender,
+       (es.deed_type = ANY(%(deeds)s))                            AS deed_conveys,
+       (rs.seller_key IS NOT NULL)                                AS seller_is_repeat,
+       COALESCE(rs.trackers, 0)                                   AS seller_tracker_count
 FROM outcomes.redemption_tracker rt
 JOIN outcomes.ecrv_county_map m
        ON m.county_slug = rt.county_code
 JOIN outcomes.ecrv_sales es
        ON es.county_cde = m.county_cde
       AND regexp_replace(rt.parcel_id, '\\D', '', 'g') = es.parcel_norm
+LEFT JOIN core.parcels p
+       ON p.county_code = rt.county_code
+      AND p.parcel_id   = rt.parcel_id
+LEFT JOIN repeat_sellers rs
+       ON rs.seller_key = lower(btrim(array_to_string(es.sellers, '; ')))
 WHERE rt.outcome = 'pending'
   AND rt.superseded_by IS NULL
   AND es.primary_parcel
@@ -157,13 +228,14 @@ WHERE rt.outcome = 'pending'
   AND es.purchase_amt > 0
   AND es.deed_date > rt.anchor_date
   AND es.deed_date <= rt.redemption_expiry_date
-ORDER BY rt.id, rt.redemption_expiry_date, es.deed_date
+ORDER BY rt.county_code, rt.parcel_id, es.deed_date,
+         rt.redemption_expiry_date, rt.id
 """
 
 STAMP_SQL = """
 UPDATE outcomes.redemption_tracker
 SET outcome             = %(outcome)s,
-    ambiguous           = false,
+    ambiguous           = %(ambiguous)s,
     outcome_detected_at = now(),
     outcome_event_date  = %(event_date)s,
     detection_source    = %(source)s,
@@ -183,31 +255,53 @@ def log(msg):
 
 
 def classify(row):
-    """Return (outcome, source, note) or (None, reason, note) to skip.
+    """Return (outcome, source, note, ambiguous) or (None, reason, note,
+    False) to skip.
 
-    Three ways a sale inside the window can read, and only one is a
-    redemption.
+    Four ways a sale inside the window can read, and only one is a
+    redemption. Order matters: lender first, then repeat seller, then deed
+    type, because a lender is also a repeat seller and the more specific
+    reading should win.
     """
     seller = row["sellers"] or ""
     amt = float(row["purchase_amt"] or 0)
+    ratio = row["price_to_emv"]
     base = ("eCRV: %s %s amt %s seller %s"
             % (row["deed_type"], row["deed_date"], amt, seller))
 
+    low = (ratio is not None and float(ratio) < LOW_CONSIDERATION_RATIO)
+    low_note = ""
+    if low:
+        low_note = (" | AMBIGUOUS: price is %s of assessed value (%s vs %s) "
+                    "-- may be a sale of the redemption right rather than a "
+                    "market sale. Kept because the 90 hand-written rows run "
+                    "as low as 0.063 and applied no price test."
+                    % (ratio, amt, row["emv_total"]))
+
     if row["seller_is_lender"]:
-        # The lender sold it. Title moved at the sheriff sale; this is the
-        # REO disposition, not a redemption. Matches the hand-written
-        # ecrv_reo_sale_in_window rows.
+        # Title moved at the sheriff sale; this is the REO disposition.
         return ("foreclosed_sold", "ecrv_reo_sale_in_window",
                 base + " | seller matches a lender/GSE pattern, so title had "
-                       "already moved at the sheriff sale")
+                       "already moved at the sheriff sale", False)
+
+    if row["seller_is_repeat"]:
+        # FLIPPER RULE. Same inference the hand-written
+        # ecrv_repeat_seller_post_expiry rows record, at a threshold
+        # measured rather than assumed -- see REPEAT_SELLER_MIN_TRACKERS.
+        return ("foreclosed_sold", "ecrv_repeat_seller_post_expiry",
+                base + " | seller appears on %d distinct tracked "
+                       "foreclosures, so it is a certificate holder rather "
+                       "than an owner who redeemed. INFERENCE from repeat "
+                       "behaviour, not a lender match -- hence ambiguous."
+                       % row["seller_tracker_count"], True)
 
     if not row["deed_conveys"]:
-        # EQUITY STRIP. Not stamped -- see the module docstring. Left
-        # pending so outcome_checker still gets its turn.
+        # EQUITY STRIP. Not stamped -- see the module docstring.
         return (None, "equity_strip_not_stamped",
-                base + " | buyers %s" % (row["buyers"] or ""))
+                base + " | buyers %s" % (row["buyers"] or ""), False)
 
-    return ("redeemed_by_owner", "ecrv_owner_sale_in_window", base)
+    return ("redeemed_by_owner", "ecrv_owner_sale_in_window",
+            base + low_note, low)
 
 
 def main() -> int:
@@ -229,16 +323,18 @@ def main() -> int:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(CANDIDATE_SQL,
                         {"lender_rx": LENDER_RX,
-                         "deeds": list(REDEMPTION_DEEDS)})
+                         "deeds": list(REDEMPTION_DEEDS),
+                         "repeat_min": REPEAT_SELLER_MIN_TRACKERS})
             rows = cur.fetchall()
         log("candidates: %d pending trackers with a sale inside the window"
             % len(rows))
 
         counts = {"redeemed_by_owner": 0, "foreclosed_sold": 0,
                   "equity_strip_not_stamped": 0}
+        flagged = 0
         stamped = 0
         for r in rows:
-            outcome, source, note = classify(r)
+            outcome, source, note, ambiguous = classify(r)
             if outcome is None:
                 counts[source] += 1
                 log("  SKIP  %-11s %-14s %s %8.0f  %s -> %s"
@@ -248,9 +344,13 @@ def main() -> int:
                 continue
 
             counts[outcome] += 1
-            log("  %-17s %-11s %-14s %s %8.0f  %s"
+            flagged += bool(ambiguous)
+            log("  %-17s %-11s %-14s %-10s %8.0f r=%-6s %s%s"
                 % (outcome, r["county_code"], r["parcel_id"], r["deed_type"],
-                   float(r["purchase_amt"] or 0), (r["sellers"] or "")[:34]))
+                   float(r["purchase_amt"] or 0),
+                   r["price_to_emv"] if r["price_to_emv"] is not None else "-",
+                   (r["sellers"] or "")[:30],
+                   "  [ambiguous]" if ambiguous else ""))
             if args.dry_run:
                 continue
             with conn.cursor() as w:
@@ -259,6 +359,7 @@ def main() -> int:
                     "event_date": r["deed_date"],
                     "source": source,
                     "notes": note[:2000],
+                    "ambiguous": ambiguous,
                     "tracker_id": r["tracker_id"],
                 })
                 stamped += w.rowcount
@@ -267,9 +368,9 @@ def main() -> int:
             conn.commit()
 
         log("redeemed_by_owner %d | foreclosed_sold %d | equity strips left "
-            "pending %d"
+            "pending %d | flagged ambiguous %d"
             % (counts["redeemed_by_owner"], counts["foreclosed_sold"],
-               counts["equity_strip_not_stamped"]))
+               counts["equity_strip_not_stamped"], flagged))
         if args.dry_run:
             log("DRY RUN: nothing written")
         else:
