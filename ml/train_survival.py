@@ -104,7 +104,7 @@ import pandas as pd
 import psycopg2
 
 MODEL_NAME = "redemption_survival"
-MODEL_VERSION = "v3"
+MODEL_VERSION = "v4"
 
 # A model must beat the marginal curve by this margin in C-index to ship.
 # 0.5 is where a no-covariate baseline sits by construction; anything within
@@ -330,6 +330,42 @@ def fit_and_score(X: pd.DataFrame, feats: list[str], label: str) -> dict:
     coef = cph.summary[["coef", "p"]].round(4)
     strong = coef[coef["p"] < 0.05].sort_values("coef", key=abs,
                                                 ascending=False)
+
+    # === WHY EVERY COEFFICIENT, NOT JUST p < 0.05 ===
+    # v3 ranks at 0.80-0.87 within county with exactly ONE significant term:
+    # homestead_yes. A single binary covariate cannot order 615 windows that
+    # well on its own, so either the other nine are contributing below the
+    # significance threshold -- entirely plausible on 20-24 holdout events,
+    # where nothing reaches p<0.05 but the linear combination still ranks --
+    # or one term does everything and the rest are decoration.
+    #
+    # Those two cases lead to different products. Nine features combining is
+    # a per-property hazard worth rendering. homestead_yes alone is a rate
+    # cut, and scoring.redemption_rates already publishes it at 45.7% vs
+    # 32.9% with its sample size attached.
+    all_terms = {
+        k: {"coef": float(v["coef"]), "p": float(v["p"])}
+        for k, v in coef.sort_values("coef", key=abs, ascending=False)
+                        .to_dict("index").items()
+    }
+
+    # SINGLE-COVARIATE CONTROL. Same fit, same strata, homestead_yes only.
+    # If this scores what the full model scores, the full model is a
+    # one-feature model wearing nine features.
+    c_homestead_only = None
+    if "homestead_yes" in feats:
+        try:
+            cols1 = ["homestead_yes", "duration", "event"] + (
+                ["_county"] if strata else [])
+            cph1 = CoxPHFitter(penalizer=0.1)
+            cph1.fit(tr[cols1], duration_col="duration", event_col="event",
+                     strata=strata)
+            r1 = -cph1.predict_partial_hazard(
+                te[["homestead_yes"] + (["_county"] if strata else [])])
+            c_homestead_only = round(float(concordance_index(
+                te["duration"], r1, te["event"])), 4)
+        except Exception:
+            c_homestead_only = None
     return {
         "label": label,
         "n_train": int(len(tr)),
@@ -346,10 +382,12 @@ def fit_and_score(X: pd.DataFrame, feats: list[str], label: str) -> dict:
             c >= MIN_C_INDEX
             and (c_within is None or c_within >= MIN_C_INDEX)
         ),
+        "c_index_homestead_only": c_homestead_only,
         "significant_terms": {
             k: {"coef": float(v["coef"]), "p": float(v["p"])}
             for k, v in strong.head(8).to_dict("index").items()
         },
+        "all_terms": all_terms,
     }
 
 
@@ -394,6 +432,7 @@ def main() -> int:
                     log(f"{target} [{tag}] Cox C={r['c_index']} "
                         f"within-county={r.get('c_index_within_county')} "
                         f"covariate-free={r.get('c_index_covariate_free')} "
+                        f"homestead-only={r.get('c_index_homestead_only')} "
                         f"(bar {MIN_C_INDEX}) -> "
                         f"{'BEATS' if r['beats_baseline'] else 'does not beat'}")
                 else:
