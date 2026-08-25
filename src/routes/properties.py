@@ -2509,11 +2509,28 @@ def _redemption_timing() -> Optional[dict[str, Any]]:
 
 
 def _load_redemption_rates() -> Optional[list[dict[str, Any]]]:
-    """Load scoring.redemption_rates whole. Twelve rows; cached.
+    """Load scoring.redemption_rates whole. Ten rows; cached.
 
     Same stale-if-error contract as _load_deal_calibration: a failure returns
     the last good copy, and a cold failure returns None so the caller emits
     no rates rather than a fabricated one.
+
+    === EIGHT COLUMNS SINCE 2026-08-25, WAS FIVE ===
+    n_confirmed / redeemed_confirmed / redeem_pct_confirmed were APPENDED to
+    the view that day. Appended, not reordered: CREATE OR REPLACE VIEW can
+    only add at the end, and this select-list names columns explicitly, so
+    the five-column version kept working until this line changed.
+
+    They exist because 127 of 412 resolved tracker rows carry
+    ambiguous = true -- carlton's forfeit-owner-name matches, the eCRV
+    flipper rule, low-consideration eCRV sales. The view reported ONE rate
+    and said nothing about them, and they are not evenly spread: almost all
+    are foreclosed_sold or foreclosed against only 2 redemptions, so they
+    inflate the DENOMINATOR and never the numerator. Excluding them moves
+    the headline 33.4% of 326 -> 37.5% of 285, and hennepin 39.2% -> 43.0%.
+
+    A rate that folds inferences in without saying so is the same failure as
+    publishing a rate without its n.
     """
     now = _time_mod.monotonic()
     if (
@@ -2524,7 +2541,8 @@ def _load_redemption_rates() -> Optional[list[dict[str, Any]]]:
     try:
         rows = _fetch_all_rows_in_schema(
             scoring_table, "redemption_rates",
-            "scope, bucket, n, redeemed, redeem_pct"
+            "scope, bucket, n, redeemed, redeem_pct, "
+            "n_confirmed, redeemed_confirmed, redeem_pct_confirmed"
         )
     except Exception as e:
         logger.warning(
@@ -2609,12 +2627,21 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
         ("homestead", homestead),
         ("bid_to_value", bid_bucket),
     ]
+    def _num(v):
+        """None-safe float. redeem_pct_confirmed is NULL when a bucket has
+        no confirmed rows at all, and NULLIF in the view guarantees a NULL
+        rather than a divide-by-zero."""
+        return None if v is None else float(v)
+
     matched = [
         {
             "scope": r["scope"],
             "bucket": r["bucket"],
             "n": r["n"],
             "redeem_pct": float(r["redeem_pct"]),
+            # Confirmed-only figures: same bucket, inferred outcomes removed.
+            "n_confirmed": r.get("n_confirmed"),
+            "redeem_pct_confirmed": _num(r.get("redeem_pct_confirmed")),
         }
         for r in rows
         if any(r["scope"] == sc and r["bucket"] == bk for sc, bk in wanted if bk)
@@ -2623,23 +2650,50 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
     matched.sort(key=lambda m: -m["n"])
 
-    base = next(
-        (float(r["redeem_pct"]) for r in rows if r["scope"] == "all"), None
+    all_row = next((r for r in rows if r["scope"] == "all"), None)
+    base = float(all_row["redeem_pct"]) if all_row else None
+    base_n = all_row["n"] if all_row else None
+    base_confirmed_pct = _num(all_row.get("redeem_pct_confirmed")) if all_row else None
+    base_n_confirmed = all_row.get("n_confirmed") if all_row else None
+
+    # === THE BASIS SENTENCE IS COMPOSED HERE, NOT CLIENT-SIDE ===
+    # PropertyDetailPage renders `basis` verbatim and never rebuilds it. That
+    # rule exists because composing the deal-math sentence client-side once
+    # silently dropped the assessment-vintage note and the association-lien
+    # warning. The confirmed explanation follows the same rule.
+    #
+    # The second sentence is only added when some outcome in the population
+    # IS inferred. When nothing is flagged, saying so would be noise.
+    inferred = None
+    if base_n is not None and base_n_confirmed is not None:
+        inferred = base_n - base_n_confirmed
+
+    basis = (
+        "Observed redemption rates from %s resolved redemption windows. "
+        "Each figure is the share of comparable properties whose owner "
+        "redeemed, with the number of comparables shown. These are "
+        "observed rates, not a prediction for this property, and they "
+        "describe WHETHER an owner redeemed - not when."
+        % (base_n if base_n is not None else "resolved")
     )
-    base_n = next((r["n"] for r in rows if r["scope"] == "all"), None)
+    if inferred and base_confirmed_pct is not None:
+        basis += (
+            " %d of those %d outcomes were INFERRED rather than confirmed "
+            "outright - a tax-forfeiture owner name, a repeat corporate "
+            "seller, or a sale well below assessed value. Excluding them, "
+            "%.1f%% of %d confirmed windows redeemed. Almost every inferred "
+            "outcome is a foreclosure rather than a redemption, so leaving "
+            "them in lowers the rate."
+            % (inferred, base_n, base_confirmed_pct, base_n_confirmed)
+        )
 
     return {
         "base_rate_pct": base,
         "base_n": base_n,
+        "base_rate_pct_confirmed": base_confirmed_pct,
+        "base_n_confirmed": base_n_confirmed,
         "buckets": matched,
-        "basis": (
-            "Observed redemption rates from %s resolved redemption windows. "
-            "Each figure is the share of comparable properties whose owner "
-            "redeemed, with the number of comparables shown. These are "
-            "observed rates, not a prediction for this property, and they "
-            "describe WHETHER an owner redeemed - not when."
-            % (base_n if base_n is not None else "resolved")
-        ),
+        "basis": basis,
     }
 
 
