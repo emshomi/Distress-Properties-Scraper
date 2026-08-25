@@ -5,6 +5,10 @@
 -- Created 2026-08-24. The first prediction surface Govire has: not what a
 -- property is worth, but what is likely to HAPPEN to it.
 --
+-- REGENERATED 2026-08-25 (task 2982) after two defects were found and fixed.
+-- The prior version of this file recorded a definition that would silently
+-- reintroduce the first of them. See DEFECTS FOUND 2026-08-25 below.
+--
 -- ============================================================
 -- WHY THIS IS A VIEW AND NOT A MODEL
 -- ============================================================
@@ -21,43 +25,91 @@
 -- So this ships the rate, with its n, and a model is only worth reaching for
 -- when a rate demonstrably cannot answer the question.
 --
--- A VIEW rather than a materialized view: the population is ~225 rows and
--- grows daily as outcome_checker resolves windows. scoring.comp_ratios is
--- materialized because it scans 338,038 eCRV rows; this scans a few hundred,
--- and being always-current matters more than being fast.
+-- A VIEW rather than a materialized view: the population is a few hundred
+-- rows and grows daily as outcome_checker and ecrv_outcome_detector resolve
+-- windows. scoring.comp_ratios is materialized because it scans 338,038 eCRV
+-- rows; this scans a few hundred, and being always-current matters more than
+-- being fast. That property paid off on 2026-08-25 — every write that day
+-- reached the page immediately with no refresh.
+--
+-- ============================================================
+-- DEFECTS FOUND 2026-08-25
+-- ============================================================
+--
+-- DEFECT 1 — IT COUNTED SUPERSEDED DUPLICATES.
+-- The view had NO `superseded_by IS NULL` filter, so every retired duplicate
+-- tracker row was counted in a PUBLISHED rate.
+--
+-- Found by measuring the same population two ways and getting different
+-- answers: a hand query gave washington 66 resolved windows, the view gave
+-- 93. The 27-row gap is exactly washington's 2026-08-25 12:38 supersede pass
+-- — 1 foreclosed, 26 foreclosed_sold.
+--
+-- Effect on the headline: n 353 -> 326.
+--
+-- This matters more than it looks. 762 stub rows were retired on 2026-08-25
+-- alone. ANY view over redemption_tracker that omits the superseded filter
+-- counts windows twice, and its numbers move every time cleanup runs.
+--
+-- DEFECT 2 — INFERENCES WERE FOLDED INTO THE HEADLINE.
+-- 127 of 412 resolved rows carry ambiguous = true: carlton's
+-- forfeit-owner-name matches, the eCRV flipper rule, low-consideration eCRV
+-- sales. The view reported one rate and said nothing about them.
+--
+-- They are NOT evenly spread. Almost all are foreclosed_sold (28) or
+-- foreclosed (11) against only 2 redemptions, so they inflate the
+-- DENOMINATOR and never the numerator. Excluding them raises every rate:
+--
+--     all          33.4% of 326  ->  37.5% of 285 confirmed
+--     hennepin     39.2% of 158  ->  43.0% of 142
+--     anoka        50.0% of  28  ->  68.4% of  19
+--     bid <50%     58.1% of  31  ->  64.3% of  28
+--
+-- Three columns APPENDED — n_confirmed, redeemed_confirmed,
+-- redeem_pct_confirmed. Appended, not reordered: CREATE OR REPLACE VIEW can
+-- only add columns at the end, and src/routes/properties.py selects the
+-- original five by name, so it keeps working untouched.
+--
+-- THE CONFIRMED FLOOR APPLIES TO BOTH COUNTS. Every HAVING now tests n AND
+-- n_confirmed against the same threshold. Without it, `third-party buyer`
+-- passed at n=18 and published a confirmed rate on 13 rows — under its own
+-- floor of 15, and swinging 61.1% -> 84.6% between the two columns. A bucket
+-- that cannot support a confirmed rate should not print one.
+--
+-- Two buckets dropped out when this was added, and both are honest losses:
+--     third-party buyer   18 rows,  13 confirmed  (floor 15)
+--     anoka               28 rows,  19 confirmed  (floor 20)
+-- Anoka was the newest county on the page and the only one above 50%. It
+-- returns at 20 confirmed. It is at 19.
 --
 -- ============================================================
 -- THE BASE RATE
 -- ============================================================
--- 36.5% of resolved sheriff-sale redemption windows end in redemption
--- (92 of 252, measured 2026-08-24). First time this has been measured.
+-- 2026-08-24:  36.5% of 252 resolved windows.
+-- 2026-08-25:  33.4% of 326, or 37.5% of 285 confirmed.
 --
--- Read 40.9% (92 of 225) before the LEFT join fix below. The 27 rows an inner
--- join dropped are all washington and all foreclosed -- none of them redeemed
--- -- so excluding them inflated the rate by 4.4 points.
+-- The headline barely moved and the reasons CANCEL rather than agree:
+--   -  56 foreclosures recovered by retuned REO patterns pushed it DOWN
+--   -  17 redemptions recovered by the eCRV detector pushed it UP
+--   -  27 superseded duplicates removed pushed it UP
 --
--- That is the number every bucket below should be read against. A bucket at
--- 47% is mildly above base; one at 72% is a different situation.
+-- A prediction was made during that day that the rate was "biased low,
+-- structurally", reasoning from the idle redemption detector alone. True of
+-- that mechanism, wrong about the net, because another was being changed at
+-- the same time. Read the whole population before predicting a direction.
 --
 -- ============================================================
 -- WHAT SEPARATES, AND WHAT DOES NOT
 -- ============================================================
--- Seven cuts were measured before choosing these four:
---
---   bid_to_value    72.0% -> 34.5%   STRONGEST, and has a mechanism
---   county          49.6% -> 29.6%
---   homestead       47.0% -> 33.3%
---   buyer_type      64.7% -> 47.1%
---
 -- Cuts NOT published and why:
 --
---   period_months   6mo is 199 of 225 rows. The 12mo bucket is n=6. There is
---                   no contrast to publish yet, though the statutory
+--   period_months   6mo dominates the population. The 12mo bucket is tiny.
+--                   No contrast to publish yet, though the statutory
 --                   difference is real and this should be revisited.
 --
 --   notice_of_intent  MEASURED THE OPPOSITE OF EXPECTED and is withheld
 --                   deliberately. Owners who FILE a formal intent to redeem
---                   redeem 14.3% of the time (n=14) against 54.2% for those
+--                   redeemed 14.3% of the time (n=14) against 54.2% for those
 --                   who do not. Either that is a real finding — filing is
 --                   what a struggling owner does in a last attempt that
 --                   usually fails — or the field does not mean what its name
@@ -66,49 +118,48 @@
 --                   would be indefensible. REVISIT AT n>=50.
 --
 -- ============================================================
--- bid_to_value — the strongest cut, and Hennepin-only
+-- bid_to_value — still the strongest cut
 -- ============================================================
---   under 50%   72.0%  (n=25)
---   50-80%      47.8%  (n=67)
---   80%+        34.5%  (n=29)
+-- 2026-08-25, and it survives excluding every inference:
 --
--- Mechanism: a lender bidding under half the assessed value leaves a large
--- equity cushion, so the owner has something worth saving and can often
--- borrow against it. A bid at or above assessed value means the debt exceeds
--- what the property is worth and there is nothing to redeem FOR.
+--                  all              confirmed
+--   under 50%   58.1% (n=31)     64.3% (n=28)
+--   50-80%      44.2% (n=77)     49.3% (n=67)
+--   80%+        20.0% (n=50)     21.3% (n=47)
 --
--- Verified to be a real effect and not a county-mix artefact: the same
--- gradient holds with county held constant at hennepin.
+-- Monotonic on both. Mechanism: a lender bidding under half the assessed
+-- value leaves a large equity cushion, so the owner has something worth
+-- saving and can often borrow against it. A bid at or above assessed value
+-- means the debt exceeds what the property is worth and there is nothing to
+-- redeem FOR.
 --
--- 'over 100%' is COLLAPSED into '80%+'. On its own it is n=6, which is not
--- publishable, and it says the same thing as 80-100% (33.3% vs 34.8%).
+-- STAGE2_SURVIVAL_FINDINGS §3 calls bid_to_value "the sharpest
+-- disagreement": strongest cut in this table, statistically nothing in the
+-- Cox hazard model (p=0.836). That disagreement is UNRESOLVED. The gradient
+-- here is now steeper and better-populated than when it was named, which is
+-- new evidence on it but not a resolution.
 --
 -- *** THIS CUT EXISTS ONLY FOR HENNEPIN. *** finalBidAmount is a
 -- hennepin_sheriff payload field. dakota_sheriff and washington_sheriff
--- publish a different field set and carry NO bid at all — 104 of 225 resolved
--- rows. The view labels those rows '(no bid data)' rather than bucketing them,
--- because a bucket that silently means "the other two counties" is worse than
--- an honest gap.
+-- publish a different field set and carry NO bid at all. Rows without a bid
+-- are EXCLUDED from the scope, not bucketed — see the note on the
+-- bid_to_value block below.
 --
 -- ============================================================
 -- KNOWN LIMITATION: homestead coverage
 -- ============================================================
--- homestead_status is populated on 167,104 dakota parcels and 163,880 ramsey
--- parcels, but only 5,578 of 448,266 hennepin (1.3%) and 207 of 118,430
--- washington (0.2%) as of 2026-08-24.
---
--- hennepin_parcels.py was fixed the same day to map HMSTD_CD1 (present on
--- 443,614 rows, clean two-state H/N), and a full run was in flight when this
--- view was written. Until that lands, the homestead cut is measuring a 1.3%
--- sample on the county holding half the tracker. THE n COLUMN MAKES THAT
--- VISIBLE, which is the point of publishing it.
---
--- Four vocabularies exist and are normalised below:
+-- Four county vocabularies exist and are normalised below:
 --   dakota      FULL HOMESTEAD / NON HOMESTEAD / DISABLED VET HOMESTEAD /
 --               FRACTIONAL / BLIND/DISABLED
 --   ramsey      Y / N / P
 --   hennepin    Yes / No
 --   washington  Yes / No
+--
+-- ANOKA WRITES NULL FOR NOT-HOMESTEADED, not 'N' — enumerated 2026-08-25
+-- over all 140,279 anoka parcels: 'Y' 105,887, null 34,392, no third value.
+-- So an anoka null is a NEGATIVE, while a null elsewhere may mean unknown.
+-- The CASE below maps null to NULL and the scope excludes it, which is
+-- correct but means anoka contributes fewer homestead rows than it has.
 --
 -- FRACTIONAL and P are 'partial' and NOT folded into either side — a
 -- fractional homestead is a genuinely different situation and collapsing it
@@ -117,18 +168,30 @@
 -- ============================================================
 -- WHAT THIS CANNOT ANSWER
 -- ============================================================
--- WHEN a redemption happens. Nothing in our data records it — redemption is
--- inferred from the ABSENCE of a post-expiry deed, and an absence has no
--- date. See STAGE2_SURVIVAL_FINDINGS_2026-08-23.md §6.
+-- WHEN a redemption happens. Redemption is inferred from the ABSENCE of a
+-- post-expiry deed, and an absence has no date. See
+-- STAGE2_SURVIVAL_FINDINGS_2026-08-23.md §6.
 --
--- Time to FORECLOSURE SALE is recoverable (119 dated events) and is the
--- survival model's target. This view answers WHETHER, not WHEN.
+-- Time to FORECLOSURE SALE is recoverable and is the survival model's
+-- target. This view answers WHETHER, not WHEN.
+--
+-- ============================================================
+-- HOW TO REGENERATE THIS FILE
+-- ============================================================
+-- Never retype the body. Generate it:
+--
+--     SELECT pg_get_viewdef('scoring.redemption_rates'::regclass, true);
+--
+-- The database is authoritative for the definition; this file is the
+-- reconstruction path and the record of WHY the filters are there, which
+-- pg_get_viewdef cannot tell you.
 -- ============================================================
 
 CREATE OR REPLACE VIEW scoring.redemption_rates AS
 WITH base AS (
   SELECT t.id,
          t.county_code,
+         t.ambiguous,
          (t.outcome = 'redeemed_by_owner')                     AS redeemed,
          -- Normalise four county vocabularies to three states.
          CASE
@@ -159,23 +222,24 @@ WITH base AS (
            ELSE '80%+'
          END                                                    AS bid_to_value
   FROM outcomes.redemption_tracker t
-  -- LEFT join, not inner (fixed 2026-08-24 the same day this view shipped).
+  -- LEFT join, not inner (fixed 2026-08-24, the day this view shipped).
   --
-  -- An inner join silently dropped 27 of 252 resolved rows -- 11% of the
-  -- population -- and pulled the base rate from 36.5% to 40.9%. Every one is
+  -- An inner join silently dropped 27 of 252 resolved rows — 11% of the
+  -- population — and pulled the base rate from 36.5% to 40.9%. Every one was
   -- a washington row keyed 'WASHINGTON-FC-0202821420118': a valid 13-digit
   -- PIN behind a stub prefix, which outcome_checker.py learned to read
-  -- through on 2026-08-24 but core.parcels joins still cannot.
+  -- through but core.parcels joins still cannot.
   --
   -- Those rows have a REAL outcome. They belong in the base rate and in the
   -- county cut. They simply cannot contribute to homestead or bid_to_value,
   -- which need parcel data, and a LEFT join expresses exactly that: present
   -- in the population, absent from the cuts that need a parcel.
   --
-  -- The permanent fix is re-keying those rows to their bare PINs. That is
-  -- destructive and needs its own guard -- 18 of the washington stubs have no
-  -- twin row and would be destroyed by a careless retirement, while 66 have a
-  -- resolved twin and would duplicate. Until then, LEFT join.
+  -- STILL REQUIRED 2026-08-25. 762 stub rows were retired that day and 2
+  -- re-keyed, but the retirement was for DUPLICATES — a stub whose twin
+  -- already carries the real PIN. Stubs with no twin remain, and 58 tracker
+  -- rows across hennepin and dakota have no PIN at source either. LEFT join
+  -- stays.
   LEFT JOIN core.parcels p
          ON p.county_code = t.county_code
         AND p.parcel_id   = t.parcel_id
@@ -183,30 +247,52 @@ WITH base AS (
   -- Resolved outcomes only. 'unknown' is an unresolved ladder, not a result,
   -- and 'pending' has not happened yet.
   WHERE t.outcome IN ('redeemed_by_owner','foreclosed_sold','foreclosed')
+    -- ADDED 2026-08-25 — DEFECT 1. Without this the view counted retired
+    -- duplicates. washington read 93 resolved windows against a true 66.
+    AND t.superseded_by IS NULL
 )
 SELECT 'all'::text        AS scope,
        'all resolved windows'::text AS bucket,
        count(*)           AS n,
        count(*) FILTER (WHERE redeemed) AS redeemed,
-       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1) AS redeem_pct
+       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1) AS redeem_pct,
+       count(*) FILTER (WHERE NOT ambiguous) AS n_confirmed,
+       count(*) FILTER (WHERE NOT ambiguous AND redeemed) AS redeemed_confirmed,
+       round(100.0 * count(*) FILTER (WHERE NOT ambiguous AND redeemed)
+             / NULLIF(count(*) FILTER (WHERE NOT ambiguous), 0), 1) AS redeem_pct_confirmed
 FROM base
 
 UNION ALL
 SELECT 'county', county_code, count(*), count(*) FILTER (WHERE redeemed),
-       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1)
-FROM base GROUP BY county_code HAVING count(*) >= 20
+       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1),
+       count(*) FILTER (WHERE NOT ambiguous),
+       count(*) FILTER (WHERE NOT ambiguous AND redeemed),
+       round(100.0 * count(*) FILTER (WHERE NOT ambiguous AND redeemed)
+             / NULLIF(count(*) FILTER (WHERE NOT ambiguous), 0), 1)
+FROM base GROUP BY county_code
+HAVING count(*) >= 20 AND count(*) FILTER (WHERE NOT ambiguous) >= 20
 
 UNION ALL
 SELECT 'homestead', homestead, count(*), count(*) FILTER (WHERE redeemed),
-       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1)
+       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1),
+       count(*) FILTER (WHERE NOT ambiguous),
+       count(*) FILTER (WHERE NOT ambiguous AND redeemed),
+       round(100.0 * count(*) FILTER (WHERE NOT ambiguous AND redeemed)
+             / NULLIF(count(*) FILTER (WHERE NOT ambiguous), 0), 1)
 FROM base WHERE homestead IS NOT NULL
-GROUP BY homestead HAVING count(*) >= 20
+GROUP BY homestead
+HAVING count(*) >= 20 AND count(*) FILTER (WHERE NOT ambiguous) >= 20
 
 UNION ALL
 SELECT 'buyer_type', buyer_type, count(*), count(*) FILTER (WHERE redeemed),
-       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1)
+       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1),
+       count(*) FILTER (WHERE NOT ambiguous),
+       count(*) FILTER (WHERE NOT ambiguous AND redeemed),
+       round(100.0 * count(*) FILTER (WHERE NOT ambiguous AND redeemed)
+             / NULLIF(count(*) FILTER (WHERE NOT ambiguous), 0), 1)
 FROM base WHERE buyer_type IS NOT NULL
-GROUP BY buyer_type HAVING count(*) >= 15
+GROUP BY buyer_type
+HAVING count(*) >= 15 AND count(*) FILTER (WHERE NOT ambiguous) >= 15
 
 UNION ALL
 -- NULLS EXCLUDED, not bucketed (fixed 2026-08-24, hours after this view
@@ -225,32 +311,39 @@ UNION ALL
 -- and the API's matcher drops the scope entirely for those rows rather than
 -- showing an absence as a finding.
 SELECT 'bid_to_value', bid_to_value, count(*), count(*) FILTER (WHERE redeemed),
-       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1)
+       round(100.0 * count(*) FILTER (WHERE redeemed) / count(*), 1),
+       count(*) FILTER (WHERE NOT ambiguous),
+       count(*) FILTER (WHERE NOT ambiguous AND redeemed),
+       round(100.0 * count(*) FILTER (WHERE NOT ambiguous AND redeemed)
+             / NULLIF(count(*) FILTER (WHERE NOT ambiguous), 0), 1)
 FROM base WHERE bid_to_value IS NOT NULL
-GROUP BY bid_to_value HAVING count(*) >= 20;
+GROUP BY bid_to_value
+HAVING count(*) >= 20 AND count(*) FILTER (WHERE NOT ambiguous) >= 20;
 
 -- ============================================================
 -- VERIFY — a green CREATE is not evidence
 -- ============================================================
--- Expected 2026-08-24 AFTER the LEFT join fix:
---   all           252 rows   36.5%   <- was 225 / 40.9% with an inner join
---   county        hennepin 121 (49.6%), washington 77, dakota 54 (29.6%)
---   homestead     homestead 140 (45.7%), non-homestead 85 (32.9%)
---   buyer_type    lender credit-bid 104 (47.1%), third-party buyer 17 (64.7%)
---   bid_to_value  50-80% 67 (47.8%), 80%+ 29 (34.5%), under 50% 25 (72.0%)
---                 THREE buckets, no '(no bid data)' row. If a fourth appears
---                 the null exclusion reverted.
+-- Expected 2026-08-25 evening, TEN rows:
 --
--- The 'all' row MUST read 252. If it reads 225 the join reverted to inner and
--- 27 washington rows with real outcomes are being dropped from the base rate.
+--   all            326 / 33.4%   confirmed 285 / 37.5%
+--   county         hennepin 158 (39.2%, conf 142 / 43.0%)
+--                  washington 66 (24.2%, conf 64 / 25.0%)
+--                  dakota    61 (26.2%, conf 59 / 27.1%)
+--   homestead      homestead 171 (38.6%, conf 158 / 41.1%)
+--                  non-homestead 114 (24.6%, conf 107 / 26.2%)
+--   buyer_type     lender credit-bid 140 (36.4%, conf 129 / 38.8%)
+--   bid_to_value   under 50% 31 (58.1%, conf 28 / 64.3%)
+--                  50-80%    77 (44.2%, conf 67 / 49.3%)
+--                  80%+      50 (20.0%, conf 47 / 21.3%)
 --
--- washington's county n rises from 50 to 77 for the same reason -- those 27
--- rows were always washington, they were just invisible.
+-- THE 'all' ROW MUST READ 326, NOT 353. If it reads 353 the
+-- superseded_by filter reverted and retired duplicates are being published.
 --
---   SELECT now() AS run_at, scope, bucket, n, redeemed, redeem_pct
+-- ANOKA AND third-party buyer MUST BE ABSENT. Both pass the n floor and fail
+-- the n_confirmed floor (19 and 13). If either appears, the confirmed floor
+-- reverted and a rate is being published on fewer rows than its own
+-- threshold allows.
+--
+--   SELECT now() AS run_at, scope, bucket, n, redeemed, redeem_pct,
+--          n_confirmed, redeemed_confirmed, redeem_pct_confirmed
 --   FROM scoring.redemption_rates ORDER BY scope, n DESC;
---
--- hennepin_parcels ran 2026-08-24 12:10 and took homestead from 5,578 to
--- 427,472 county-wide. The homestead cut here did NOT move: all 121 hennepin
--- tracker rows already carried a value. The gap was on the other 443,000
--- parcels nobody had foreclosed on.
