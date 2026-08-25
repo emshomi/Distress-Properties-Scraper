@@ -281,16 +281,35 @@ FROM outcomes.redemption_tracker t
 LEFT JOIN core.parcels p
        ON p.county_code = t.county_code
       AND p.parcel_id   = t.parcel_id
-LEFT JOIN signals.distress_events e ON e.id = t.source_id;
+LEFT JOIN signals.distress_events e ON e.id = t.source_id
+-- === DUPLICATES ARE NOT OBSERVATIONS ===
+-- 137 washington rows are keyed WASHINGTON-FC-<pin> and duplicate a row keyed
+-- on the bare PIN with the SAME anchor_date: same parcel, same foreclosure,
+-- recorded twice. Marked with superseded_by on 2026-08-25.
+--
+-- Without this filter each of those contributes a second at-risk window and,
+-- for 26 of them, a second EVENT. The survival curve would be fitted on 211
+-- events where 185 exist, and the extra 26 are not independent -- they are
+-- the same 26 foreclosures counted again. That inflates the event rate and
+-- narrows every confidence interval on evidence that does not exist.
+--
+-- superseded_by IS NULL rather than an outcome filter, deliberately: outcome
+-- is constrained to eight values and every one is something that happened to
+-- the PROPERTY. A duplicate record is a fact about our bookkeeping. The
+-- check constraint rejected an attempt to write 'superseded' into outcome and
+-- was right to.
+WHERE t.superseded_by IS NULL;
 
 -- ============================================================
 -- VERIFY — a green CREATE is not evidence
 -- ============================================================
 -- Expected 2026-08-24:
---   total rows            2,569
+--   total rows            2,432  (2,569 tracker rows less 137 superseded)
 --   event_type owner_exit        92, median days_expiry_to_event  −65
---   event_type foreclosure_sale 119, median days_expiry_to_event +100
---   censored                  2,358  (2,208 pending + 109 unknown + 41 fc)
+--   event_type foreclosure_sale  93, median days_expiry_to_event +100
+--                                    (was 119 -- 26 were washington duplicates)
+--   censored                  2,247
+--   live events total           185, NOT 211
 --   outcome_ambiguous true      109
 --   bid_to_value non-null       578  (hennepin only)
 --   homestead non-null          916
