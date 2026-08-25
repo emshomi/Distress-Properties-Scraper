@@ -290,6 +290,75 @@ COUNTY_CONFIG = {
         "pin_regex": r"^[0-9]{9}$",
         "check_source": "carlton_arcgis",
     },
+    "st_louis": {
+        # ADDED 2026-08-25 (task 2933). 20 live pending windows (13 with
+        # bare PINs), 184,559 parcels loaded, 12-digit PINs. Layer 23 of the
+        # Cadastral service, 66 fields, maxRecordCount 2000, reachable
+        # anonymously.
+        "url": ("https://gis.stlouiscountymn.gov/server2/rest/services/"
+                "GeneralUse/Cadastral/MapServer/23/query"),
+        "pin_field": "PRCL_NBR",
+        "owner_fields": ["OWNAME", "TXNAME"],
+
+        # === PRCL_NBR IS HYPHENATED 3-4-5 ===
+        # '010-0735-00115', not '010073500115'. The bare tracker form
+        # returned 0 of 11 and even `PRCL_NBR LIKE '0100%'` found nothing
+        # across 185,610 rows. The hyphenated variant returned 11 of 11.
+        #
+        # Second county in a row with this trap: carlton's PARCELID holds
+        # '06-030-0840' while P_ID2 holds the bare value. There the fix was
+        # a different FIELD; here there is no bare field, so it is a
+        # variant -- the same shape as washington's dotted 2.3.2.2.4 form.
+        #
+        # norm_pin() strips non-digits from the RETURNED PRCL_NBR, so
+        # '010-0735-00115' keys back to '010073500115' and matches the
+        # tracker value. That round trip is what makes a variant work at
+        # all, and washington has proven it.
+        "pin_variants": lambda pin: [
+            "%s-%s-%s" % (pin[0:3], pin[3:7], pin[7:12]),
+        ],
+
+        # === LASTSALEDATE IS YYYYMMDD, NOT EPOCH MILLISECONDS ===
+        # esriFieldTypeDOUBLE -- a bare number, no date semantics declared.
+        # Fifteen raw values read across two trials on 2026-08-25:
+        # 20060401, 20171122, 20030901, 20000901, 20170824, 20210414,
+        # 19980801, 20190401, 20040601, 20100101, 20090201, 20160816,
+        # 20221118, 20120801, 20190502.
+        #
+        # Under the default esri_ms parser EVERY ONE of those becomes
+        # 1970-01-01 -- a legal date, not an error -- so `sale_dt > expiry`
+        # would always be false and this branch would be dead while looking
+        # healthy. That is exactly what happened to hennepin for months.
+        # Decoded five ways before choosing; see yyyymmdd_to_date.
+        "sale_date_field": "LASTSALEDATE",
+        "sale_date_format": "yyyymmdd",
+
+        # No sale-price field on this layer. decide() only reads it for a
+        # notes string, guarded behind `if sale_dt`, so None is safe.
+        "sale_price_field": None,
+
+        # === Ownership IS THE FORFEIT FIELD, WITH ITS OWN VOCABULARY ===
+        # Enumerated server-side over all 185,610 parcels: Private 147,903,
+        # Tax Forfeit 14,245, Municipal 8,712, State 7,672, Federal 4,050,
+        # Unknown 1,275, County Fee 837, Tribal 752, Port Authority 164.
+        # 'Tax Forfeit' is a first-class value, so forfeit_values overrides
+        # the ("Y","T","1") default rather than the branch being skipped.
+        "forfeit_field": "Ownership",
+        "forfeit_values": ("TAX FORFEIT",),
+
+        # PRJ_FORF_YR is a PROJECTED forfeiture year and no other county
+        # publishes anything forward-looking: 2026 -> 357 parcels,
+        # 2027 -> 558, 2028 -> 751, 2029 -> 1,404, plus one row carrying
+        # 3000, which is a sentinel and not a year. DELINQUENT is 'Y' on
+        # 3,326 of 185,610 (1.8%) and NULL otherwise -- null means "not
+        # delinquent" here, the same encoding as anoka's HOMESTEAD, so do
+        # not read a null as unknown.
+        "extra_fields": ["Ownership", "DELINQUENT", "BAL_DUE",
+                         "PRJ_FORF_YR", "ASMT_YR", "TAX_YR",
+                         "EstTotalValue", "TPCLS1", "PHYSADDR"],
+        "pin_regex": r"^[0-9]{12}$",
+        "check_source": "st_louis_arcgis",
+    },
 }
 
 BATCH_SIZE = 100          # tracker PIDs per ArcGIS request
@@ -389,10 +458,53 @@ def yyyymm_to_date(value):
     return date(year, month, 1)
 
 
+def yyyymmdd_to_date(value):
+    """Convert a YYYYMMDD value to a date.
+
+    St. Louis County's LASTSALEDATE is esriFieldTypeDOUBLE holding
+    20060401 / 20171122 / 19980801 -- a NUMBER with no declared date
+    semantics whatsoever. Verified against the live layer 2026-08-25 on
+    fifteen rows across two trials.
+
+    THE DEFAULT PARSER WOULD HAVE RETURNED 1970-01-01 FOR EVERY ONE.
+    int(20060401)/1000 is 20,060 seconds after the epoch. Decoded five ways
+    side by side before this parser was written:
+
+        20060401 -> epoch_ms 1970-01-01   epoch_s  1970-08-21
+                    yyyymmdd 2006-04-01   yyyymm   ValueError
+                    excel    OverflowError
+
+    Exactly one reading lands on a plausible date. That is the read; the
+    field's TYPE said nothing and its NAME said nothing.
+
+    This is hennepin's defect caught before shipping rather than after
+    months of a silently dead sale branch. Accepts int, float or str
+    because an esri Double arrives as a Python number, not a string.
+    """
+    if value is None:
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    year, month, day = n // 10000, (n // 100) % 100, n % 100
+    if not (1900 <= year <= 2100):
+        return None
+    try:
+        return date(year, month, day)
+    except ValueError:
+        # Real data: 20250000 and 20250800 appear in county extracts where
+        # only the year or month is known. A day of 0 is not a date and
+        # None is the honest answer -- a parser that guesses the 1st would
+        # be inventing a fact.
+        return None
+
+
 # Dispatch by the format a county actually publishes. Added 2026-08-25.
 _DATE_PARSERS = {
     "esri_ms": esri_ms_to_date,
     "yyyymm": yyyymm_to_date,
+    "yyyymmdd": yyyymmdd_to_date,
 }
 
 
@@ -615,9 +727,33 @@ def decide(cfg, row, attrs, today):
                 % (reo_hit, " / ".join("'%s'" % v for v in owner_values)),
                 None, row["check_stage"], None)
 
-    if forfeit in ("Y", "T", "1"):
+    # === FORFEIT VOCABULARY IS PER-COUNTY (2026-08-25, task 2933) ===
+    # Was hardcoded ("Y", "T", "1") -- hennepin's FORFEIT_LAND_IND. That is
+    # one county's encoding, and the same assumption applied to all counties
+    # is what this file has now been bitten by three times (esri_ms_to_date,
+    # the 13-digit PIN filter, the {8,13} width test).
+    #
+    # St. Louis publishes an Ownership field whose vocabulary was enumerated
+    # server-side over all 185,610 parcels on 2026-08-25:
+    #
+    #   Private 147,903 | Tax Forfeit 14,245 | Municipal 8,712 | State 7,672
+    #   Federal 4,050 | Unknown 1,275 | County Fee 837 | Tribal 752
+    #   Port Authority 164
+    #
+    # 'Tax Forfeit' is a first-class value there, not a flag and not a
+    # substring of an owner name. Comparing it against ("Y","T","1") would
+    # never fire and the branch would be silently dead.
+    #
+    # Matched by prefix so 'Tax Forfeit' is caught whether or not a county
+    # appends an administrator ('TAX FORFEIT - STATE ADMINISTERED' in
+    # carlton's OWNAME). Case-folded because hennepin writes 'Y' and
+    # st_louis writes title case.
+    forfeit_values = cfg.get("forfeit_values", ("Y", "T", "1"))
+    if forfeit and any(forfeit.startswith(v.strip().upper())
+                       for v in forfeit_values):
         return ("foreclosed", True, src + "_forfeit_flag",
-                "Forfeit flag=%s (tax forfeiture path, review)" % forfeit,
+                "Forfeit indicator=%s (Minn. Stat. ch. 281 tax-forfeiture "
+                "path, not ch. 580/582; review)" % forfeit,
                 None, row["check_stage"], None)
 
     if sale_dt and sale_dt > expiry:
