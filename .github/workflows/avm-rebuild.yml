@@ -1,0 +1,79 @@
+name: AVM Training Rebuild
+# MANUAL FOR NOW. Once a real run has been seen end to end, the intended
+# home is a final step in eCRV Ingest, so the training set refreshes
+# whenever its inputs do.
+#
+# === WHY THIS EXISTS ===
+# scoring.avm_training had NO refresh path. It is a plain table, so the
+# Monday `refresh-deal-math` pg_cron job does not touch it -- that job
+# refreshes scoring.comp_ratios, a different object, which IS current and
+# does serve Premium deal math. avm_training was built BY HAND three times
+# (n_tup_ins 565,002 = 182,020 + 182,020 + 200,962) and drifted between.
+#
+# sql/avm_training_set.sql builds it with two pg_cron jobs and warns twice:
+# "UNSCHEDULE BOTH WHEN DONE. Neither self-terminates." That is why it was
+# never scheduled. scripts/rebuild_avm_training.py replaces those jobs with
+# a script that loops, validates, swaps and exits.
+#
+# === WHY A FULL REBUILD ===
+# knn_ratio uses only PRIOR sales, which suggests appending new rows would
+# be enough. Measured against one real weekly extract on 2026-08-25: 1,663
+# of 2,054 eligible new rows -- 81% -- carry a deed date at or before what
+# is already loaded, back to 2024-02-01. eCRV filing lags the deed by up to
+# two and a half years, and every late arrival becomes a prior neighbour
+# for rows already in the table. Append-only would leave most of each
+# affected county stale.
+#
+# === SAFETY ===
+# The script builds scoring.avm_training_new and swaps only after
+# validating row count, county count and knn coverage. The live table keeps
+# serving throughout and is renamed to scoring.avm_training_old at the end,
+# so a failure mid-run costs nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and validate but do NOT swap (1 = dry run)'
+        required: true
+        default: '1'
+      source_file:
+        description: 'eCRV extract that triggered this, recorded in scoring.avm_build_log'
+        required: false
+        default: ''
+jobs:
+  rebuild:
+    name: Rebuild scoring.avm_training
+    runs-on: ubuntu-latest
+    # Measured shape of the work: ~10 min fill across 57 counties, ~22 min
+    # KNN across 40. The default 360-minute ceiling is the real limit; 120
+    # leaves generous headroom while still failing rather than hanging if
+    # the KNN pass loses its GiST index -- unindexed, that pass is 31 hours,
+    # not 22 minutes.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Rebuild AVM training set
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "1" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ -n "${{ inputs.source_file }}" ]; then
+            ARGS="$ARGS --source-file ${{ inputs.source_file }}"
+          fi
+          echo "[workflow] python -m scripts.rebuild_avm_training $ARGS"
+          python -m scripts.rebuild_avm_training $ARGS
