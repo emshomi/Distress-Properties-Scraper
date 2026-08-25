@@ -171,6 +171,73 @@ COUNTY_CONFIG = {
         "pin_regex": r"^[0-9]{8}$",
         "check_source": "crow_wing_arcgis",
     },
+    "anoka": {
+        # ADDED 2026-08-25 (task 2918). Largest unconfigured county: 274
+        # pending tracker windows, 139,159 parcels loaded, 12-digit PINs.
+        # First non-metro county where ALL THREE decide() branches can fire.
+        #
+        # === THERE IS NO ANOKA FIREWALL BLOCK ===
+        # This county was deprioritised three times on 2026-08-25 on the
+        # claim that "Anoka's Railway datacenter IP is blocked by the county
+        # firewall." Anoka_Sheriff_Lessons_Learned.md (2026-05-29) says no
+        # such thing. The obstacle it documents is the FORECLOSURE SITE --
+        # an ASP.NET WebForms app that fingerprints pure-HTTP clients and
+        # bounces them to error.aspx, solved in May with httpx + Playwright
+        # in-page fetch(), 80/80, and running green on a GitHub runner every
+        # morning since. Different host, different problem, already fixed.
+        # The GIS layer below took a plain requests.post with no browser.
+        "url": ("https://gisservices.co.anoka.mn.us/anoka_gis/rest/services/"
+                "Parcels/FeatureServer/0/query"),
+        "pin_field": "PIN",
+        "owner_fields": ["OWNER", "TAXPAYER"],
+        "sale_date_field": "SALE_DATE",
+        "sale_price_field": "SALE_PRICE",
+
+        # === SALE_DATE IS GENUINE EPOCH MILLISECONDS -- MEASURED ===
+        # No sale_date_format key, so parse_sale_date falls through to
+        # esri_ms. That default is CORRECT here and it was verified rather
+        # than assumed, because assuming it is exactly what killed
+        # hennepin: its SALE_DATE is esriFieldTypeString length 6 holding
+        # '202012', int('202012')/1000 is 202 seconds after the epoch, and
+        # every hennepin parcel parsed to a LEGAL 1970-01-01. The sale
+        # branch was dead for months and nothing said so.
+        #
+        # Anoka's field also reports esriFieldTypeDate -- the same thing
+        # hennepin's type would have suggested. Six raw values across three
+        # probe trials on 2026-08-25 settled it:
+        #
+        #   1133740800000 -> 2005-12-05    1601596800000 -> 2020-10-02
+        #   1143763200000 -> 2006-03-31    1755734400000 -> 2025-08-21
+        #   1445299200000 -> 2015-10-20    1757548800000 -> 2025-09-11
+        #
+        # A declared TYPE is not a wire FORMAT. Only a raw value settles it.
+        #
+        # SALE_PRICE is null on both 2025 sales and populated on older ones,
+        # so recent transfers land before their price does. It feeds only a
+        # notes string in decide(), so this is cosmetic, not a dead branch.
+
+        # No forfeiture field exists on this layer -- 96 fields, none of
+        # them a forfeiture state. None, like dakota and washington.
+        "forfeit_field": None,
+
+        # HOMESTEAD enumerated server-side over all 140,279 rows:
+        # 'Y' 105,887, null 34,392. NO 'N' VALUE -- anoka encodes
+        # not-homesteaded as NULL. Worth carrying deliberately: homestead
+        # is the single strongest term in the stage-2 survival model, and a
+        # county that writes null where another writes 'N' would silently
+        # change what homestead_yes means when the two are pooled.
+        #
+        # TAX_YEAR comes back as a Double -- 2026.0, not 2026. It is an
+        # assessment vintage, the thing hennepin structurally lacks.
+        "extra_fields": ["HOMESTEAD", "TAX_YEAR", "MKT_VALUE", "PROP_CLASS"],
+
+        # Stored bare, 12 digits: '023024140073'. All 10 pending tracker
+        # PINs returned on the first POST, so the digits-only tracker value
+        # matches the layer value exactly -- no variant needed.
+        "pin_variants": lambda pin: [pin],
+        "pin_regex": r"^[0-9]{12}$",
+        "check_source": "anoka_arcgis",
+    },
 }
 
 BATCH_SIZE = 100          # tracker PIDs per ArcGIS request
