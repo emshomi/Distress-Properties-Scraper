@@ -120,10 +120,43 @@ expanded AS (
          (b.event_type = tgt.target)::int AS event
   FROM base b
   CROSS JOIN (VALUES ('owner_exit'), ('foreclosure_sale')) AS tgt(target)
+  -- === STRATA: WITHIN-COUNTY ONLY, AND WHY ===
+  -- The first version of this view emitted a 'county' scope and a POOLED
+  -- 'homestead' scope. Both were measured on 2026-08-25 and both mislead.
+  --
+  -- COUNTY comparisons are a coverage artefact. At 365 days:
+  --     washington  84.4% resolved   31 events on   191 windows
+  --     hennepin     9.8% resolved   35 events on 1,196 windows
+  -- Two adjacent metro counties do not differ by 8x. Washington's tracker is
+  -- small and heavily checked; Hennepin's is large and barely checked -- its
+  -- ArcGIS batch has been failing with a 400 since 2026-08-23, and its sale
+  -- date parsed to 1970-01-01 for every parcel until it was fixed the same
+  -- day this was written. The curve measures HOW COMPLETELY WE HAVE CHECKED
+  -- EACH COUNTY. Dropped.
+  --
+  -- POOLED HOMESTEAD washes the effect out entirely:
+  --     homesteaded      40.5% resolved
+  --     non-homesteaded  44.2% resolved
+  -- which says homestead does not matter. Within Hennepin alone it plainly
+  -- does:
+  --     homesteaded      n=294  22 events  28.4% resolved
+  --     non-homesteaded  n=122  13 events  51.5% resolved
+  -- An absentee owner reaches a foreclosure sale at roughly TWICE the rate of
+  -- one living in the house. Pooling across counties whose event rates run
+  -- 2.9% to 16% swamps that completely.
+  --
+  -- The Cox model in ml/train_survival.py agreed all along -- homestead_yes
+  -- was its only significant term, p=0.000, because it STRATIFIES BY COUNTY.
+  -- The pooled curve disagreed because it did not. The model was right.
+  --
+  -- So the bucket is county AND homestead together. At n>=30 and events>=10
+  -- that will leave Hennepin and little else, and that is the correct
+  -- outcome: a comparison we cannot make honestly should not appear.
   CROSS JOIN LATERAL (VALUES
         ('all'::text,       'all windows'::text),
-        ('homestead'::text, coalesce(b.homestead, '(unknown)')),
-        ('county'::text,    coalesce(b.county_code, '(unknown)'))
+        ('county_homestead'::text,
+         coalesce(b.county_code, '(unknown)') || ' / ' ||
+         coalesce(b.homestead, '(unknown)'))
   ) AS st(scope, bucket)
   WHERE b.duration IS NOT NULL
     AND b.duration > 0
@@ -187,16 +220,20 @@ GROUP BY s.target, s.scope, s.bucket, s.n, s.events, h.horizon_days;
 --     If it rises, the running total is not ordered descending and n_risk is
 --     wrong.
 --   * every value is between 0 and 1.
---   * the 'all' stratum for foreclosure_sale sits near 0.86 at 365 days,
---     matching the lifelines KM in the training log (surv@365d = 0.8621).
---     That is the cross-check that this SQL agrees with the library.
---   * owner_exit 'all' near 0.94 at 365 days (lifelines: 0.9428).
+--   * the 'all' stratum for foreclosure_sale sits at 0.8893 at 365 days,
+--     matching the lifelines KM in the training log EXACTLY. That is the
+--     cross-check that this SQL agrees with the library, and it has now held
+--     twice -- before and after 137 duplicate rows were superseded.
+--   * owner_exit 'all' 0.9394 at 365 days (lifelines: 0.9394).
+--   * scope 'county' must NOT appear. If it does, the stratum list reverted.
+--   * county_homestead should show hennepin / homestead and
+--     hennepin / non-homestead, and probably nothing else. Fewer buckets than
+--     expected is the threshold working, not a fault.
 --
 --   SELECT now() AS run_at, target, scope, bucket, n, events,
 --          horizon_days, survival, resolved_pct
 --   FROM scoring.redemption_curves
---   WHERE scope = 'all'
---   ORDER BY target, horizon_days;
+--   ORDER BY target, scope, bucket, horizon_days;
 --
 -- If the 365-day figures do not match the training log to within a rounding
 -- step, the SQL and lifelines disagree about censoring and the SQL is wrong
