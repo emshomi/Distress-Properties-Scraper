@@ -92,6 +92,81 @@ COUNTY_CONFIG = {
         ],
         "check_source": "washington_arcgis",
     },
+    "crow_wing": {
+        # ADDED 2026-08-25 (task 2909). First county configured outside the
+        # metro three. 138 pending tracker windows, 77,579 parcels loaded,
+        # already eCRV-mapped, no known firewall obstacle.
+        #
+        # EVERY VALUE BELOW WAS PROBED AGAINST THE LIVE LAYER ON 2026-08-25,
+        # not read off the field list. That distinction is the whole reason
+        # this entry is correct -- see forfeit_field.
+        "url": ("https://gis.crowwing.us/cwc_external_main/rest/services/"
+                "Link_Public/MapServer/0/query"),
+        "pin_field": "PIN",
+        "owner_fields": ["OWNAME", "TXNAME"],
+
+        # === NO SALE DATA ON THIS LAYER ===
+        # 56 fields, none of them a sale date or sale price. Confirmed by
+        # enumerating the layer, not by failing to find one.
+        #
+        # CONSEQUENCE, stated so nobody rediscovers it: decide() has three
+        # signal branches and TWO of them need sale_date_field. With no
+        # sale field and no forfeit field (below), crow_wing runs on the
+        # REO owner-name match ALONE. One live branch out of three.
+        #
+        # That is exactly the state hennepin was in for months while
+        # looking healthy -- there, esri_ms_to_date('202012') returned a
+        # LEGAL 1970-01-01 for every parcel, so the sale branch was dead and
+        # nothing said so. Here the branch is dead for an honest reason and
+        # this comment is the thing that says so.
+        #
+        # Traced before setting these to None: line 260 guards the
+        # outFields build with `if f:`; attrs.get(None) returns None rather
+        # than raising; parse_sale_date passes None straight through
+        # esri_ms_to_date's explicit None guard; and the sale_price_field
+        # read at line 384 sits inside `if sale_dt and ...`, unreachable
+        # when sale_dt is None. No code change required.
+        "sale_date_field": None,
+        "sale_price_field": None,
+
+        # === TAXFALC IS **NOT** A FORFEITURE FLAG ===
+        # It was named one on 2026-08-25 from the letters TAX and FAL,
+        # asserted to be "exactly what hennepin's FORFEIT_LAND_IND does",
+        # and that was a guess dressed as a reading. A server-side GROUP BY
+        # over all 75,679 rows returned NINE values and no forfeiture state:
+        #
+        #   FEE 31,722 | OWN 30,902 | OTH 10,956 | CD 890 | LFE 387
+        #   LSE 78 | ASN 57 | null 686 | '' 1
+        #
+        # Those are INTEREST TYPES -- fee simple, owner, contract for deed,
+        # life estate, lease, assignment. decide() compares a forfeit flag
+        # against ('Y','T','1'), so had this been wired as forfeit_field the
+        # branch would have been silently dead and crow_wing would have run
+        # on ZERO working branches.
+        #
+        # Kept in extra_fields because CD (890 parcels) is a contract-for-
+        # deed population Govire reads from no other source.
+        "forfeit_field": None,
+
+        # DELINQUENT is 'YES' on 1,118 of 75,679 parcels -- 1.5%. Both
+        # tracker PINs probed came back YES; at that base rate two hits by
+        # chance is ~1 in 4,400. Carried so it lands in owner_checks.raw on
+        # every check and accumulates whether or not anything reads it yet.
+        #
+        # ASMT_YR is a real assessment year, which hennepin structurally
+        # lacks (104 payload keys, no vintage) -- see the emv_year work.
+        # APR_DATE is genuine epoch milliseconds (1774414800000 ->
+        # 2026-03-25), verified by repr rather than assumed from its type;
+        # it is an APPRAISAL date, not a sale, and feeds nothing.
+        "extra_fields": ["DELINQUENT", "ESTTOTVAL", "ASMT_YR", "TAXFALC"],
+
+        # Stored bare, 8 digits: '41301003'. All 10 pending tracker PINs
+        # returned on the first POST, so the digits-only tracker value
+        # matches the layer value exactly and needs no variant -- unlike
+        # washington's dotted 17-char form.
+        "pin_variants": lambda pin: [pin],
+        "check_source": "crow_wing_arcgis",
+    },
 }
 
 BATCH_SIZE = 100          # tracker PIDs per ArcGIS request
