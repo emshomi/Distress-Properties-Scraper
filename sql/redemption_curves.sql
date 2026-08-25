@@ -120,7 +120,7 @@ expanded AS (
          (b.event_type = tgt.target)::int AS event
   FROM base b
   CROSS JOIN (VALUES ('owner_exit'), ('foreclosure_sale')) AS tgt(target)
-  -- === STRATA: WITHIN-COUNTY ONLY, AND WHY ===
+  -- === ONE SCOPE ONLY, AND WHY ===
   -- The first version of this view emitted a 'county' scope and a POOLED
   -- 'homestead' scope. Both were measured on 2026-08-25 and both mislead.
   --
@@ -149,14 +149,50 @@ expanded AS (
   -- was its only significant term, p=0.000, because it STRATIFIES BY COUNTY.
   -- The pooled curve disagreed because it did not. The model was right.
   --
-  -- So the bucket is county AND homestead together. At n>=30 and events>=10
-  -- that will leave Hennepin and little else, and that is the correct
-  -- outcome: a comparison we cannot make honestly should not appear.
+  -- COUNTY x HOMESTEAD was then tried, and it fails too. At 365 days:
+  --
+  --     county      homesteaded   non-homesteaded   direction
+  --     dakota          37.1%          48.2%        non-hs faster
+  --     hennepin        28.4%          27.2%        NO DIFFERENCE
+  --     washington     100.0%          72.1%        homesteaded faster
+  --
+  -- Three adjacent metro counties, three different directions, and
+  -- washington / homestead at EXACTLY 100% resolved on 75 windows -- every
+  -- one reached a foreclosure sale inside a year. That is not a market fact.
+  -- A cut that reverses direction between neighbouring counties is not
+  -- measuring homestead.
+  --
+  -- (An earlier read appeared to show Hennepin separating 28.4% against
+  -- 51.5%. That query omitted the superseded filter and measured survival
+  -- over all time rather than at 365 days. On the same population and the
+  -- same horizon the gap is 1.2 points. The apparent finding was the query,
+  -- not the data.)
+  --
+  -- THE PATTERN, TWICE OVER: checking coverage varies so much between
+  -- counties that almost any stratification inherits it. Washington's
+  -- tracker is small and heavily checked; Hennepin's is large and barely
+  -- checked -- its ArcGIS batch has been failing with a 400 since
+  -- 2026-08-23, and its sale date parsed to 1970-01-01 for every parcel
+  -- until 2026-08-25. Stratifying to remove the confound found the confound
+  -- underneath.
+  --
+  -- So ONE scope. The pooled curve is a fair statement about the whole
+  -- population and it matches lifelines exactly -- 0.8893 and 0.9394, and
+  -- that cross-check has now held twice, before and after 137 duplicate rows
+  -- were superseded.
+  --
+  -- Revisit when the checker reaches Hennepin's 1,036 pending rows. Until
+  -- the counties are checked to comparable depth, no comparison between them
+  -- means anything.
+  --
+  -- The Cox model in ml/train_survival.py DOES find homestead significant
+  -- (p=0.000, and homestead_only scores C=0.79 against a full-model 0.83).
+  -- It stratifies by county, which these curves cannot do without falling
+  -- under their sample floor. That disagreement is unresolved and is why no
+  -- per-property hazard ships either.
+  -- ONE SCOPE. Everything else measured as a coverage artefact.
   CROSS JOIN LATERAL (VALUES
-        ('all'::text,       'all windows'::text),
-        ('county_homestead'::text,
-         coalesce(b.county_code, '(unknown)') || ' / ' ||
-         coalesce(b.homestead, '(unknown)'))
+        ('all'::text, 'all windows'::text)
   ) AS st(scope, bucket)
   WHERE b.duration IS NOT NULL
     AND b.duration > 0
@@ -225,10 +261,9 @@ GROUP BY s.target, s.scope, s.bucket, s.n, s.events, h.horizon_days;
 --     cross-check that this SQL agrees with the library, and it has now held
 --     twice -- before and after 137 duplicate rows were superseded.
 --   * owner_exit 'all' 0.9394 at 365 days (lifelines: 0.9394).
---   * scope 'county' must NOT appear. If it does, the stratum list reverted.
---   * county_homestead should show hennepin / homestead and
---     hennepin / non-homestead, and probably nothing else. Fewer buckets than
---     expected is the threshold working, not a fault.
+--   * scope must be 'all' and nothing else -- TWO rows at each horizon, one
+--     per target, ten rows in total. Any other scope means the stratum list
+--     reverted.
 --
 --   SELECT now() AS run_at, target, scope, bucket, n, events,
 --          horizon_days, survival, resolved_pct
