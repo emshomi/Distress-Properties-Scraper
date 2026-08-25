@@ -267,6 +267,12 @@ _LEVERAGE_FIELDS = (
     # at under 50% of assessed value redeem 72% of the time" without the
     # outcome history behind it.
     "redemption_rates",
+    # Redemption timing (2026-08-25) — the survival curves. Premium for the
+    # same reason as redemption_rates: it cannot be read off the public
+    # record at any level of access. Nobody reconstructs "11.1% of tracked
+    # windows reach a foreclosure sale within a year" without the outcome
+    # history behind it.
+    "redemption_timing",
     # Vacancy cost estimates (cumulative VBR fees + PVE exposure) are the
     # motivated-seller leverage for vacant properties — premium only.
     # (vacancy_years itself stays visible: it derives from a public date.)
