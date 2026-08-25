@@ -238,6 +238,58 @@ COUNTY_CONFIG = {
         "pin_regex": r"^[0-9]{12}$",
         "check_source": "anoka_arcgis",
     },
+    "carlton": {
+        # ADDED 2026-08-25 (task 2925). 31 pending windows, ALL 31 overdue
+        # since Oct-Nov 2025 -- the only configured county whose entire
+        # backlog is already past due. 32,874 parcels loaded, 9-digit PINs.
+        #
+        # The service description says "Basic land viewer of data for
+        # Carlton County employees" and the HTML Services Directory is
+        # disabled (403). The REST API itself answers anonymous POSTs
+        # normally -- verified from a residential IP on 2026-08-25.
+        "url": ("https://gis.co.carlton.mn.us/arcgis/rest/services/"
+                "AGOL/AGO_InternalViewer/MapServer/6/query"),
+
+        # === P_ID2, **NOT** PARCELID ===
+        # PARCELID is the obvious-looking field and it is the WRONG one. It
+        # stores the hyphenated form '06-030-0840'. Our tracker carries
+        # digits-only '060300840', so `PARCELID IN (...)` returned 0 of 10,
+        # and even `PARCELID LIKE '060%'` returned nothing across all
+        # 32,874 rows -- the leading digits do not appear in that form at
+        # all. P_ID2 holds the bare 9-digit value and matched 10 of 10.
+        #
+        # Second naming trap in two counties: crow_wing's TAXFALC looked
+        # like a forfeiture flag and holds interest types; carlton's
+        # PARCELID looks like the PIN field and is not the one that joins.
+        # Both were caught by probing rather than by reading field names.
+        "pin_field": "P_ID2",
+
+        # One owner field only -- there is no separate taxpayer-name field.
+        "owner_fields": ["OWNAME"],
+
+        # No sale-date and no sale-price field among the 37. APDEED is a
+        # Double (a document number, as in crow_wing), not a date.
+        "sale_date_field": None,
+        "sale_price_field": None,
+
+        # No forfeit FIELD -- carlton states forfeiture in OWNAME instead.
+        # See forfeit_owner_pattern and the decide() branch it feeds.
+        "forfeit_field": None,
+        "forfeit_owner_pattern": r"TAX FORFEIT",
+
+        # BALDUE is an unpaid tax balance in dollars -- 58.0, 187.0, 354.0
+        # on three of ten probed tracker parcels. No other configured
+        # county exposes a live delinquency amount. TPHSTC is homestead as
+        # PROSE ('Non Homestead', 'Owner Homestead (may be partial)'), not
+        # anoka's 'Y'/null flag: do NOT pool the two without normalising.
+        # PARCELID is carried so the hyphenated county-facing form is on
+        # every owner_checks row.
+        "extra_fields": ["PARCELID", "PHYSADDR", "TPHSTC", "TPYEAR",
+                         "ESTTOTVAL", "BALDUE", "TPCLS1"],
+        "pin_variants": lambda pin: [pin],
+        "pin_regex": r"^[0-9]{9}$",
+        "check_source": "carlton_arcgis",
+    },
 }
 
 BATCH_SIZE = 100          # tracker PIDs per ArcGIS request
@@ -511,6 +563,50 @@ def decide(cfg, row, attrs, today):
         forfeit = (attrs.get(cfg["forfeit_field"]) or "").strip().upper()
 
     reo_hit = match_reo(owner_values)
+
+    # === FORFEITURE STATED IN THE OWNER FIELD (2026-08-25, task 2925) ===
+    # Checked BEFORE the REO branch because it is the more specific claim.
+    #
+    # decide() has always read forfeiture from a dedicated FIELD
+    # (cfg["forfeit_field"], hennepin's FORFEIT_LAND_IND). Carlton has no
+    # such field -- it writes the state into OWNAME instead:
+    #
+    #   TAX FORFEIT - COUNTY ADMINISTERED    940
+    #   TAX FORFEIT - STATE ADMINISTERED   1,186
+    #
+    # Enumerated server-side over all 32,874 carlton parcels on 2026-08-25:
+    # EXACTLY those two strings, both prefixed 'TAX FORFEIT - ', so the
+    # pattern below covers the whole vocabulary with no false-positive
+    # surface. Three of ten probed carlton tracker parcels already carry it
+    # -- windows that closed in Oct-Nov 2025 and would otherwise ladder out
+    # to 'unknown', discarding a known outcome.
+    #
+    # NOT added to REO_PATTERNS. That list means a LENDER holds the
+    # property (ch. 580/582 mortgage foreclosure). Tax forfeiture is ch.
+    # 281 and the property went to the state. redemption_builder.py is
+    # explicit that forcing one statutory track onto the other "would make
+    # every row in this table ambiguous about which law it describes".
+    # Routing here instead reuses the forfeit branch's contract:
+    # ambiguous=True and a _forfeit_* detection source.
+    #
+    # OUTCOME IS 'foreclosed' AND THAT IS SECOND-BEST, NOT RIGHT. The check
+    # constraint permits exactly eight values -- pending, redeemed_by_owner,
+    # redeemed_by_junior, foreclosed, foreclosed_sold, deed_in_lieu,
+    # sale_cancelled, unknown -- and NONE names tax forfeiture. Read before
+    # writing rather than assumed. 'foreclosed' carries the true part (the
+    # owner lost the property); ambiguous=True and the detection source
+    # carry the rest. If a 'tax_forfeited' value is ever added to that
+    # constraint, this branch is where it belongs.
+    forfeit_owner_re = cfg.get("forfeit_owner_pattern")
+    if forfeit_owner_re:
+        for val in owner_values:
+            if val and re.search(forfeit_owner_re, val, re.IGNORECASE):
+                return ("foreclosed", True, src + "_forfeit_owner_name",
+                        "Owner field states tax forfeiture: '%s' "
+                        "(Minn. Stat. ch. 281 track, not ch. 580/582; "
+                        "review)" % val,
+                        None, row["check_stage"], None)
+
     if reo_hit:
         # No date: an owner-name match says the lender HOLDS it, not when
         # title moved. All 41 REO rows are undated and that is correct.
