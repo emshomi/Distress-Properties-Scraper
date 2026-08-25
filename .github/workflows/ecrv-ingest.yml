@@ -15,6 +15,11 @@ name: eCRV Ingest
 #
 # Idempotent on (crv_number_id, parcel_id_raw): re-running the same file
 # updates rather than duplicates. Weekly extracts overlap by design.
+#
+# TWO STEPS RUN AFTER THE INGEST (added 2026-08-25):
+#   - the ingest itself now reports county codes with no ecrv_county_map
+#     entry, whose sales join to nothing downstream
+#   - scoring.avm_training is rebuilt, because eCRV is its only input
 on:
   workflow_dispatch:
     inputs:
@@ -26,9 +31,13 @@ jobs:
   ingest:
     name: Ingest eCRV weekly extract
     runs-on: ubuntu-latest
-    # ~2,700 certificates -> ~3,000 parcel rows, parsed in seconds; the
-    # time is the download plus batched upserts.
-    timeout-minutes: 20
+    # RAISED 20 -> 60 on 2026-08-25. The ingest itself is seconds — ~2,700
+    # certificates to ~3,000 parcel rows, the time being download plus
+    # batched upserts. The AVM rebuild step below is ~15 minutes measured
+    # (2.6 min fill, 12.1 min KNN, 207,118 rows), so 20 left almost no
+    # margin and 60 leaves real headroom without letting a hung KNN pass
+    # run indefinitely.
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -52,3 +61,44 @@ jobs:
           SCHEDULER_TIMEZONE: America/Chicago
         run: |
           python -m scripts.run_ecrv_ingest "${{ inputs.object_name }}"
+
+      - name: Rebuild AVM training set
+        # === WHY THIS RUNS HERE ===
+        # scoring.avm_training had NO refresh path. It is a plain table, so
+        # the Monday `refresh-deal-math` pg_cron job does not touch it —
+        # that job refreshes scoring.comp_ratios, a different object which
+        # IS current and does serve Premium deal math. avm_training was
+        # built BY HAND three times (n_tup_ins 565,002 = 182,020 + 182,020
+        # + 200,962) and drifted in between.
+        #
+        # eCRV is its ONLY input, so this is the exact moment its data
+        # changes. Nothing else needs to remember.
+        #
+        # === WHY A FULL REBUILD AND NOT AN APPEND ===
+        # knn_ratio is the median sale-to-assessment of the 10 nearest
+        # PRIOR sales. Prior-only, so appending NEWER rows could not
+        # invalidate existing values — which suggested an append would take
+        # seconds. Measured 2026-08-25 against one real weekly extract:
+        #
+        #     eligible new rows      2,054
+        #     strictly newer           391   (19%)
+        #     dated at or before     1,663   (81%)   earliest 2024-02-01
+        #
+        # 81% of a weekly file is LATE-FILED. eCRV filing lags the deed by
+        # up to two and a half years, and every late arrival becomes a
+        # prior neighbour for rows already loaded. Append-only would leave
+        # most of each affected county stale.
+        #
+        # === SAFE TO FAIL ===
+        # The script builds scoring.avm_training_new, validates row count,
+        # county count and knn coverage, and swaps only if all three pass.
+        # The live table serves throughout and becomes avm_training_old at
+        # the end. A failure mid-run leaves the previous build in place and
+        # writes a row to scoring.avm_build_log with the reason.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+        run: |
+          python -m scripts.rebuild_avm_training \
+            --source-file "${{ inputs.object_name }}"
