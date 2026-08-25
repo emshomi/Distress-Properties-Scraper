@@ -116,6 +116,53 @@ MIN_C_INDEX = 0.60
 # C-index says. 92 events across ~10 covariates is already thin.
 MIN_EVENTS = 60
 
+# SHERIFF SALES ONLY. ADDED 2026-08-25 evening, matching the identical
+# filter added to scoring.redemption_curves the same day.
+#
+# === WHY, AND WHAT IT COSTS ===
+# This query had NO WHERE CLAUSE and pulled all 1,671 feature rows. 335 of
+# them are anchor_type = 'tax_judgment_sale' -- Minn. Stat. ch. 281 tax
+# forfeiture, a three-year clock from judgment -- pooled with ch. 580/582
+# mortgage redemption, a six-month clock from the sheriff sale.
+#
+# Measured 2026-08-25:
+#
+#     anchor_type          rows   events   avg duration
+#     sheriff_sale        1,336      218        159 days
+#     tax_judgment_sale     335        0        921 days
+#
+# EVERY tax-forfeiture row is censored and always will be. outcome_checker
+# detects MORTGAGE foreclosure outcomes -- an REO owner name, a post-expiry
+# deed -- and a forfeiture window cannot reach a foreclosure sale at all.
+# So 315 of them entered the risk set, sat there for an average of 921
+# days, never failed, and depressed the hazard at every event time.
+#
+# In the SQL curve, removing them moved "reached a foreclosure sale within
+# 1 year" from 18.8% to 33.0%.
+#
+# === THIS BREAKS THE CROSS-CHECK UNTIL IT IS RE-RUN ===
+# The pre-fix SQL matched this script's lifelines KM to four decimals --
+# 0.8893 and 0.9394 at 365 days -- and that agreement held TWICE, before
+# and after 137 duplicate rows were superseded. Two independent
+# implementations agreeing is the strongest check this project has.
+#
+# The SQL was fixed first, so right now the two DISAGREE. The new SQL
+# figures at 365 days are:
+#
+#     foreclosure_sale  survival 0.6697   (resolved 33.0%)
+#     owner_exit        survival 0.8504   (resolved 15.0%)
+#
+# A run of this script must reproduce those to within a rounding step. If
+# it does not, the two implementations disagree about censoring and the
+# disagreement is the finding -- lifelines is the reference here, not the
+# SQL.
+#
+# === THE C-INDEX FIGURES IN THE HEADER ARE NOW STALE ===
+# 0.803 / 0.805 pooled and 0.866 within-county were all measured on the
+# statute-mixed population of 1,671. Refitting on 1,336 will move them, and
+# possibly by a lot: 315 never-failing rows were 19% of the sample and
+# every one of them was trivially easy to rank correctly. Expect the
+# C-index to FALL, and do not read a fall as the model getting worse.
 QUERY = """
 SELECT tracker_id, county_code, outcome, event_type, censored,
        outcome_ambiguous, days_anchor_to_event, days_observed,
@@ -124,6 +171,7 @@ SELECT tracker_id, county_code, outcome, event_type, censored,
        amount_owed, final_bid, bid_to_value, paid_vs_value,
        buyer_type, notice_of_intent
 FROM scoring.redemption_features
+WHERE anchor_type = 'sheriff_sale'
 """
 
 
