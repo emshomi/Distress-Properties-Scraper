@@ -199,7 +199,35 @@ def fetch_county_batch(cfg, pins):
     resp.raise_for_status()
     body = resp.json()
     if "error" in body:
-        raise RuntimeError("ArcGIS error: %s" % json.dumps(body["error"]))
+        # === THE ERROR MUST NAME THE REQUEST THAT CAUSED IT ===
+        # hennepin returned {"code":400,"message":"Unable to complete
+        # operation","details":[]} on 2026-08-23 and again on 2026-08-24,
+        # both times on the same 5 PINs, and the log said nothing else.
+        #
+        # SIX hypotheses were tested against the live layer by hand and ALL
+        # SIX came back working: the layer exists with 122 fields and
+        # maxRecordCount 2000; PID, OWNER_NM, TAXPAYER_NM, SALE_DATE,
+        # SALE_PRICE and FORFEIT_LAND_IND are all present; PID is
+        # esriFieldTypeString so the quoted IN clause is correct; a 5-PIN
+        # batch returns all 5; a single PIN returns 1; and every one of
+        # extra_fields (SALE_CODE_NAME, TORRENS_TYP, ABSTR_TORRENS_CD) is on
+        # the layer and returns a value.
+        #
+        # Seven round trips to learn nothing, because the instrument was
+        # missing. ArcGIS returns this same opaque message for a malformed
+        # where clause, an unknown field, an over-long request and a server
+        # limit, so the response body alone cannot distinguish them -- only
+        # the REQUEST can.
+        #
+        # Logged: the url, the full where clause, the outFields string and
+        # the PIN count. That is enough to rebuild the exact call and run it
+        # by hand.
+        raise RuntimeError(
+            "ArcGIS error: %s | url=%s | where=%s | outFields=%s | "
+            "pins=%d | where_len=%d"
+            % (json.dumps(body["error"]), cfg["url"], where,
+               payload["outFields"], len(pins), len(where))
+        )
     result = {}
     for feature in body.get("features", []):
         attrs = feature.get("attributes", {})
