@@ -62,6 +62,54 @@ jobs:
         run: |
           python -m scripts.run_ecrv_ingest "${{ inputs.object_name }}"
 
+      - name: Refresh deal-math matviews
+        # === WHY HERE AND NOT ONLY ON MONDAY ===
+        # scoring.comp_ratios is the rate table serving Premium deal math.
+        # It refreshes on pg_cron job `refresh-deal-math`, Mondays 15:00
+        # UTC — so before this step, an extract loaded on a Tuesday did not
+        # reach subscribers until the following Monday. Up to five days of
+        # lag on the one object a paying subscriber actually reads.
+        #
+        # BOTH views are eCRV-derived; read from pg_depend rather than
+        # inferred from their names on 2026-08-25:
+        #
+        #   comp_ratios          -> outcomes.ecrv_sales,
+        #                           outcomes.ecrv_county_map, core.parcels
+        #   distress_multipliers -> outcomes.distressed_exit_sales
+        #                           -> outcomes.ecrv_channel (eCRV),
+        #                              signals.distress_with_parcel
+        #
+        # The Monday job STAYS. distress_multipliers also depends on
+        # signals.distress_with_parcel, which the daily sheriff scrapers
+        # feed, so it goes stale between ingests for a reason this step
+        # does not address.
+        #
+        # NOT CONCURRENTLY: neither matview has a unique index, so
+        # REFRESH MATERIALIZED VIEW CONCURRENTLY is unavailable. A plain
+        # refresh takes an exclusive lock, which at 48 kB and 24 kB is
+        # milliseconds — acceptable, and stated so nobody assumes
+        # otherwise.
+        #
+        # Runs BEFORE the AVM rebuild: it takes seconds and serves live
+        # subscribers, while the rebuild takes ~15 minutes and serves an
+        # offline experiment.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os, psycopg2
+          conn = psycopg2.connect(os.environ["DATABASE_URL"])
+          conn.autocommit = True
+          for mv in ("scoring.comp_ratios", "scoring.distress_multipliers"):
+              with conn.cursor() as cur:
+                  cur.execute("REFRESH MATERIALIZED VIEW %s" % mv)
+                  cur.execute(
+                      "SELECT count(*) FROM %s" % mv)
+                  print("[refresh] %s -> %d rows"
+                        % (mv, cur.fetchone()[0]), flush=True)
+          conn.close()
+          PY
+
       - name: Rebuild AVM training set
         # === WHY THIS RUNS HERE ===
         # scoring.avm_training had NO refresh path. It is a plain table, so
