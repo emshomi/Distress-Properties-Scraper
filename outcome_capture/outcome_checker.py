@@ -53,6 +53,11 @@ COUNTY_CONFIG = {
         "sale_price_field": "SALE_PRICE",
         "forfeit_field": "FORFEIT_LAND_IND",
         "extra_fields": ["SALE_CODE_NAME", "TORRENS_TYP", "ABSTR_TORRENS_CD"],
+        # SALE_DATE here is esriFieldTypeString length 6 -- '202012' -- not
+        # epoch ms. Verified against the live layer 2026-08-25. Without this
+        # every hennepin sale date parsed to 1970-01-01 and the sale branch
+        # was dead. See parse_sale_date.
+        "sale_date_format": "yyyymm",
         "pin_variants": lambda pin: [pin],
         "check_source": "hennepin_arcgis",
     },
@@ -160,6 +165,74 @@ def esri_ms_to_date(value):
         return datetime.fromtimestamp(int(value) / 1000.0, tz=timezone.utc).date()
     except (ValueError, TypeError, OSError):
         return None
+
+
+def yyyymm_to_date(value):
+    """Convert a 6-character YYYYMM string to the first of that month.
+
+    Hennepin's SALE_DATE is esriFieldTypeString with length 6 -- '202012',
+    '201610', '200004' -- NOT epoch milliseconds. Verified against the live
+    layer 2026-08-25.
+
+    The day is not published, so this returns the first of the month. That is
+    an approximation of up to 30 days and it is acceptable here: the branch
+    it feeds asks whether a sale happened AFTER a redemption expiry, and a
+    30-day error only matters for sales in the expiry month itself.
+    hennepin_parcels.py makes the same approximation for last_sale_date.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if len(text) != 6 or not text.isdigit():
+        return None
+    year, month = int(text[:4]), int(text[4:])
+    if not (1900 <= year <= 2100) or not (1 <= month <= 12):
+        return None
+    return date(year, month, 1)
+
+
+# Dispatch by the format a county actually publishes. Added 2026-08-25.
+_DATE_PARSERS = {
+    "esri_ms": esri_ms_to_date,
+    "yyyymm": yyyymm_to_date,
+}
+
+
+def parse_sale_date(cfg, value):
+    """Parse a county's sale-date field using ITS format, not a default.
+
+    === WHY THIS EXISTS: A SILENT 1970 ===
+    Every county went through esri_ms_to_date. Washington and Dakota publish
+    real epoch-millisecond date fields, so that worked. Hennepin publishes a
+    6-character YYYYMM STRING, and int('202012')/1000 is 202 seconds after
+    the epoch:
+
+        esri_ms_to_date('202012')  ->  1970-01-01
+        esri_ms_to_date('201610')  ->  1970-01-01
+        esri_ms_to_date('200004')  ->  1970-01-01
+
+    Not an exception. Not None. A LEGAL DATE, for every Hennepin parcel.
+
+    So `sale_dt > expiry` was always false and `sale_dt` inside the window was
+    always false, and the sale branch was DEAD for Hennepin while looking
+    perfectly healthy. The only branch that could ever fire was the REO
+    owner-name match.
+
+    That shows up in the outcome counts: hennepin has 35 foreclosure_sale
+    events against washington's 57, on FOUR TIMES the windows -- 1,196 to 328.
+    Read as a market difference that is Hennepin resolving slower. It is not.
+    It is one branch that could never fire.
+
+    A parser that returns a wrong answer is worse than one that raises,
+    because nothing downstream can tell.
+    """
+    fmt = cfg.get("sale_date_format", "esri_ms")
+    parser = _DATE_PARSERS.get(fmt)
+    if parser is None:
+        logger_msg = "unknown sale_date_format %r; treating as no date" % fmt
+        log(logger_msg)
+        return None
+    return parser(value)
 
 
 def match_reo(names):
@@ -286,7 +359,7 @@ def decide(cfg, row, attrs, today):
                 min(row["check_stage"] + 1, len(LADDER_OFFSETS)), None)
 
     owner_values = [attrs.get(f) or "" for f in cfg["owner_fields"]]
-    sale_dt = esri_ms_to_date(attrs.get(cfg["sale_date_field"]))
+    sale_dt = parse_sale_date(cfg, attrs.get(cfg["sale_date_field"]))
     forfeit = ""
     if cfg["forfeit_field"]:
         forfeit = (attrs.get(cfg["forfeit_field"]) or "").strip().upper()
