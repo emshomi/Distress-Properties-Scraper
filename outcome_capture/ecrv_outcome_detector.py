@@ -187,10 +187,26 @@ LOW_CONSIDERATION_RATIO = 0.4
 # The 2026-08-25 dry run stamped parcel 213124210030 twice from a single
 # $248,000 sale, which is the exact defect this was meant to prevent.
 #
-# Keyed on (county_code, parcel_id, deed_date) and ordered so the window
-# with the EARLIEST expiry after the deed wins -- the first window that
-# sale could have resolved. Deliberately not the latest, which would let
-# one sale close a window opened months afterwards.
+# Keyed on (county_code, parcel_id) and ordered by deed_date ASC, so the
+# EARLIEST sale out of the window wins, then the earliest expiry after it.
+#
+# THE KEY DELIBERATELY EXCLUDES deed_date, and the second version got that
+# wrong. With deed_date in the key, parcel 253324210007 produced TWO rows
+# on the 2026-08-25 dry run:
+#
+#   OTHER    $147,720  2025-12-29  Realty Pros LLC -> Minnesota Renovations
+#   WARRNTY  $366,900  2026-05-06  Minnesota Renovations -> Jackson Bringle
+#
+# Those are two GENUINELY DIFFERENT sales, not a duplicate row -- a flip
+# chain across one redemption window. Only the FIRST conveyance resolves
+# the window; the second is what the new owner did afterwards and says
+# nothing about the foreclosure.
+#
+# STAMP_SQL's `outcome = 'pending'` guard meant the second write was a
+# no-op, so the database stayed correct either way. The damage was to the
+# COUNT: the log reported both, and a reported figure that does not match
+# what was written is the defect this project has been bitten by
+# repeatedly today.
 CANDIDATE_SQL = """
 WITH repeat_sellers AS (
   SELECT regexp_replace(lower(array_to_string(es.sellers, '; ')),
@@ -207,7 +223,7 @@ WITH repeat_sellers AS (
   GROUP BY 1
   HAVING count(DISTINCT rt.id) >= %(repeat_min)s
 )
-SELECT DISTINCT ON (rt.county_code, rt.parcel_id, es.deed_date)
+SELECT DISTINCT ON (rt.county_code, rt.parcel_id)
        rt.id                       AS tracker_id,
        rt.county_code,
        rt.parcel_id,
