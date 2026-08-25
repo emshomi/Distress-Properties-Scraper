@@ -666,6 +666,69 @@ WHERE t.anchor_type = 'tax_judgment_sale'
 """
 
 
+RETIRE_REKEYED_SQL = """
+-- Retire tracker rows orphaned when signals.distress_events.parcel_id is
+-- re-keyed from a stub to a real PIN.
+--
+-- ADDED 2026-08-25 (task 2890). This closes the defect the module docstring
+-- already names for anchor_date:
+--
+--   "NOT YET SOLVED: a POSTPONED sale moves anchor_date, which is part of
+--    the key, so the postponed sale inserts a NEW row and the old window
+--    survives alongside it."
+--
+-- Same mechanism, parcel_id instead of anchor_date. parcel_id is part of
+-- ON CONFLICT (county_code, parcel_id, anchor_date). When an upstream
+-- re-key changes de.parcel_id from 'HENNEPIN-FC-2506001' to
+-- '0102824110078', the next run derives a row under the NEW key, finds no
+-- conflict, and INSERTS. The stub row has nothing to update it and survives
+-- forever -- pending, and invisible to outcome_checker, whose selection
+-- requires a digits-only PIN.
+--
+-- MEASURED 2026-08-25 before this existed: 729 orphaned stub rows.
+-- hennepin 579, dakota 148, pennington 1, chisago 1. Hennepin's "1,036
+-- pending" was 456 real windows and 579 shadows of them; 241 of the shadows
+-- tracked windows their twin had ALREADY resolved. Every one of the 727
+-- checked by hand shared its twin's source_id AND redemption_expiry_date --
+-- 727 of 727, no exceptions -- which is what licensed retiring them.
+--
+-- THE EXPIRY EQUALITY IS LOAD-BEARING, not decoration. Same source event,
+-- same county, same anchor, DIFFERENT window means these are not one sale
+-- recorded twice and retiring the older one would destroy a real record.
+-- That is the error that nearly cost the 18 Washington orphans, which had
+-- no twin at all.
+--
+-- superseded_by, NOT outcome. outcome is check-constrained to eight values
+-- and every one describes something that happened to the PROPERTY. The
+-- constraint rejected an attempt to write 'superseded' there and was right.
+--
+-- Width is {8,13}: Minnesota PINs are 8 (crow_wing), 9 (most rural),
+-- 11 (lake), 12 (anoka/ramsey/olmsted/st_louis) and 13 (metro) digits,
+-- confirmed against core.parcels county by county on 2026-08-25. A
+-- single-width test is wrong for most of the state.
+--
+-- Expected steady-state volume is LOW. Measured over ten weeks, 10 of 149
+-- new hennepin sheriff-sale events arrived stub-keyed (6.7%), dakota 0 of
+-- 8. This prevents accrual; it does not recover a backlog.
+UPDATE outcomes.redemption_tracker stale
+SET superseded_by = live.id,
+    updated_at    = now()
+FROM outcomes.redemption_tracker live
+WHERE live.source_table = stale.source_table
+  AND live.source_id    = stale.source_id
+  AND live.county_code  = stale.county_code
+  AND live.anchor_date  = stale.anchor_date
+  AND live.id <> stale.id
+  AND live.redemption_expiry_date = stale.redemption_expiry_date
+  AND stale.superseded_by IS NULL
+  AND live.superseded_by  IS NULL
+  AND stale.outcome = 'pending'
+  AND stale.parcel_id <> live.parcel_id
+  AND regexp_replace(live.parcel_id,  '\\D', '', 'g') ~ '^[0-9]{8,13}$'
+  AND NOT (regexp_replace(stale.parcel_id, '\\D', '', 'g') ~ '^[0-9]{8,13}$');
+"""
+
+
 def main() -> int:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
@@ -703,6 +766,7 @@ def main() -> int:
 
         written = 0
         pruned = 0
+        retired = 0
         with conn.cursor() as cur:
             for r in rows:
                 cur.execute(UPSERT_SQL, r)
@@ -713,11 +777,21 @@ def main() -> int:
             # cannot be deleted and re-created.
             cur.execute(PRUNE_ORPHANED_TAX_SQL)
             pruned = cur.rowcount
+
+            # Retire AFTER the upsert and in the SAME transaction, for the
+            # same reason the prune is: the re-keyed row this run inserts
+            # must already exist before its stub twin can be pointed at it.
+            # Running this first would find no twin and retire nothing.
+            cur.execute(RETIRE_REKEYED_SQL)
+            retired = cur.rowcount
         conn.commit()
         log(f"upserted {written} tracker rows")
         if pruned:
             log(f"pruned {pruned} tax-forfeiture row(s) whose source event "
                 "no longer exists")
+        if retired:
+            log(f"retired {retired} stub-keyed row(s) superseded by a "
+                "re-keyed twin (same source event, same window)")
         return 0
     except Exception as e:
         conn.rollback()
