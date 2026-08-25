@@ -2443,15 +2443,40 @@ def _redemption_timing() -> Optional[dict[str, Any]]:
     checked. Splitting by homestead WITHIN county then gave three counties
     and three different directions, one of them exactly 100%.
 
-    A Cox model DOES rank windows -- C=0.83 pooled, 0.86 within county, with
-    a covariate-free control at exactly 0.500 -- but homestead_yes alone
-    carries 0.79 of it and these curves cannot reproduce that effect in any
-    single county. Two methods on the same data disagree. Until that
-    resolves, a per-property hazard would assert something indefensible.
+    === THE COX ARGUMENT RECORDED HERE WAS OBSOLETED 2026-08-25 EVENING ===
+    It read: the model scores C=0.83 pooled and 0.86 within county, but
+    homestead_yes alone carries 0.79 of it and these curves cannot reproduce
+    that effect in any single county, so two methods disagree and a
+    per-property hazard would assert something indefensible.
+
+    Both halves are gone. scoring.redemption_curves was pooling TWO
+    STATUTORY TRACKS -- 315 ch. 281 tax-forfeiture windows on a three-year
+    clock mixed with 1,336 ch. 580/582 mortgage windows on a six-month one.
+    Every forfeiture row was censored and always would be, because
+    outcome_checker detects mortgage outcomes and a forfeiture window cannot
+    reach a foreclosure sale at all.
+
+    Refit on sheriff sales only:
+
+        C-index         0.803 / 0.805  ->  0.661 / 0.669
+        homestead-only  0.742 / 0.761  ->  0.594 / 0.618
+        homestead p             0.000  ->  0.121 / 0.331
+
+    homestead_yes is NO LONGER SIGNIFICANT and its solo C is below the 0.60
+    bar, so it does not carry the model. And the disagreement did not
+    resolve -- it EVAPORATED. The forfeiture rows are overwhelmingly
+    non-homesteaded parcels that never fail, so including them made
+    "homesteaded" look predictive of resolution when it was partly
+    predicting "is this a mortgage foreclosure at all". The curves were
+    right.
+
+    The model still does not ship, for a WEAKER reason than before: one term
+    at p=0.03 across 109 events, nothing significant for foreclosure_sale,
+    and C=0.66 is nearer a coin than the 0.83 that was never real.
 
     So: one honest population-level statement, with its event count, and the
-    basis string says plainly that it describes comparable windows rather
-    than this property.
+    basis string says plainly that it describes comparable MORTGAGE
+    foreclosure windows rather than this property.
     """
     rows = _load_redemption_curves()
     if not rows:
@@ -2493,12 +2518,14 @@ def _redemption_timing() -> Optional[dict[str, Any]]:
             "owner_exit_pct": _at(oe, 365),
         },
         "basis": (
-            "Observed timing from %s tracked redemption windows: %s reached a "
-            "foreclosure sale and %s saw the owner sell during the window. "
-            "Measured from the sheriff sale date. These describe comparable "
-            "windows across every county we track, NOT this property - the "
-            "per-county figures differ mainly by how completely each county "
-            "has been checked, so they are not published."
+            "Observed timing from %s tracked mortgage foreclosure windows: "
+            "%s reached a foreclosure sale and %s saw the owner sell during "
+            "the window. Measured from the sheriff sale date. Tax-forfeiture "
+            "windows run on a different statutory clock and are excluded. "
+            "These describe comparable windows across every county we track, "
+            "NOT this property - the per-county figures differ mainly by how "
+            "completely each county has been checked, so they are not "
+            "published."
             % (
                 (fc or oe or {}).get("n", "the"),
                 (fc or {}).get("events", "n/a"),
