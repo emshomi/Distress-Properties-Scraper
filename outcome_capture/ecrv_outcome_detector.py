@@ -147,6 +147,23 @@ REDEMPTION_DEEDS = ("WARRNTY", "SPECWARNTY", "PERREPDEED", "PROBATE",
 # describe the same inference: "Corporate seller resolving that many
 # foreclosed properties post-redemption is a certificate holder, not an
 # owner who redeemed."
+#
+# THE KEY IS NORMALISED, AND IT HAS TO BE. The first version grouped on
+# lower(btrim(sellers)) and the threshold was defeated by punctuation:
+# 'Creative Real Estate Inc' and 'Creative Real Estate, Inc.' are two keys,
+# so a seller on 5 tracked foreclosures counted as 4 and 1 and passed
+# through as a redemption. Measured after normalising: Alabama 2 8->10,
+# Realty Pros 8->9, Creative Real Estate 4->5, Renovo Holdings 3->4,
+# Blackstone 1 3->4, Minnesota Renovations 2->3, Miramac 2->3.
+#
+# Same failure as carlton's PARCELID vs P_ID2 the same afternoon -- an
+# identifier compared without normalising its punctuation.
+#
+# The threshold SURVIVED normalisation, which is the stronger result. At 3+
+# all nineteen sellers are corporate, trusts, credit unions or GSEs, and
+# not one individual appears. At 2 individuals appear immediately -- Amy L.
+# Revak, Patrick N. Andersen, Samual S. Anderson -- and all three are known
+# DOUBLE-COUNTS rather than repeat sellers.
 REPEAT_SELLER_MIN_TRACKERS = 3
 
 # Below this share of assessed value, a sale is flagged ambiguous rather
@@ -176,7 +193,8 @@ LOW_CONSIDERATION_RATIO = 0.4
 # one sale close a window opened months afterwards.
 CANDIDATE_SQL = """
 WITH repeat_sellers AS (
-  SELECT lower(btrim(array_to_string(es.sellers, '; '))) AS seller_key,
+  SELECT regexp_replace(lower(array_to_string(es.sellers, '; ')),
+                        '[^a-z0-9]', '', 'g') AS seller_key,
          count(DISTINCT rt.id) AS trackers
   FROM outcomes.redemption_tracker rt
   JOIN outcomes.ecrv_county_map m ON m.county_slug = rt.county_code
@@ -219,7 +237,8 @@ LEFT JOIN core.parcels p
        ON p.county_code = rt.county_code
       AND p.parcel_id   = rt.parcel_id
 LEFT JOIN repeat_sellers rs
-       ON rs.seller_key = lower(btrim(array_to_string(es.sellers, '; ')))
+       ON rs.seller_key = regexp_replace(
+            lower(array_to_string(es.sellers, '; ')), '[^a-z0-9]', '', 'g')
 WHERE rt.outcome = 'pending'
   AND rt.superseded_by IS NULL
   AND es.primary_parcel
