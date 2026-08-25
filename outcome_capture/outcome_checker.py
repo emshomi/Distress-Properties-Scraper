@@ -380,6 +380,19 @@ REO_PATTERNS = [
     r"\bFREDDIE\s*MAC\b",
     r"SECRETARY OF HOUSING",          # HUD
     r"\bHUD\b",
+    # === THE VA WAS MISSING ENTIRELY (added 2026-08-25, task 2950) ===
+    # Largest single miss in the list. outcomes.owner_checks has recorded
+    # every owner on every check since July and was never read back until
+    # today; when it was, the Secretary of Veterans Affairs held 23 TRACKED
+    # PARCELS across three spellings and matched nothing:
+    #   SECRETARY OF VETERANS AFFAIRS  16 trackers
+    #   SEC OF VETERANS AFFAIRS         6
+    #   SECRETARY OF VETERANS AFFAIR    1  (no trailing S)
+    # HUD was covered and the VA was not, which is an omission rather than
+    # a judgement -- VA-guaranteed loans are a large share of Minnesota
+    # foreclosures.
+    r"SEC(RETARY)?\s+OF\s+VETERANS\s+AFFAIR",
+    r"\bVETERANS\s+AFFAIRS\b",
     r"U\.?\s*S\.?\s*BANK.*TRUST",
     r"WILMINGTON TRUST",
     r"WILMINGTON SAVINGS",
@@ -407,6 +420,66 @@ REO_PATTERNS = [
     r"\bUS BANK NATIONAL ASSOC",
     r"\bCREDIT UNION\b",
     r"SAVINGS BANK",
+
+    # === ABBREVIATIONS DEFEATED THE LIST (added 2026-08-25, task 2950) ===
+    # Read from outcomes.owner_checks, which had recorded every owner on
+    # every check since July and had never been read back. Counties write
+    # the same institution differently and three abbreviations account for
+    # most of the misses:
+    #
+    #   NATL  'FEDERAL NATL MORTGAGE ASSN'      12 trackers, Fannie Mae.
+    #         Anoka writes it out in full and matched; hennepin abbreviates
+    #         and never has.
+    #   MTG   'FEDERAL HOME LOAN MTG CORP', 'CITIGROUP MTG LOAN TR 2023-A',
+    #         'CARRINGTON MTG SERVICES LLC', 'ROCKET MTG LLC'. The list
+    #         spelled MORTGAGE out every time, so a single abbreviation
+    #         defeated its two largest patterns.
+    #   TRS   'US BANK TRS CO NATL ASSOC TRS', 'CITIBANK NA TRS',
+    #         'MEB REO TRS VI', 'FED HOME LOAN MTG CORP TRS'. The list had
+    #         \bTRUSTEE\b; TRS is the county abbreviation for it.
+    r"FED(ERAL)?\s+NAT(IONAL|L)?\s+MORT",
+    r"FED(ERAL)?\s+HOME\s+LOAN\s+MT(G|GE)",
+    r"\bMTG\s+(LOAN|SERVICES|SERVICING|CORP|COMPANY|LLC|INC|TR)\b",
+    r"\bMORT\.?\s+(CO|CORP)\b",
+    r"\bTRS\b",
+
+    # Whole categories with no pattern at all. Each string below appeared
+    # on a TRACKED parcel and can only mean an institution holding title.
+    r"\bFUNDING\s+(LLC|INC|CORP|COMPANY)\b",
+    r"\bLENDING\s+(LLC|INC|CORP|COMPANY)\b",
+    r"\bREO\b",
+    r"ACQUISITION TRUST",
+    r"CREDIT OPPORTUNITIES",
+    r"SELECT PORTFOLIO",
+    r"\bSERVBANK\b",
+    r"\bMIDFIRST\b",
+    r"MCLP ASSET",
+    # Reverse-mortgage lender. FINANCE AMERICA REVERSE LLC, 1 tracker.
+    # Narrow on purpose: a bare \bFINANC\w+ pattern would catch
+    # PINE FINANCIAL GROUP INC and AMERICAN LAND & CAPITAL LLC, which
+    # are investors, not lenders holding title.
+    r"\bREVERSE\s+(MORTGAGE|MTG|LLC)\b",
+
+    # A bank holding a parcel that is IN A REDEMPTION TRACKER is the
+    # lender that bid it in. Seen unmatched: DRAKE BANK, MIDFIRST BANK,
+    # HUNTINGTON NATIONAL BANK, CITIZENS BANK NA, SUNRISE BANKS N A,
+    # BELL BANK, WELLS FARGO BANK NA. The existing bank patterns all
+    # required '.*TRUST' after the name, so a plain bank name never fired.
+    # Word-bounded so it cannot catch RIVERBANK or BANKS as a surname
+    # fragment.
+    r"\bBANKS?\b",
+
+    # === DELIBERATELY NOT ADDED ===
+    # A false 'foreclosed' asserts something about a property that did not
+    # happen, which is worse than an honest 'unknown'. These appeared on
+    # tracked parcels and are NOT lenders taking title:
+    #   investor LLCs   MONGOOSE PROPERTY LLC, HOMES FOR CASH LLC,
+    #                   RJM PROPERTIES LLC, BSAW INVESTMENTS LLC
+    #   associations    PARK VILLA TWNHS ASSN INC, RIDGEVIEW HOMEOWNERS
+    #   iBuyer          OPENDOOR PROPERTY TRUST I -- a purchase, not an REO
+    # An investor buying at auction is a different OUTCOME from a lender
+    # taking title back, and REO_PATTERNS means the lender holds it. A bare
+    # \bLLC\b or \bTRUST\b pattern would collapse that distinction.
 ]
 REO_REGEX = re.compile("|".join(REO_PATTERNS), re.IGNORECASE)
 
