@@ -59,6 +59,7 @@ COUNTY_CONFIG = {
         # was dead. See parse_sale_date.
         "sale_date_format": "yyyymm",
         "pin_variants": lambda pin: [pin],
+        "pin_regex": r"^[0-9]{13}$",
         "check_source": "hennepin_arcgis",
     },
     "dakota": {
@@ -71,6 +72,7 @@ COUNTY_CONFIG = {
         "forfeit_field": None,
         "extra_fields": ["TAXPIN", "HOMESTEAD", "Update_Date"],
         "pin_variants": lambda pin: [pin],
+        "pin_regex": r"^[0-9]{13}$",
         "check_source": "dakota_arcgis",
     },
     "washington": {
@@ -90,6 +92,7 @@ COUNTY_CONFIG = {
             "%s.%s.%s.%s.%s" % (pin[0:2], pin[2:5], pin[5:7],
                                 pin[7:9], pin[9:13]),
         ],
+        "pin_regex": r"^[0-9]{13}$",
         "check_source": "washington_arcgis",
     },
     "crow_wing": {
@@ -165,6 +168,7 @@ COUNTY_CONFIG = {
         # matches the layer value exactly and needs no variant -- unlike
         # washington's dotted 17-char form.
         "pin_variants": lambda pin: [pin],
+        "pin_regex": r"^[0-9]{8}$",
         "check_source": "crow_wing_arcgis",
     },
 }
@@ -580,19 +584,61 @@ def report_source_health(conn, ok, note=""):
 def process(conn, dry_run, today):
     """Run all county checks. Returns (due_count, stamped, advanced)."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # === PER-COUNTY PIN WIDTH, NOT ONE CONSTANT (2026-08-25, task 2911) ===
+        #
+        # This clause was `~ '^[0-9]{13}$'` applied to EVERY county. 13 is
+        # the metro width -- hennepin, dakota and washington -- and it was
+        # written when those were the only three configured, which made it
+        # correct and invisible at the same time.
+        #
+        # Minnesota PINs are not one width. Measured against core.parcels
+        # county by county on 2026-08-25:
+        #
+        #   crow_wing  8 digits (77,261 parcels)
+        #   carlton/benton/chippewa/pope/stevens/rock/pine  9
+        #   lake      11 (46,949)
+        #   anoka/ramsey/olmsted/st_louis  12
+        #   metro     13
+        #
+        # The cost was exact and silent: the crow_wing COUNTY_CONFIG entry
+        # added minutes before this shipped, loaded cleanly, and selected
+        # ZERO of its 138 pending windows -- every PIN is 8 digits and the
+        # filter rejected all of them before the county list was consulted.
+        # The run logged "Due records with real PINs: 0" and said nothing
+        # about the 138 it had discarded.
+        #
+        # Same family as esri_ms_to_date: one county's format applied to
+        # all, producing a legal-looking wrong answer everywhere else.
+        #
+        # A county is now matched against ITS OWN width, carried in
+        # cfg["pin_regex"] beside the endpoint that needs it, so adding a
+        # county cannot silently fail this way again.
+        #
+        # ALSO ADDED HERE: `superseded_by IS NULL`. Retirement writes
+        # superseded_by and deliberately leaves outcome = 'pending' (the
+        # check constraint holds eight PROPERTY outcomes and 'superseded'
+        # is not one), so without this the checker re-checks rows that were
+        # explicitly retired. 729 rows were retired on 2026-08-25 and every
+        # one of them stayed selectable until this line.
+        county_pins = [(c, cfg["pin_regex"]) for c, cfg in COUNTY_CONFIG.items()]
         cur.execute(
             """
-            SELECT id, county_code, parcel_id,
-                   regexp_replace(parcel_id, '\\D', '', 'g') AS pin_norm,
-                   anchor_date, redemption_expiry_date, check_stage
-            FROM outcomes.redemption_tracker
-            WHERE outcome = 'pending'
-              AND next_check_date <= %s
-              AND county_code = ANY(%s)
-              AND regexp_replace(parcel_id, '\\D', '', 'g') ~ '^[0-9]{13}$'
-            ORDER BY county_code, redemption_expiry_date
+            SELECT t.id, t.county_code, t.parcel_id,
+                   regexp_replace(t.parcel_id, '\\D', '', 'g') AS pin_norm,
+                   t.anchor_date, t.redemption_expiry_date, t.check_stage
+            FROM outcomes.redemption_tracker t
+            JOIN (SELECT * FROM unnest(%s::text[], %s::text[])
+                    AS m(county_code, pin_regex)) m
+              ON m.county_code = t.county_code
+            WHERE t.outcome = 'pending'
+              AND t.superseded_by IS NULL
+              AND t.next_check_date <= %s
+              AND regexp_replace(t.parcel_id, '\\D', '', 'g') ~ m.pin_regex
+            ORDER BY t.county_code, t.redemption_expiry_date
             """,
-            (today, list(COUNTY_CONFIG.keys())),
+            ([c for c, _ in county_pins],
+             [r for _, r in county_pins],
+             today),
         )
         due = cur.fetchall()
 
