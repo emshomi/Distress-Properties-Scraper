@@ -1949,6 +1949,19 @@ _DEAL_CALIBRATION_TTL_S = 600
 _REDEMPTION_RATES_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
 _REDEMPTION_RATES_TTL_S = 600
 
+# ---------------------------------------------------------------
+# REDEMPTION CURVES (scoring.redemption_curves)
+# ---------------------------------------------------------------
+# The TIMING half. redemption_rates answers WHETHER an owner redeems; this
+# answers how long a window stays unresolved.
+#
+# Ten rows -- two targets x five horizons -- so the whole table is cached
+# whole. ONE SCOPE ONLY: county and county-x-homestead strata were both built
+# and both measured as coverage artefacts rather than market facts, so the
+# view emits the pooled curve alone. See sql/redemption_curves.sql.
+_REDEMPTION_CURVES_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_REDEMPTION_CURVES_TTL_S = 600
+
 
 # ============================================================
 # ASSESSOR OWNERS (core.owners — backfilled 2026-07-08, 163,880 Ramsey
@@ -2007,10 +2020,16 @@ def _apply_redemption_rates(shaped_rows: list[dict[str, Any]]) -> None:
     Attaches nothing when no bucket matches, so a property outside the three
     counties with outcome history gets no block rather than an empty one.
     """
+    # Computed ONCE, not per row: the curves are population-level and
+    # identical on every property. Calling the shaper inside the loop would
+    # rebuild the same dict for every row in a 50-row page.
+    timing = _redemption_timing()
     for s in shaped_rows:
         rates = _redemption_rates_for(s)
         if rates is not None:
             s["redemption_rates"] = rates
+        if timing is not None:
+            s["redemption_timing"] = timing
 
 
 def _apply_imagery_flags(shaped_rows: list[dict[str, Any]]) -> None:
@@ -2374,6 +2393,119 @@ def _apply_assessor_owners(shaped_rows: list[dict[str, Any]]) -> None:
                 s["owner_type"] = o.get("owner_type")
             if s.get("is_absentee") is None:
                 s["is_absentee"] = o.get("is_absentee")
+
+
+def _load_redemption_curves() -> Optional[list[dict[str, Any]]]:
+    """Load scoring.redemption_curves whole. Ten rows; cached.
+
+    Same stale-if-error contract as the calibration and rates loaders: a
+    failure returns the last good copy, and a cold failure returns None so the
+    caller emits no timing block rather than a fabricated one.
+    """
+    now = _time_mod.monotonic()
+    if (
+        _REDEMPTION_CURVES_CACHE["data"] is not None
+        and now - _REDEMPTION_CURVES_CACHE["at"] < _REDEMPTION_CURVES_TTL_S
+    ):
+        return _REDEMPTION_CURVES_CACHE["data"]
+    try:
+        rows = _fetch_all_rows_in_schema(
+            scoring_table, "redemption_curves",
+            "target, scope, bucket, n, events, horizon_days, survival, "
+            "resolved_pct"
+        )
+    except Exception as e:
+        logger.warning(
+            "redemption curves load failed (timing disabled this request)",
+            error_type=type(e).__name__,
+        )
+        return _REDEMPTION_CURVES_CACHE["data"]  # stale-if-error
+    if not rows:
+        return None
+    _REDEMPTION_CURVES_CACHE["data"] = rows
+    _REDEMPTION_CURVES_CACHE["at"] = now
+    return rows
+
+
+def _redemption_timing() -> Optional[dict[str, Any]]:
+    """The two survival curves, reshaped for display. Not per-property.
+
+    === WHY THIS IS NOT PERSONALISED, AND SAYING SO MATTERS ===
+    Unlike redemption_rates, which matches a property to its county,
+    homestead and bid buckets, this block is IDENTICAL on every property.
+    That is a deliberate limit, not an oversight.
+
+    County and county-x-homestead curves were both built and both measured as
+    coverage artefacts. At 365 days the county split read washington 84.4%
+    resolved against hennepin 9.8% -- 31 events on 191 windows versus 35 on
+    1,196. Two adjacent metro counties do not differ eightfold; Washington's
+    tracker is small and heavily checked while Hennepin's is large and barely
+    checked. Splitting by homestead WITHIN county then gave three counties
+    and three different directions, one of them exactly 100%.
+
+    A Cox model DOES rank windows -- C=0.83 pooled, 0.86 within county, with
+    a covariate-free control at exactly 0.500 -- but homestead_yes alone
+    carries 0.79 of it and these curves cannot reproduce that effect in any
+    single county. Two methods on the same data disagree. Until that
+    resolves, a per-property hazard would assert something indefensible.
+
+    So: one honest population-level statement, with its event count, and the
+    basis string says plainly that it describes comparable windows rather
+    than this property.
+    """
+    rows = _load_redemption_curves()
+    if not rows:
+        return None
+
+    curves: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if r.get("scope") != "all":
+            continue
+        tgt = r["target"]
+        c = curves.setdefault(tgt, {"n": r["n"], "events": r["events"],
+                                    "points": []})
+        c["points"].append({
+            "days": int(r["horizon_days"]),
+            "survival": float(r["survival"]),
+            "resolved_pct": float(r["resolved_pct"]),
+        })
+    if not curves:
+        return None
+    for c in curves.values():
+        c["points"].sort(key=lambda p: p["days"])
+
+    fc = curves.get("foreclosure_sale")
+    oe = curves.get("owner_exit")
+
+    def _at(curve, days):
+        if not curve:
+            return None
+        for p in curve["points"]:
+            if p["days"] == days:
+                return p["resolved_pct"]
+        return None
+
+    return {
+        "foreclosure_sale": fc,
+        "owner_exit": oe,
+        "headline_365": {
+            "foreclosure_sale_pct": _at(fc, 365),
+            "owner_exit_pct": _at(oe, 365),
+        },
+        "basis": (
+            "Observed timing from %s tracked redemption windows: %s reached a "
+            "foreclosure sale and %s saw the owner sell during the window. "
+            "Measured from the sheriff sale date. These describe comparable "
+            "windows across every county we track, NOT this property - the "
+            "per-county figures differ mainly by how completely each county "
+            "has been checked, so they are not published."
+            % (
+                (fc or oe or {}).get("n", "the"),
+                (fc or {}).get("events", "n/a"),
+                (oe or {}).get("events", "n/a"),
+            )
+        ),
+    }
 
 
 def _load_redemption_rates() -> Optional[list[dict[str, Any]]]:
