@@ -631,7 +631,27 @@ def get_owner_dashboard(owner_id: str) -> dict[str, Any]:
                        r.anchor_type,
                        r.outcome,
                        (SELECT COUNT(*) FROM marketplace.offers o
-                         WHERE o.listing_id = l.id) AS offer_count
+                         WHERE o.listing_id = l.id) AS offer_count,
+                       -- Photos aggregated in the SAME statement rather than
+                       -- fetched per listing. The docstring above promises a
+                       -- single round trip because "three sequential queries
+                       -- on a page an anxious person reloads is a page that
+                       -- feels broken", and N+1 for photos would be worse
+                       -- than the three it was written against.
+                       --
+                       -- COALESCE to an empty array, never NULL: the UI
+                       -- distinguishes "no photos yet" from "we could not
+                       -- read them", and a NULL arriving as an absent field
+                       -- collapses those into one.
+                       COALESCE((
+                         SELECT json_agg(ph ORDER BY ph.is_primary DESC,
+                                                    ph.display_order ASC,
+                                                    ph.uploaded_at ASC)
+                           FROM (SELECT id, listing_id, storage_path, caption,
+                                        display_order, is_primary, uploaded_at
+                                   FROM marketplace.listing_photos
+                                  WHERE listing_id = l.id) ph
+                       ), '[]'::json) AS photos
                 FROM marketplace.listings l
                 LEFT JOIN core.parcels p
                        ON p.parcel_id = l.parcel_id
@@ -655,6 +675,25 @@ def get_owner_dashboard(owner_id: str) -> dict[str, Any]:
         # no properties" when the query failed would reasonably conclude their
         # listing had been deleted.
         raise
+
+    # The public URL is composed HERE rather than stored, so a bucket move or
+    # a project change does not require rewriting every row. storage_path is
+    # the durable value; the URL is derived from it.
+    #
+    # A missing credential degrades to rows without URLs rather than raising:
+    # an owner whose photos cannot be linked should still see their deadline,
+    # their offers and their listing status. The photos are the least
+    # important thing on this page.
+    try:
+        base, _ = _storage_creds()
+    except RuntimeError:
+        base = None
+    if base:
+        for r in rows:
+            for ph in (r.get("photos") or []):
+                ph["url"] = (
+                    f"{base}/storage/v1/object/public/{ph['storage_path']}"
+                )
 
     return {"listings": rows, "count": len(rows)}
 
