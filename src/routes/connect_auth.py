@@ -710,6 +710,292 @@ def withdraw_listing(owner_id: str, listing_id: str) -> Optional[dict[str, Any]]
         raise
 
 
+# ============================================================
+# LISTING PHOTOS
+# ============================================================
+#
+# WHY PHOTOS EXIST HERE AND NOT AT raise-hand.
+# connect_raise_hand says, deliberately: "Photos likewise: nobody
+# photographs a house they are ashamed of." That reasoning stands and is not
+# being overturned -- raise-hand still accepts no photos.
+#
+# What this fixes is narrower. viewing_access offers 'photos_only',
+# specifically so an owner ashamed of the condition is not forced into "no"
+# -- and an owner who picks it has no way to provide photos. The product
+# offers something it cannot deliver.
+#
+# So the ask MOVED rather than appeared: it happens on /connect/me, where the
+# listing already exists and the owner has come back voluntarily, instead of
+# mid-form at the moment they raise their hand.
+#
+# THE REDACTION PROBLEM, STATED PLAINLY. routes/marketplace.py withholds
+# parcel_id, address, city, exact value and exact date so a buyer cannot
+# identify the house and go around the owner. A PHOTO IS UNBANDED: one clear
+# shot of a front door with a number on it defeats every band on the listing.
+# This ships with GUIDANCE ONLY -- the upload screen asks the owner to keep
+# house numbers and street signs out of frame. That is a warning, not a
+# mechanism, and it is the weakest of the three options considered. If a leak
+# appears, review-before-publish is the next step and add_listing_photo is
+# where the gate goes.
+
+_PHOTO_BUCKET = "listing-photos"
+_EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+
+def _storage_creds() -> tuple[str, str]:
+    """Supabase Storage base URL and service key, from the environment.
+
+    Read the same way pg() reads DATABASE_URL rather than through settings:
+    every settings access in this module is a getattr with a fallback, so the
+    attribute is not reliably present, and a missing credential must fail
+    loudly here rather than silently produce an unauthenticated request.
+    """
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required to "
+            "store listing photos"
+        )
+    return url.rstrip("/"), key
+
+
+def add_listing_photo(
+    owner_id: str,
+    listing_id: str,
+    data: bytes,
+    mime: str,
+    caption: Optional[str] = None,
+    max_photos: int = 8,
+) -> Optional[dict[str, Any]]:
+    """Attach one photo to a listing the caller owns.
+
+    Returns None when the listing is not theirs or does not exist -- ONE
+    answer for both, so a guessed id cannot be probed for existence. Returns
+    {"limit_reached": True, ...} at the cap, and {"photo": {...}} on success.
+
+    OWNERSHIP IS CHECKED IN THE INSERT ITSELF, not in a SELECT beforehand.
+    marketplace.* has RLS enabled with ZERO policies and the service role
+    bypasses it, so every restriction in this codebase is enforced in Python.
+    A check-then-write is a race; the INSERT ... SELECT below cannot insert a
+    row whose listing does not belong to owner_id, whatever happens between
+    statements.
+
+    STORAGE FIRST, ROW SECOND, and the order matters. A row pointing at an
+    object that was never written renders as a broken image on a buyer's
+    screen. An object with no row is unreachable and costs a few hundred
+    kilobytes. The second failure is cheaper, so the upload goes first and
+    the object is deleted if the insert then finds no listing.
+
+    THE PATH IS NOT LOCATING. listings/{listing_id}/{uuid}.{ext} -- never the
+    parcel id and never the address. A storage URL ends up in browser
+    history, in a shared link, in a screenshot; it must not be the thing the
+    rest of the marketplace redaction exists to withhold.
+    """
+    ext = _EXT.get(mime)
+    if ext is None:
+        raise ValueError(f"unsupported mime for storage: {mime}")
+
+    # Checked BEFORE uploading, so a listing already at the cap does not cost
+    # a storage write that then has to be undone. The insert below is still
+    # the authority on ownership; this is only about not wasting the upload.
+    with pg() as cur:
+        cur.execute(
+            """
+            SELECT count(*) AS n
+            FROM marketplace.listing_photos p
+            JOIN marketplace.listings l ON l.id = p.listing_id
+            WHERE p.listing_id = %s AND l.user_id = %s
+            """,
+            (listing_id, owner_id),
+        )
+        row = cur.fetchone()
+        existing = int(row["n"]) if row else 0
+    if existing >= max_photos:
+        return {"limit_reached": True, "photo_count": existing}
+
+    object_name = f"{listing_id}/{secrets.token_hex(16)}.{ext}"
+    storage_path = f"{_PHOTO_BUCKET}/{object_name}"
+    base, key = _storage_creds()
+
+    resp = httpx.post(
+        f"{base}/storage/v1/object/{_PHOTO_BUCKET}/{object_name}",
+        content=data,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": mime,
+            # An owner replacing a photo should not be able to overwrite an
+            # unrelated object by racing a path. The name is random, so a
+            # collision is a bug worth failing on rather than absorbing.
+            "x-upsert": "false",
+        },
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        logger.error(
+            "connect: photo storage upload failed",
+            status=resp.status_code, body=resp.text[:400],
+        )
+        raise RuntimeError(f"storage upload failed: {resp.status_code}")
+
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                INSERT INTO marketplace.listing_photos
+                    (listing_id, storage_path, caption, display_order,
+                     is_primary, uploaded_at)
+                SELECT l.id, %s, %s,
+                       COALESCE((SELECT max(display_order) + 1
+                                   FROM marketplace.listing_photos
+                                  WHERE listing_id = l.id), 0),
+                       NOT EXISTS (SELECT 1
+                                     FROM marketplace.listing_photos
+                                    WHERE listing_id = l.id),
+                       now()
+                FROM marketplace.listings l
+                WHERE l.id = %s AND l.user_id = %s
+                RETURNING id, listing_id, storage_path, caption,
+                          display_order, is_primary, uploaded_at
+                """,
+                (storage_path, caption, listing_id, owner_id),
+            )
+            inserted = cur.fetchone()
+    except Exception as e:
+        print(f"[connect] PHOTO INSERT FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: photo insert FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        _delete_storage_object(object_name)
+        raise
+
+    if inserted is None:
+        # The listing is not theirs, or does not exist. The object is already
+        # in the bucket, so it has to come back out -- otherwise anyone with a
+        # session could fill the bucket by posting against guessed ids.
+        _delete_storage_object(object_name)
+        return None
+
+    with pg() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM marketplace.listing_photos "
+            "WHERE listing_id = %s",
+            (listing_id,),
+        )
+        row = cur.fetchone()
+        count = int(row["n"]) if row else 1
+
+    photo = dict(inserted)
+    photo["url"] = f"{base}/storage/v1/object/public/{storage_path}"
+    logger.info("connect: listing photo stored", listing_id=listing_id)
+    return {"photo": photo, "photo_count": count}
+
+
+def _delete_storage_object(object_name: str) -> None:
+    """Best-effort removal. Never raises.
+
+    Called on the failure paths of add_listing_photo, where an exception is
+    already travelling. Masking that exception with a storage error would
+    replace a real diagnosis with a cleanup failure.
+    """
+    try:
+        base, key = _storage_creds()
+        httpx.delete(
+            f"{base}/storage/v1/object/{_PHOTO_BUCKET}/{object_name}",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=15.0,
+        )
+    except Exception as e:
+        logger.error("connect: orphan photo cleanup failed",
+                     object=object_name, error=str(e)[:300])
+
+
+def list_listing_photos(listing_id: str) -> list[dict[str, Any]]:
+    """Every photo on a listing, primary first then upload order.
+
+    NOT scoped to an owner: the buyer-facing listing page calls this too, and
+    a photo on an active listing is meant to be seen. Ownership matters for
+    WRITING, which add_listing_photo and delete_listing_photo enforce.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT id, listing_id, storage_path, caption,
+                       display_order, is_primary, uploaded_at
+                FROM marketplace.listing_photos
+                WHERE listing_id = %s
+                ORDER BY is_primary DESC, display_order ASC, uploaded_at ASC
+                """,
+                (listing_id,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[connect] PHOTO LIST FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: photo list FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        # An empty list, not a raise. A listing whose photos cannot be read
+        # should still render its numbers -- the photos are the least
+        # important thing on that page.
+        return []
+
+    try:
+        base, _ = _storage_creds()
+    except RuntimeError:
+        return rows
+    for r in rows:
+        r["url"] = f"{base}/storage/v1/object/public/{r['storage_path']}"
+    return rows
+
+
+def delete_listing_photo(owner_id: str, photo_id: str) -> bool:
+    """Remove one photo, row and object. True if something was removed.
+
+    Scoped through the listing to owner_id, so a copied photo id cannot
+    delete someone else's picture.
+
+    ROW FIRST, OBJECT SECOND -- the opposite order to add_listing_photo, and
+    for the same reason. Deleting the object first would leave a row pointing
+    at nothing, which renders as a broken image; deleting the row first
+    leaves at worst an unreachable file.
+
+    The upload screen promises a photo can be removed at any time. An owner
+    who cannot take their own information back is in exactly the position
+    withdraw_listing was written to fix.
+    """
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                DELETE FROM marketplace.listing_photos p
+                USING marketplace.listings l
+                WHERE p.id = %s
+                  AND l.id = p.listing_id
+                  AND l.user_id = %s
+                RETURNING p.storage_path
+                """,
+                (photo_id, owner_id),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"[connect] PHOTO DELETE FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: photo delete FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        raise
+
+    if row is None:
+        return False
+
+    path = str(row["storage_path"])
+    prefix = f"{_PHOTO_BUCKET}/"
+    _delete_storage_object(
+        path[len(prefix):] if path.startswith(prefix) else path
+    )
+    return True
+
+
 def get_offers_for_owner(owner_id: str) -> list[dict[str, Any]]:
     """Every offer on every listing this owner holds. Newest first.
 
@@ -1071,6 +1357,9 @@ __all__ = [
     "get_active_listing",
     "get_owner_dashboard",
     "withdraw_listing",
+    "add_listing_photo",
+    "list_listing_photos",
+    "delete_listing_photo",
     "get_offers_for_owner",
     "respond_to_offer",
     "send_listing_confirmation",
