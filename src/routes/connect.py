@@ -70,7 +70,17 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query, status as http_status
+from fastapi import (
+    APIRouter,
+    Body,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+    status as http_status,
+)
 
 from src.db.supabase_client import core_table, outcomes_table, scoring_table
 from src.utils.address_match import (
@@ -79,7 +89,9 @@ from src.utils.address_match import (
     split_house_number,
 )
 from src.routes.connect_auth import (
+    add_listing_photo,
     create_listing,
+    delete_listing_photo,
     get_active_listing,
     get_offers_for_owner,
     get_owner_dashboard,
@@ -881,6 +893,236 @@ async def connect_withdraw(
         "message": (
             "Withdrawn. Buyers are no longer seeing this property. Your "
             "answers are kept, so you can put it back any time."
+        ),
+    })
+
+
+# ============================================================
+# LISTING PHOTOS
+# ============================================================
+#
+# WHY THESE EXIST, GIVEN THE NOTE IN connect_raise_hand BELOW.
+# That route says, deliberately: "Photos likewise: nobody photographs a house
+# they are ashamed of." The reasoning stands and is NOT overturned here --
+# raise-hand still accepts no photos and these routes are not reachable from
+# that form.
+#
+# What they fix is narrower. viewing_access offers 'photos_only',
+# specifically so an owner ashamed of the condition is not forced into "no"
+# -- and an owner who picks it has no way to provide photos. The product
+# offers something it cannot deliver.
+#
+# So the ask MOVED rather than appeared: it happens on /connect/me, where the
+# listing already exists and the owner has come back voluntarily, instead of
+# mid-form at the moment they raise their hand.
+#
+# THE REDACTION PROBLEM, STATED PLAINLY. routes/marketplace.py withholds
+# parcel_id, address, city, exact value and exact date so a buyer cannot
+# identify the house and go around the owner. A PHOTO IS UNBANDED: one clear
+# shot of a front door with a number on it defeats every band on the listing.
+# This ships with GUIDANCE ONLY -- the upload screen asks the owner to keep
+# house numbers and street signs out of frame, and says why. That is a
+# warning, not a mechanism, and it is the weakest of three options:
+#
+#     guidance only          shipped. fastest, leakiest.
+#     review before publish  ownership_verified already has a 'manual_review'
+#                            state, so the flow exists. costs a human per
+#                            listing.
+#     interior only          strongest. a listing with no exterior shot reads
+#                            as something being hidden.
+#
+# If a leak appears, review-before-publish is the next step and
+# connect_add_listing_photo is where the gate goes.
+
+MAX_PHOTOS_PER_LISTING = 8
+
+# 6 MB. A modern phone photo is 2-4 MB and an owner should not have an upload
+# fail because they sent a portrait shot. Enforced on the SERVER: a
+# client-side check is a courtesy, not a limit.
+MAX_PHOTO_BYTES = 6 * 1024 * 1024
+
+# The extension and the Content-Type are both whatever the client said. The
+# magic bytes are read instead. A .jpg that is actually an SVG is a stored-XSS
+# primitive the moment it is served back from the bucket.
+_ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
+_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"RIFF", "image/webp"),
+)
+
+
+def _sniff_image(head: bytes) -> Optional[str]:
+    """Real MIME type from the leading bytes, or None.
+
+    WEBP needs the second check because 'RIFF' alone also matches WAV and AVI.
+    """
+    for magic, mime in _MAGIC:
+        if head.startswith(magic):
+            if mime == "image/webp" and head[8:12] != b"WEBP":
+                continue
+            return mime
+    return None
+
+
+@router.post(
+    "/connect/listing-photos",
+    status_code=http_status.HTTP_201_CREATED,
+    summary="Owner adds a photo to their own listing",
+)
+async def connect_add_listing_photo(
+    listing_id: str = Form(...),
+    file: UploadFile = File(...),
+    caption: Optional[str] = Form(default=None),
+    x_connect_session: Optional[str] = Header(
+        default=None, alias="X-Connect-Session"
+    ),
+) -> dict[str, Any]:
+    """Attach one photo to a listing the caller owns.
+
+    Multipart rather than JSON and base64: base64 inflates a 4 MB photo to
+    5.5 MB of request body, and an owner uploading from a phone on a slow
+    connection is exactly the person who cannot afford that.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+
+    # One byte past the limit, so an oversized file is detected without
+    # reading all of it into memory.
+    raw = await file.read(MAX_PHOTO_BYTES + 1)
+    if len(raw) > MAX_PHOTO_BYTES:
+        raise HTTPException(
+            status_code=http_status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"message": (
+                "That photo is larger than 6 MB. Most phones can send a "
+                "smaller version, or try a different one."
+            )},
+        )
+    if not raw:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={"message": "That file was empty. Try again."},
+        )
+
+    mime = _sniff_image(raw[:16])
+    if mime not in _ALLOWED_MIME:
+        # Deliberately does not echo what was detected. An error that reports
+        # the sniffed type turns this endpoint into a file-type oracle.
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={"message": (
+                "That does not look like a photo. JPG, PNG and WEBP work."
+            )},
+        )
+
+    try:
+        result = add_listing_photo(
+            owner_id=owner_id,
+            listing_id=listing_id,
+            data=raw,
+            mime=mime,
+            caption=(caption or "").strip()[:200] or None,
+            max_photos=MAX_PHOTOS_PER_LISTING,
+        )
+    except Exception as e:
+        # NEVER report success here. An owner told the photo is up, who then
+        # finds it is not, has been given the kind of false assurance this
+        # product exists to avoid.
+        print(f"[connect] PHOTO UPLOAD FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: photo upload FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not save that photo just now. Please try again in "
+                "a moment."
+            )},
+        )
+
+    if result is None:
+        # Not their listing, or it does not exist. ONE answer for both, and
+        # not a 404 -- the same rule connect_withdraw follows, so listing ids
+        # cannot be probed for existence.
+        return success_envelope({
+            "added": False,
+            "message": "We could not add a photo to that listing.",
+        })
+
+    if result.get("limit_reached"):
+        return success_envelope({
+            "added": False,
+            "photo_count": result.get("photo_count"),
+            "message": (
+                f"That listing already has {MAX_PHOTOS_PER_LISTING} photos. "
+                "Remove one first if you want to swap it."
+            ),
+        })
+
+    logger.info("connect: listing photo added",
+                photo_count=result.get("photo_count"))
+    return success_envelope({
+        "added": True,
+        "photo": result.get("photo"),
+        "photo_count": result.get("photo_count"),
+        "message": "Added. Buyers looking at this property will see it.",
+    })
+
+
+@router.post(
+    "/connect/listing-photos/delete",
+    status_code=http_status.HTTP_200_OK,
+    summary="Owner removes a photo from their own listing",
+)
+async def connect_delete_listing_photo(
+    photo_id: str = Body(..., embed=True),
+    x_connect_session: Optional[str] = Header(
+        default=None, alias="X-Connect-Session"
+    ),
+) -> dict[str, Any]:
+    """Remove one photo.
+
+    POST rather than DELETE, matching /connect/withdraw and every other write
+    on this router. One idiom per surface.
+
+    An owner who cannot take a photo back is in the position withdraw_listing
+    was written to fix: unable to retrieve their own information. The upload
+    screen promises removal is possible, so it has to be.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+
+    try:
+        removed = delete_listing_photo(owner_id=owner_id, photo_id=photo_id)
+    except Exception as e:
+        print(f"[connect] PHOTO DELETE FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: photo delete FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not remove that photo just now. It is still "
+                "showing to buyers, so please try again in a moment."
+            )},
+        )
+
+    # Same shape as withdraw: 'nothing to do' rather than an error, so a
+    # double-tap or a stale page is not a failure the owner has to read.
+    return success_envelope({
+        "removed": bool(removed),
+        "message": (
+            "Removed. Buyers are no longer seeing it."
+            if removed
+            else "That photo is not on your listing."
         ),
     })
 
