@@ -8,6 +8,12 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 starlette==0.41.3
+# Multipart form parsing. Added 2026-08-25 and REQUIRED, not optional:
+# FastAPI raises at IMPORT TIME if a route declares Form() or UploadFile()
+# without it, so the whole app fails to boot rather than just that endpoint.
+# It went missing when the owner photo-upload routes were added to
+# routes/connect.py and took the service down until it was installed.
+python-multipart==0.0.20
 # ---- Configuration & data validation ----
 pydantic==2.10.3
 pydantic-settings==2.6.1
