@@ -292,6 +292,40 @@ class Settings(BaseSettings):
     # still gates on scraper_olmsted_tax_detail_enabled.
     scraper_tyler_tax_detail_enabled: bool = Field(default=False)
 
+    # ADDED 2026-09-01 — Beacon/Schneider parcel reports, vendor-grouped.
+    #
+    # ONE field for every Beacon county, the same shape as
+    # scraper_tyler_tax_detail_enabled above and scraper_mngeo_parcels_enabled
+    # before it. Blue Earth is the first; the other 27 counties with no parcel
+    # loader are registry rows, not new fields.
+    #
+    # These 28 counties are exactly the ones with no gac_open_approval in
+    # MnGeo's opt-in parcel layer, and the Geospatial Commons catalogue holds
+    # no parcel dataset for any of them (measured 2026-09-01 across all 1,049
+    # rows; control: the same filter finds Houston, Waseca, Steele and
+    # Hennepin). They are not missing by accident — Blue Earth sells its
+    # property-tax GIS data under a licence. The vendor portal is the only
+    # open door.
+    #
+    # source_name stays PER-COUNTY ('blue_earth_parcels') because
+    # audit.scraper_runs and audit.source_health key on it — a collapsed
+    # source_name would mark the whole vendor unhealthy when one county
+    # failed. BeaconParcelsScraper.run() gates on enable_key instead, then
+    # delegates to the unmodified _run_locked so audit, freshness, health and
+    # the class lock behave exactly as they do for every other scraper.
+    #
+    # Per-county control lives in core.vendor_portals.enabled, which cannot be
+    # set true without a verified_url containing that county's own host and
+    # its own AppID (check constraint, not code — the WHEN 'beacon' branch has
+    # been in the table since it was built, unused until now). Turning a
+    # county on is an UPDATE, not a redeploy.
+    #
+    # Defaults FALSE: beacon.schneidercorp.com bot-blocks datacenter egress
+    # (verified both directions 2026-09-01), so this runs from the Windows box
+    # like govire_mnpn_browser.py — and a registry row landing in the table
+    # must not start hitting a county's server because a deploy happened.
+    scraper_beacon_parcels_enabled: bool = Field(default=False)
+
     # ----- Scraper behavior -----
 
     scraper_request_timeout_seconds: int = Field(
