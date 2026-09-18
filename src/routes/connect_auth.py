@@ -535,6 +535,147 @@ def create_listing(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Owner-reported properties — marketplace.self_reported
+#
+# An owner whose county Govire does not yet cover reaches /connect, types the
+# address on the notice in their hand, and is told "we do not have a record".
+# Before 2026-09-17 that was the end of the road. Now they can tell us about
+# the property themselves. It lands in its own table, NOT in core.parcels and
+# NOT in marketplace.listings: the spine every view joins to stays clean, and
+# nothing typed by a user is ever indistinguishable from a county record.
+# See PLAN_owner_reported_listings.md for the reasoning.
+#
+# review_status starts 'pending'. A human flips it to 'live' (visible to
+# buyers) or 'rejected'; when the county is onboarded and the address matches
+# a real parcel, a job promotes it to a marketplace.listings row and records
+# the id here. Nothing here is ever shown as a deadline: the sale date is
+# what the owner stated, and is labelled as such.
+# ---------------------------------------------------------------------------
+
+_SELF_REPORT_ALLOWED = (
+    "address", "city", "county", "owner_name", "situation", "amount_owed",
+    "event_date", "tax_years_delinquent",
+    "occupancy", "condition", "primary_need", "leaseback_interest",
+    "buyback_interest", "viewing_access", "earliest_close_date",
+    "preferred_close_date", "contact_preference", "contact_restrictions",
+    "assessed_value_stated",
+)
+
+
+def create_self_report(owner_id: str, fields: dict[str, Any]) -> Optional[str]:
+    """Create OR UPDATE the owner's open self-report for an address.
+
+    Same shape as create_listing: resubmitting must not produce a second
+    contradictory row. There is no unique index to lean on here (the address
+    is free text), so the open row is looked up by owner + normalised
+    address and updated in place; otherwise a new row is inserted. Only
+    supplied (non-None) fields are written on update, so a partial
+    resubmission never erases earlier answers.
+    """
+    cols: list[str] = []
+    vals: list[Any] = []
+    for key in _SELF_REPORT_ALLOWED:
+        if key in fields and fields[key] is not None:
+            cols.append(key)
+            vals.append(fields[key])
+    if "address" not in cols:
+        return None
+
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                SELECT id FROM marketplace.self_reported
+                 WHERE user_id = %s
+                   AND lower(regexp_replace(address, '\\s+', ' ', 'g'))
+                     = lower(regexp_replace(%s, '\\s+', ' ', 'g'))
+                   AND review_status IN ('pending', 'live')
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                (owner_id, fields["address"]),
+            )
+            existing = cur.fetchone()
+            if existing:
+                set_sql = ", ".join(f"{c} = %s" for c in cols)
+                cur.execute(
+                    f"UPDATE marketplace.self_reported "
+                    f"SET {set_sql}, updated_at = now() "
+                    f"WHERE id = %s RETURNING id",
+                    vals + [existing["id"]],
+                )
+            else:
+                col_sql = ", ".join(["user_id"] + cols)
+                placeholders = ", ".join(["%s"] * (len(vals) + 1))
+                cur.execute(
+                    f"INSERT INTO marketplace.self_reported ({col_sql}) "
+                    f"VALUES ({placeholders}) RETURNING id",
+                    [owner_id] + vals,
+                )
+            row = cur.fetchone()
+            return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[connect] SELF-REPORT WRITE FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: self-report write FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        return None
+
+
+def get_self_reports(owner_id: str) -> list[dict[str, Any]]:
+    """Every self-reported property for this owner, newest first.
+
+    Raises on failure, like get_owner_dashboard, for the same reason: an
+    owner shown 'nothing on file' when the read failed would conclude their
+    report was deleted.
+    """
+    with pg() as cur:
+        cur.execute(
+            """
+            SELECT id, address, city, county, owner_name, situation,
+                   amount_owed, event_date, tax_years_delinquent,
+                   occupancy, condition, primary_need, leaseback_interest,
+                   buyback_interest, viewing_access, earliest_close_date,
+                   preferred_close_date, contact_preference,
+                   contact_restrictions, assessed_value_stated,
+                   review_status, reviewed_at, promoted_listing_id,
+                   matched_county_code, matched_parcel_id,
+                   created_at, updated_at
+              FROM marketplace.self_reported
+             WHERE user_id = %s
+             ORDER BY created_at DESC
+            """,
+            (owner_id,),
+        )
+        return [dict(r) for r in (cur.fetchall() or [])]
+
+
+def withdraw_self_report(owner_id: str, report_id: str) -> bool:
+    """Mark an owner's own self-report withdrawn. Scoped to the owner so a
+    guessed id withdraws nothing. Already-promoted rows are left alone — the
+    promoted listing has its own withdraw path."""
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                UPDATE marketplace.self_reported
+                   SET review_status = 'withdrawn', updated_at = now()
+                 WHERE id = %s AND user_id = %s
+                   AND review_status IN ('pending', 'live')
+                RETURNING id
+                """,
+                (report_id, owner_id),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        print(f"[connect] SELF-REPORT WITHDRAW FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: self-report withdraw FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        return False
+
+
 def get_active_listing(owner_id: str, parcel_id: str) -> Optional[dict[str, Any]]:
     """The owner's current active listing on a parcel, or None.
 
