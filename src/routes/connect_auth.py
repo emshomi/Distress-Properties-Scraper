@@ -1370,7 +1370,15 @@ def request_ownership_code(owner_id: str, listing_id: Optional[str] = None,
                 "message": "A letter is already on its way. Give it a few days, "
                            "then request another if it has not arrived."}
 
-    addr = _lob_verify_us(prop["address1"], prop["city"], prop["state"], prop.get("zip"))
+    if _lob_key().startswith("test_"):
+        # A Lob TEST key never verifies real addresses (it only answers to
+        # special test inputs), so the check would wrongly say undeliverable.
+        # In test mode use the address as held; the letter is rendered, never
+        # printed. Live keys verify for real.
+        addr = {"address1": prop["address1"], "city": prop["city"],
+                "state": prop["state"], "zip": (prop.get("zip") or "55447")[:5]}
+    else:
+        addr = _lob_verify_us(prop["address1"], prop["city"], prop["state"], prop.get("zip"))
     if addr is None:
         return {"sent": False, "undeliverable": True,
                 "message": "The postal service does not deliver to that address as "
