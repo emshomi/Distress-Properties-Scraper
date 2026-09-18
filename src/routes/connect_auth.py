@@ -1325,8 +1325,11 @@ def _owner_property_address(owner_id: str, listing_id: Optional[str],
                        l.ownership_verified
                   FROM marketplace.listings l
                   JOIN core.parcels p
-                    ON p.county_code = l.county_code AND p.parcel_id = l.parcel_id
+                    ON p.parcel_id = l.parcel_id
+                   AND (l.county_code IS NULL OR p.county_code = l.county_code)
                  WHERE l.id = %s AND l.user_id = %s
+                 ORDER BY (p.county_code = l.county_code) DESC NULLS LAST
+                 LIMIT 1
                 """,
                 (listing_id, owner_id),
             )
