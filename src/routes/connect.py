@@ -91,10 +91,12 @@ from src.utils.address_match import (
 from src.routes.connect_auth import (
     add_listing_photo,
     create_listing,
+    create_self_report,
     delete_listing_photo,
     get_active_listing,
     get_offers_for_owner,
     get_owner_dashboard,
+    get_self_reports,
     owner_from_session,
     request_link,
     respond_to_offer,
@@ -102,6 +104,7 @@ from src.routes.connect_auth import (
     send_offer_response_notification,
     verify_link,
     withdraw_listing,
+    withdraw_self_report,
 )
 from src.utils.errors import success_envelope
 from src.utils.logger import logger
@@ -464,11 +467,28 @@ async def connect_lookup(
 
     logger.info("connect lookup", county=county, has_city=bool(city),
                 matches=len(matches))
+    if not matches:
+        # No record — usually a county we do not cover yet. The owner can
+        # still tell us about the property (POST /connect/self-report); the
+        # frontend uses this flag to offer that instead of a dead end.
+        return success_envelope({
+            "query": address,
+            "match_count": 0,
+            "matches": [],
+            "needs_more_input": False,
+            "can_self_report": True,
+            "next_step": (
+                "We do not have a record for that address yet. You can still "
+                "tell us about your property and buyers on Govire will be "
+                "able to make offers once it is reviewed."
+            ),
+        })
     return success_envelope({
         "query": address,
         "match_count": len(matches),
         "matches": matches,
         "needs_more_input": False,
+        "can_self_report": False,
         "next_step": (
             "If one of these is your property, confirm you are the owner to "
             "see your redemption deadline and what is at stake."
@@ -787,9 +807,152 @@ async def connect_me(
             out[key] = str(value) if hasattr(value, "isoformat") else value
         listings.append(out)
 
+    # Owner-reported properties ride along on the same page. A failure here
+    # degrades to an empty list rather than failing the whole dashboard: the
+    # real listings and their offers are the important thing.
+    self_reported: list[dict[str, Any]] = []
+    try:
+        for row in get_self_reports(owner_id):
+            out = {}
+            for key, value in row.items():
+                out[key] = str(value) if hasattr(value, "isoformat") else value
+            self_reported.append(out)
+    except Exception as e:
+        logger.warning("connect: self-report read failed",
+                       error_type=type(e).__name__)
+
     return success_envelope({
         "count": data["count"],
         "listings": listings,
+        "self_reported": self_reported,
+        "self_reported_count": len(self_reported),
+    })
+
+
+_SELF_REPORT_SITUATIONS = {"sheriff_sale", "behind_mortgage", "behind_taxes", "other"}
+
+
+@router.post(
+    "/connect/self-report",
+    status_code=http_status.HTTP_201_CREATED,
+    summary="Owner tells us about a property we do not hold",
+)
+async def connect_self_report(
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+    address: str = Body(..., min_length=4, max_length=200),
+    city: str = Body(..., min_length=2, max_length=60),
+    county: str = Body(..., min_length=3, max_length=40),
+    owner_name: str = Body(..., min_length=2, max_length=120),
+    situation: str = Body(...),
+    amount_owed: Optional[float] = Body(default=None),
+    event_date: Optional[str] = Body(default=None),
+    tax_years_delinquent: Optional[int] = Body(default=None),
+    occupancy: Optional[str] = Body(default=None),
+    condition: Optional[str] = Body(default=None),
+    primary_need: Optional[str] = Body(default=None),
+    leaseback_interest: Optional[bool] = Body(default=None),
+    buyback_interest: Optional[bool] = Body(default=None),
+    viewing_access: Optional[str] = Body(default=None),
+    earliest_close_date: Optional[str] = Body(default=None),
+    preferred_close_date: Optional[str] = Body(default=None),
+    contact_preference: Optional[str] = Body(default=None),
+    contact_restrictions: Optional[str] = Body(default=None),
+    assessed_value_stated: Optional[float] = Body(default=None),
+) -> dict[str, Any]:
+    """The path for an owner whose property is not in core.parcels.
+
+    Everything is AS STATED BY THE OWNER and stored that way. No redemption
+    clock is computed from a typed date — a countdown built on unverified
+    input is exactly the fake certainty this product exists to not have.
+    Reviewed by a person before any buyer sees it.
+    """
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+    if situation not in _SELF_REPORT_SITUATIONS:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"message": "Please choose one of the listed situations."},
+        )
+
+    def _date(v: Optional[str]) -> Optional[date]:
+        if not v:
+            return None
+        try:
+            return date.fromisoformat(v[:10])
+        except ValueError:
+            return None
+
+    report_id = create_self_report(owner_id, {
+        "address": address.strip(),
+        "city": city.strip(),
+        "county": county.strip().lower(),
+        "owner_name": owner_name.strip(),
+        "situation": situation,
+        "amount_owed": amount_owed,
+        "event_date": _date(event_date),
+        "tax_years_delinquent": tax_years_delinquent,
+        "occupancy": occupancy,
+        "condition": condition,
+        "primary_need": primary_need,
+        "leaseback_interest": leaseback_interest,
+        "buyback_interest": buyback_interest,
+        "viewing_access": viewing_access,
+        "earliest_close_date": _date(earliest_close_date),
+        "preferred_close_date": _date(preferred_close_date),
+        "contact_preference": contact_preference,
+        "contact_restrictions": contact_restrictions,
+        "assessed_value_stated": assessed_value_stated,
+    })
+    if report_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not save that just now. Nothing has been lost — "
+                "please try again in a moment."
+            )},
+        )
+
+    logger.info("connect self-report created", county=county.strip().lower(),
+                situation=situation)
+    return success_envelope({
+        "id": report_id,
+        "review_status": "pending",
+        "message": (
+            "Thank you. We have your property on file and will review it "
+            "shortly. You can come back to this page any time to see where "
+            "things stand."
+        ),
+    })
+
+
+@router.post(
+    "/connect/self-report/{report_id}/withdraw",
+    status_code=http_status.HTTP_200_OK,
+    summary="Owner withdraws a self-reported property",
+)
+async def connect_withdraw_self_report(
+    report_id: str,
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+) -> dict[str, Any]:
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+    if not withdraw_self_report(owner_id, report_id):
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail={"message": "We could not find that property on your account."},
+        )
+    return success_envelope({
+        "id": report_id,
+        "review_status": "withdrawn",
+        "message": "Withdrawn. Your answers are kept, so you can add it back any time.",
     })
 
 
