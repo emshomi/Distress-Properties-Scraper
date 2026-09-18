@@ -1365,7 +1365,8 @@ def request_ownership_code(owner_id: str, listing_id: Optional[str] = None,
             (owner_id, listing_id, self_report_id),
         )
         last = cur.fetchone()
-    if last and (datetime.now(timezone.utc) - last["sent_at"]) < timedelta(hours=_CODE_RESEND_HOURS):
+    if (last and not _lob_key().startswith("test_")
+            and (datetime.now(timezone.utc) - last["sent_at"]) < timedelta(hours=_CODE_RESEND_HOURS)):
         return {"sent": False, "recent": True,
                 "message": "A letter is already on its way. Give it a few days, "
                            "then request another if it has not arrived."}
@@ -1404,7 +1405,7 @@ def request_ownership_code(owner_id: str, listing_id: Optional[str] = None,
 
     html = f"""<html><head><meta charset="utf-8"><style>
 body{{font-family:Helvetica,Arial,sans-serif;font-size:11pt;color:#111;margin:0}}
-.page{{padding:1.25in 0.9in 0.75in 0.9in}}
+.page{{padding:3.9in 0.9in 0.75in 0.9in}}
 .code{{font-size:30pt;font-weight:800;letter-spacing:.15em;margin:.3in 0}}
 .small{{font-size:9pt;color:#555}}
 </style></head><body><div class="page">
