@@ -98,6 +98,9 @@ from src.routes.connect_auth import (
     get_offers_for_owner,
     get_owner_dashboard,
     get_self_reports,
+    ownership_code_status,
+    request_ownership_code,
+    verify_ownership_code,
     owner_from_session,
     request_link,
     respond_to_offer,
@@ -822,12 +825,83 @@ async def connect_me(
         logger.warning("connect: self-report read failed",
                        error_type=type(e).__name__)
 
+    try:
+        codes = ownership_code_status(owner_id)
+    except Exception as e:
+        logger.warning("connect: ownership code status failed",
+                       error_type=type(e).__name__)
+        codes = {}
+
     return success_envelope({
         "count": data["count"],
         "listings": listings,
         "self_reported": self_reported,
         "self_reported_count": len(self_reported),
+        "ownership_codes": codes,
     })
+
+
+@router.post(
+    "/connect/ownership-code/request",
+    status_code=http_status.HTTP_200_OK,
+    summary="Mail a verification code to the property address",
+)
+async def connect_request_ownership_code(
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+    listing_id: Optional[str] = Body(default=None),
+    self_report_id: Optional[str] = Body(default=None),
+) -> dict[str, Any]:
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+    try:
+        result = request_ownership_code(owner_id, listing_id=listing_id,
+                                        self_report_id=self_report_id)
+    except Exception as e:
+        print(f"[connect] OWNERSHIP CODE REQUEST FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: ownership code request FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": "We could not send the letter just now. Please try again."},
+        )
+    return success_envelope(result)
+
+
+@router.post(
+    "/connect/ownership-code/verify",
+    status_code=http_status.HTTP_200_OK,
+    summary="Enter the code from the mailed letter",
+)
+async def connect_verify_ownership_code(
+    x_connect_session: Optional[str] = Header(default=None, alias="X-Connect-Session"),
+    code: str = Body(...),
+    listing_id: Optional[str] = Body(default=None),
+    self_report_id: Optional[str] = Body(default=None),
+) -> dict[str, Any]:
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+    try:
+        result = verify_ownership_code(owner_id, code, listing_id=listing_id,
+                                       self_report_id=self_report_id)
+    except Exception as e:
+        print(f"[connect] OWNERSHIP CODE VERIFY FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: ownership code verify FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": "We could not check that just now. Please try again."},
+        )
+    return success_envelope(result)
 
 
 _SELF_REPORT_SITUATIONS = {"sheriff_sale", "behind_mortgage", "behind_taxes", "other"}
