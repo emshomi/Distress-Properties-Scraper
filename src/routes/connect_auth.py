@@ -633,22 +633,41 @@ def get_self_reports(owner_id: str) -> list[dict[str, Any]]:
     with pg() as cur:
         cur.execute(
             """
-            SELECT id, address, city, county, owner_name, situation,
-                   amount_owed, event_date, tax_years_delinquent,
-                   occupancy, condition, primary_need, leaseback_interest,
-                   buyback_interest, viewing_access, earliest_close_date,
-                   preferred_close_date, contact_preference,
-                   contact_restrictions, assessed_value_stated,
-                   review_status, reviewed_at, promoted_listing_id,
-                   matched_county_code, matched_parcel_id,
-                   created_at, updated_at
-              FROM marketplace.self_reported
-             WHERE user_id = %s
-             ORDER BY created_at DESC
+            SELECT r.id, r.address, r.city, r.county, r.owner_name, r.situation,
+                   r.amount_owed, r.event_date, r.tax_years_delinquent,
+                   r.occupancy, r.condition, r.primary_need, r.leaseback_interest,
+                   r.buyback_interest, r.viewing_access, r.earliest_close_date,
+                   r.preferred_close_date, r.contact_preference,
+                   r.contact_restrictions, r.assessed_value_stated,
+                   r.review_status, r.reviewed_at, r.promoted_listing_id,
+                   r.matched_county_code, r.matched_parcel_id,
+                   r.created_at, r.updated_at,
+                   -- Same single-round-trip rule as get_owner_dashboard.
+                   COALESCE((
+                     SELECT json_agg(ph ORDER BY ph.is_primary DESC,
+                                                ph.display_order ASC,
+                                                ph.uploaded_at ASC)
+                       FROM (SELECT id, self_report_id, storage_path, caption,
+                                    display_order, is_primary, uploaded_at
+                               FROM marketplace.listing_photos
+                              WHERE self_report_id = r.id) ph
+                   ), '[]'::json) AS photos
+              FROM marketplace.self_reported r
+             WHERE r.user_id = %s
+             ORDER BY r.created_at DESC
             """,
             (owner_id,),
         )
-        return [dict(r) for r in (cur.fetchall() or [])]
+        rows = [dict(r) for r in (cur.fetchall() or [])]
+    try:
+        base, _ = _storage_creds()
+    except RuntimeError:
+        base = None
+    if base:
+        for r in rows:
+            for ph in (r.get("photos") or []):
+                ph["url"] = f"{base}/storage/v1/object/public/{ph['storage_path']}"
+    return rows
 
 
 def withdraw_self_report(owner_id: str, report_id: str) -> bool:
@@ -1129,6 +1148,103 @@ def list_listing_photos(listing_id: str) -> list[dict[str, Any]]:
     return rows
 
 
+def add_self_report_photo(
+    owner_id: str,
+    report_id: str,
+    data: bytes,
+    mime: str,
+    caption: Optional[str] = None,
+    max_photos: int = 8,
+) -> Optional[dict[str, Any]]:
+    """add_listing_photo for an owner-reported property.
+
+    Same table (marketplace.listing_photos, via self_report_id), same bucket,
+    same ownership-in-the-INSERT rule, same storage-first order. Path prefix
+    is selfreports/{id}/ so the two kinds never collide and neither reveals
+    an address. When a report is later promoted to a real listing the rows
+    are re-pointed, not re-uploaded.
+    """
+    ext = _EXT.get(mime)
+    if ext is None:
+        raise ValueError(f"unsupported mime for storage: {mime}")
+
+    with pg() as cur:
+        cur.execute(
+            """
+            SELECT count(*) AS n
+            FROM marketplace.listing_photos p
+            JOIN marketplace.self_reported r ON r.id = p.self_report_id
+            WHERE p.self_report_id = %s AND r.user_id = %s
+            """,
+            (report_id, owner_id),
+        )
+        row = cur.fetchone()
+        existing = int(row["n"]) if row else 0
+    if existing >= max_photos:
+        return {"limit_reached": True, "photo_count": existing}
+
+    object_name = f"selfreports/{report_id}/{secrets.token_hex(16)}.{ext}"
+    storage_path = f"{_PHOTO_BUCKET}/{object_name}"
+    base, key = _storage_creds()
+
+    resp = httpx.post(
+        f"{base}/storage/v1/object/{_PHOTO_BUCKET}/{object_name}",
+        content=data,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": mime,
+                 "x-upsert": "false"},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        logger.error("connect: self-report photo upload failed",
+                     status=resp.status_code, body=resp.text[:400])
+        raise RuntimeError(f"storage upload failed: {resp.status_code}")
+
+    try:
+        with pg() as cur:
+            cur.execute(
+                """
+                INSERT INTO marketplace.listing_photos
+                    (self_report_id, storage_path, caption, display_order,
+                     is_primary, uploaded_at)
+                SELECT r.id, %s, %s,
+                       COALESCE((SELECT max(display_order) + 1
+                                   FROM marketplace.listing_photos
+                                  WHERE self_report_id = r.id), 0),
+                       NOT EXISTS (SELECT 1 FROM marketplace.listing_photos
+                                    WHERE self_report_id = r.id),
+                       now()
+                FROM marketplace.self_reported r
+                WHERE r.id = %s AND r.user_id = %s
+                RETURNING id, self_report_id, storage_path, caption,
+                          display_order, is_primary, uploaded_at
+                """,
+                (storage_path, caption, report_id, owner_id),
+            )
+            inserted = cur.fetchone()
+    except Exception as e:
+        print(f"[connect] SELF-REPORT PHOTO INSERT FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: self-report photo insert FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        _delete_storage_object(object_name)
+        raise
+
+    if inserted is None:
+        _delete_storage_object(object_name)
+        return None
+
+    with pg() as cur:
+        cur.execute("SELECT count(*) AS n FROM marketplace.listing_photos "
+                    "WHERE self_report_id = %s", (report_id,))
+        row = cur.fetchone()
+        count = int(row["n"]) if row else 1
+
+    photo = dict(inserted)
+    photo["url"] = f"{base}/storage/v1/object/public/{storage_path}"
+    logger.info("connect: self-report photo stored", report_id=report_id)
+    return {"photo": photo, "photo_count": count}
+
+
 def delete_listing_photo(owner_id: str, photo_id: str) -> bool:
     """Remove one photo, row and object. True if something was removed.
 
@@ -1149,13 +1265,16 @@ def delete_listing_photo(owner_id: str, photo_id: str) -> bool:
             cur.execute(
                 """
                 DELETE FROM marketplace.listing_photos p
-                USING marketplace.listings l
                 WHERE p.id = %s
-                  AND l.id = p.listing_id
-                  AND l.user_id = %s
+                  AND (
+                    EXISTS (SELECT 1 FROM marketplace.listings l
+                             WHERE l.id = p.listing_id AND l.user_id = %s)
+                    OR EXISTS (SELECT 1 FROM marketplace.self_reported r
+                                WHERE r.id = p.self_report_id AND r.user_id = %s)
+                  )
                 RETURNING p.storage_path
                 """,
-                (photo_id, owner_id),
+                (photo_id, owner_id, owner_id),
             )
             row = cur.fetchone()
     except Exception as e:
