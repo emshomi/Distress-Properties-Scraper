@@ -90,6 +90,7 @@ from src.utils.address_match import (
 )
 from src.routes.connect_auth import (
     add_listing_photo,
+    add_self_report_photo,
     create_listing,
     create_self_report,
     delete_listing_photo,
@@ -1233,6 +1234,90 @@ async def connect_add_listing_photo(
         "photo": result.get("photo"),
         "photo_count": result.get("photo_count"),
         "message": "Added. Buyers looking at this property will see it.",
+    })
+
+
+@router.post(
+    "/connect/self-report-photos",
+    status_code=http_status.HTTP_201_CREATED,
+    summary="Owner adds a photo to a property they reported themselves",
+)
+async def connect_add_self_report_photo(
+    report_id: str = Form(...),
+    file: UploadFile = File(...),
+    caption: Optional[str] = Form(default=None),
+    x_connect_session: Optional[str] = Header(
+        default=None, alias="X-Connect-Session"
+    ),
+) -> dict[str, Any]:
+    """connect_add_listing_photo for an owner-reported property. Same limits,
+    same sniffing, same answers; only the parent differs."""
+    owner_id = owner_from_session(x_connect_session)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "Sign in with your emailed link first."},
+        )
+
+    raw = await file.read(MAX_PHOTO_BYTES + 1)
+    if len(raw) > MAX_PHOTO_BYTES:
+        raise HTTPException(
+            status_code=http_status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"message": (
+                "That photo is larger than 6 MB. Most phones can send a "
+                "smaller version, or try a different one."
+            )},
+        )
+    if not raw:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={"message": "That file was empty. Try again."},
+        )
+    mime = _sniff_image(raw[:16])
+    if mime not in _ALLOWED_MIME:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={"message": "That does not look like a photo. JPG, PNG and WEBP work."},
+        )
+
+    try:
+        result = add_self_report_photo(
+            owner_id=owner_id, report_id=report_id, data=raw, mime=mime,
+            caption=(caption or "").strip()[:200] or None,
+            max_photos=MAX_PHOTOS_PER_LISTING,
+        )
+    except Exception as e:
+        print(f"[connect] SELF-REPORT PHOTO UPLOAD FAILED: {type(e).__name__}: {e}",
+              flush=True)
+        logger.error("connect: self-report photo upload FAILED",
+                     error_type=type(e).__name__, error=str(e)[:800])
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": (
+                "We could not save that photo just now. Please try again in "
+                "a moment."
+            )},
+        )
+
+    if result is None:
+        return success_envelope({
+            "added": False,
+            "message": "We could not add a photo to that property.",
+        })
+    if result.get("limit_reached"):
+        return success_envelope({
+            "added": False,
+            "photo_count": result.get("photo_count"),
+            "message": (
+                f"That property already has {MAX_PHOTOS_PER_LISTING} photos. "
+                "Remove one first if you want to swap it."
+            ),
+        })
+    return success_envelope({
+        "added": True,
+        "photo": result.get("photo"),
+        "photo_count": result.get("photo_count"),
+        "message": "Added. We will include it when the property is reviewed.",
     })
 
 
