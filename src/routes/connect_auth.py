@@ -641,6 +641,7 @@ def get_self_reports(owner_id: str) -> list[dict[str, Any]]:
                    r.contact_restrictions, r.assessed_value_stated,
                    r.review_status, r.reviewed_at, r.promoted_listing_id,
                    r.matched_county_code, r.matched_parcel_id,
+                   r.ownership_verified, r.ownership_check_basis,
                    r.created_at, r.updated_at,
                    -- Same single-round-trip rule as get_owner_dashboard.
                    COALESCE((
@@ -1243,6 +1244,294 @@ def add_self_report_photo(
     photo["url"] = f"{base}/storage/v1/object/public/{storage_path}"
     logger.info("connect: self-report photo stored", report_id=report_id)
     return {"photo": photo, "photo_count": count}
+
+
+# ---------------------------------------------------------------------------
+# Mailed ownership code — marketplace.ownership_codes
+#
+# The strongest cheap proof that the person at the keyboard controls the
+# property: a letter with a six-digit code goes to the PROPERTY address via
+# Lob, and only someone who receives mail there can type it back. Same idea
+# as Zillow's "claim your home". Works for any county, covered or not, so it
+# is the check that makes owner-reported properties trustworthy.
+#
+# Nothing here bypasses the name check; it stands beside it. A code that
+# verifies sets ownership_verified='verified' with basis 'mail_code'.
+# ---------------------------------------------------------------------------
+
+_LOB_API = "https://api.lob.com/v1"
+_CODE_TTL_DAYS = 30
+_CODE_MAX_ATTEMPTS = 5
+_CODE_RESEND_HOURS = 24
+
+
+def _lob_key() -> str:
+    key = os.environ.get("LOB_API_KEY")
+    if not key:
+        raise RuntimeError("LOB_API_KEY is required to mail ownership codes")
+    return key
+
+
+def _hash_code(code: str, row_id: str) -> str:
+    # Peppered with the row id so two owners choosing the same code hash
+    # differently. Not a password; six digits with 5 attempts is the guard.
+    return hashlib.sha256(f"{row_id}:{code}".encode()).hexdigest()
+
+
+def _lob_verify_us(address1: str, city: str, state: str, zip5: Optional[str]) -> Optional[dict[str, str]]:
+    """Ask Lob's US verification for a deliverable, ZIP-completed address.
+    Returns None when the address is not deliverable."""
+    body: dict[str, str] = {"primary_line": address1, "city": city, "state": state}
+    if zip5:
+        body["zip_code"] = zip5
+    r = httpx.post(f"{_LOB_API}/us_verifications", auth=(_lob_key(), ""),
+                   json=body, timeout=20.0)
+    if r.status_code >= 400:
+        logger.error("connect: lob verify failed", status=r.status_code,
+                     body=r.text[:300])
+        return None
+    j = r.json()
+    if str(j.get("deliverability", "")).startswith("undeliverable"):
+        return None
+    c = j.get("components", {}) or {}
+    return {
+        "address1": j.get("primary_line") or address1,
+        "city": c.get("city") or city,
+        "state": c.get("state") or state,
+        "zip": c.get("zip_code") or (zip5 or ""),
+    }
+
+
+def _owner_property_address(owner_id: str, listing_id: Optional[str],
+                            self_report_id: Optional[str]) -> Optional[dict[str, Any]]:
+    """The PROPERTY address for a listing or self-report the owner holds.
+    None if it is not theirs. For a listing the address comes from
+    core.parcels, never from anything the owner typed."""
+    with pg() as cur:
+        if self_report_id:
+            cur.execute(
+                """
+                SELECT address AS address1, city, 'MN' AS state, NULL::text AS zip,
+                       ownership_verified
+                  FROM marketplace.self_reported
+                 WHERE id = %s AND user_id = %s
+                """,
+                (self_report_id, owner_id),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT p.address AS address1, p.city, 'MN' AS state, p.zip,
+                       l.ownership_verified
+                  FROM marketplace.listings l
+                  JOIN core.parcels p
+                    ON p.county_code = l.county_code AND p.parcel_id = l.parcel_id
+                 WHERE l.id = %s AND l.user_id = %s
+                """,
+                (listing_id, owner_id),
+            )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def request_ownership_code(owner_id: str, listing_id: Optional[str] = None,
+                           self_report_id: Optional[str] = None) -> dict[str, Any]:
+    """Mail a fresh code to the property. Returns a dict with 'sent' and a
+    message; never raises for expected outcomes (not theirs, already
+    verified, sent recently, undeliverable)."""
+    if bool(listing_id) == bool(self_report_id):
+        return {"sent": False, "message": "Choose one property."}
+
+    prop = _owner_property_address(owner_id, listing_id, self_report_id)
+    if prop is None:
+        return {"sent": False, "message": "We could not find that property on your account."}
+    if prop.get("ownership_verified") == "verified":
+        return {"sent": False, "already_verified": True,
+                "message": "This property is already verified."}
+
+    with pg() as cur:
+        cur.execute(
+            """
+            SELECT sent_at FROM marketplace.ownership_codes
+             WHERE user_id = %s
+               AND COALESCE(listing_id::text, '') = COALESCE(%s, '')
+               AND COALESCE(self_report_id::text, '') = COALESCE(%s, '')
+               AND verified_at IS NULL AND expires_at > now()
+             ORDER BY sent_at DESC LIMIT 1
+            """,
+            (owner_id, listing_id, self_report_id),
+        )
+        last = cur.fetchone()
+    if last and (datetime.now(timezone.utc) - last["sent_at"]) < timedelta(hours=_CODE_RESEND_HOURS):
+        return {"sent": False, "recent": True,
+                "message": "A letter is already on its way. Give it a few days, "
+                           "then request another if it has not arrived."}
+
+    addr = _lob_verify_us(prop["address1"], prop["city"], prop["state"], prop.get("zip"))
+    if addr is None:
+        return {"sent": False, "undeliverable": True,
+                "message": "The postal service does not deliver to that address as "
+                           "written. Check the address, or contact us."}
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    row_id = None
+    with pg() as cur:
+        cur.execute(
+            """
+            INSERT INTO marketplace.ownership_codes
+                (user_id, listing_id, self_report_id, code_hash,
+                 mail_address1, mail_city, mail_state, mail_zip)
+            VALUES (%s, %s, %s, 'pending', %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (owner_id, listing_id, self_report_id,
+             addr["address1"], addr["city"], addr["state"], addr["zip"]),
+        )
+        row_id = str(cur.fetchone()["id"])
+        cur.execute("UPDATE marketplace.ownership_codes SET code_hash = %s WHERE id = %s",
+                    (_hash_code(code, row_id), row_id))
+
+    html = f"""<html><head><meta charset="utf-8"><style>
+body{{font-family:Helvetica,Arial,sans-serif;font-size:11pt;color:#111;margin:0}}
+.page{{padding:1.25in 0.9in 0.75in 0.9in}}
+.code{{font-size:30pt;font-weight:800;letter-spacing:.15em;margin:.3in 0}}
+.small{{font-size:9pt;color:#555}}
+</style></head><body><div class="page">
+<p><b>govire</b></p>
+<p>Someone with the email on file for this property asked us to confirm they
+receive mail here. If that was you, enter this code on your Govire property
+page:</p>
+<div class="code">{code}</div>
+<p>It expires in {_CODE_TTL_DAYS} days. If you did not ask for this, you can
+ignore it &mdash; nothing changes without the code.</p>
+<p class="small">Govire is a free service for Minnesota homeowners. We do not
+buy properties, are not your agent, and take no part of any sale.
+Patnu Consulting LLC, 3500 Vicksburg Ln N, Ste 400-127, Plymouth MN 55447.</p>
+</div></body></html>"""
+
+    try:
+        r = httpx.post(
+            f"{_LOB_API}/letters", auth=(_lob_key(), ""),
+            json={
+                "description": f"govire-ownership-{row_id}",
+                "to": {"name": "Resident", "address_line1": addr["address1"],
+                       "address_city": addr["city"], "address_state": addr["state"],
+                       "address_zip": addr["zip"], "address_country": "US"},
+                "from": {"name": "Govire", "company": "Patnu Consulting LLC",
+                         "address_line1": "3500 Vicksburg Ln N", "address_line2": "Ste 400-127",
+                         "address_city": "Plymouth", "address_state": "MN", "address_zip": "55447"},
+                "file": html, "color": False, "double_sided": False,
+                "address_placement": "top_first_page", "use_type": "operational",
+                "metadata": {"ownership_code_id": row_id},
+            },
+            headers={"Idempotency-Key": f"govire-ownership-{row_id}"},
+            timeout=30.0,
+        )
+    except Exception as e:
+        logger.error("connect: lob letter failed", error=str(e)[:300])
+        r = None
+    if r is None or r.status_code >= 400:
+        if r is not None:
+            logger.error("connect: lob letter rejected", status=r.status_code,
+                         body=r.text[:300])
+        with pg() as cur:
+            cur.execute("DELETE FROM marketplace.ownership_codes WHERE id = %s", (row_id,))
+        return {"sent": False, "message": "We could not send the letter just now. "
+                                          "Please try again in a moment."}
+
+    letter_id = r.json().get("id")
+    with pg() as cur:
+        cur.execute("UPDATE marketplace.ownership_codes SET lob_letter_id = %s WHERE id = %s",
+                    (letter_id, row_id))
+    logger.info("connect: ownership code mailed", code_id=row_id)
+    return {"sent": True, "expires_days": _CODE_TTL_DAYS,
+            "message": "A letter with your code is on its way to the property. "
+                       "It usually arrives in 3–5 business days."}
+
+
+def verify_ownership_code(owner_id: str, code: str, listing_id: Optional[str] = None,
+                          self_report_id: Optional[str] = None) -> dict[str, Any]:
+    """Check a typed code against the open one for this property."""
+    code = "".join(ch for ch in (code or "") if ch.isdigit())
+    if len(code) != 6 or bool(listing_id) == bool(self_report_id):
+        return {"verified": False, "message": "Enter the six-digit code from the letter."}
+
+    with pg() as cur:
+        cur.execute(
+            """
+            SELECT id, code_hash, attempts, expires_at
+              FROM marketplace.ownership_codes
+             WHERE user_id = %s
+               AND COALESCE(listing_id::text, '') = COALESCE(%s, '')
+               AND COALESCE(self_report_id::text, '') = COALESCE(%s, '')
+               AND verified_at IS NULL
+             ORDER BY sent_at DESC LIMIT 1
+            """,
+            (owner_id, listing_id, self_report_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return {"verified": False, "message": "No code has been sent for this property yet."}
+        if row["expires_at"] < datetime.now(timezone.utc):
+            return {"verified": False, "expired": True,
+                    "message": "That code has expired. Request a new letter."}
+        if row["attempts"] >= _CODE_MAX_ATTEMPTS:
+            return {"verified": False, "locked": True,
+                    "message": "Too many tries. Request a new letter."}
+
+        ok = secrets.compare_digest(row["code_hash"], _hash_code(code, str(row["id"])))
+        if not ok:
+            cur.execute("UPDATE marketplace.ownership_codes SET attempts = attempts + 1 "
+                        "WHERE id = %s", (row["id"],))
+            left = _CODE_MAX_ATTEMPTS - row["attempts"] - 1
+            return {"verified": False, "attempts_left": max(left, 0),
+                    "message": "That code does not match."}
+
+        cur.execute("UPDATE marketplace.ownership_codes SET verified_at = now() WHERE id = %s",
+                    (row["id"],))
+        if self_report_id:
+            cur.execute(
+                """UPDATE marketplace.self_reported
+                      SET ownership_verified = 'verified', ownership_check_basis = 'mail_code',
+                          ownership_checked_at = now(), updated_at = now()
+                    WHERE id = %s AND user_id = %s""",
+                (self_report_id, owner_id),
+            )
+        else:
+            cur.execute(
+                """UPDATE marketplace.listings
+                      SET ownership_verified = 'verified', ownership_check_basis = 'mail_code',
+                          ownership_checked_at = now(), updated_at = now()
+                    WHERE id = %s AND user_id = %s""",
+                (listing_id, owner_id),
+            )
+    logger.info("connect: ownership verified by mail code")
+    return {"verified": True, "message": "Verified. Thank you."}
+
+
+def ownership_code_status(owner_id: str) -> dict[str, dict[str, Any]]:
+    """Latest open or verified code per property, keyed by the property id,
+    for the dashboard."""
+    with pg() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (COALESCE(listing_id, self_report_id))
+                   COALESCE(listing_id, self_report_id)::text AS prop_id,
+                   sent_at, expires_at, verified_at, attempts
+              FROM marketplace.ownership_codes
+             WHERE user_id = %s
+             ORDER BY COALESCE(listing_id, self_report_id), sent_at DESC
+            """,
+            (owner_id,),
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for r in cur.fetchall() or []:
+            out[r["prop_id"]] = {
+                "sent_at": str(r["sent_at"]), "expires_at": str(r["expires_at"]),
+                "verified_at": str(r["verified_at"]) if r["verified_at"] else None,
+                "attempts_left": max(_CODE_MAX_ATTEMPTS - int(r["attempts"]), 0),
+            }
+    return out
 
 
 def delete_listing_photo(owner_id: str, photo_id: str) -> bool:
