@@ -183,6 +183,8 @@ key it is not a slow query, it is a wrong one.
 
 from __future__ import annotations
 
+import re
+
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -302,6 +304,37 @@ def _is_scheduled_not_sold(source: str, raw: dict[str, Any]) -> bool:
     return False
 
 
+def _notice_period(raw: dict[str, Any]) -> Optional[tuple[int, int]]:
+    """(months, extra_days) stated in the notice text, or None.
+
+    ADDED 2026-09-18. mnpublicnotice carries the period as free text in
+    raw_data['redemption_period'] — "6 Months", "twelve (12) months",
+    "six months after the date of sale", "12 months ... unless reduced to
+    Five (5) weeks under MN Stat. §580.07". Until this parser the builder
+    read the period only from signals.sheriff_sales, so every notice without
+    a sheriff_sales row fell to the six-month default. Measured 2026-09-18:
+    13 windows whose notice stated twelve months carried a six-month expiry
+    (Washington 9, Itasca 2, Rice 1, St. Louis 1); corrected by hand that
+    day, and this parser is what stops it recurring.
+
+    Twelve is checked before five weeks on purpose: the 580.07 clause names
+    the reduced period a postponement WOULD produce, not the period that
+    applies, and matching 'five' first would shorten a real twelve-month
+    window to 35 days.
+    """
+    text = raw.get("redemption_period")
+    if not text:
+        return None
+    t = str(text).lower()
+    if re.search(r"\btwelve\b|\b12\b", t):
+        return (12, 0)
+    if re.search(r"\bsix\b|\b6\b", t):
+        return (6, 0)
+    if re.search(r"\bfive\b|\b5\b", t) and "week" in t:
+        return (0, 35)
+    return None
+
+
 def _is_unheld_sale(sale_status: Any) -> bool:
     """True when signals.sheriff_sales states the sale has not been held.
 
@@ -354,7 +387,8 @@ def build_rows(conn) -> list[dict[str, Any]]:
             SELECT de.id, de.source, de.parcel_id, de.county_code,
                    de.event_date, de.raw_data,
                    ss.redemption_period_months AS notice_months,
-                   ss.sale_status              AS sale_status
+                   ss.sale_status              AS sale_status,
+                   ss.sale_date                AS ss_sale_date
             FROM signals.distress_events de
             LEFT JOIN signals.sheriff_sales ss
                    ON ss.parcel_id   = de.parcel_id
@@ -371,7 +405,21 @@ def build_rows(conn) -> list[dict[str, Any]]:
                 continue
 
             # GUARD 1 — the source says the sale has not been held.
-            if _is_unheld_sale(r["sale_status"]):
+            #
+            # NARROWED 2026-09-18. The sheriff_sales join has no date, so a
+            # parcel whose sheriff_sales row still read 'scheduled' AFTER its
+            # sale date had passed blocked every completed sale on that
+            # parcel, forever: nothing ever flips a sheriff_sales row to
+            # 'held'. Measured 2026-09-18: 342 events skipped this way, and
+            # 134 of 180 sheriff's sales held since 2026-08-12 had no window
+            # in any county. A 'scheduled' status is a statement about the
+            # future only while its own sale_date is still ahead of today;
+            # once that date has passed it is a stale row, and GUARD 2 below
+            # already handles sales that genuinely have not happened.
+            ss_sale_date = _as_date(r["ss_sale_date"])
+            if _is_unheld_sale(r["sale_status"]) and (
+                ss_sale_date is None or ss_sale_date > today
+            ):
                 skipped_unheld_status += 1
                 continue
 
@@ -405,6 +453,10 @@ def build_rows(conn) -> list[dict[str, Any]]:
                 period_source = "scraped"
             elif r["notice_months"]:
                 expiry = _add_months(anchor, int(r["notice_months"]))
+                period_source = "scraped"
+            elif _notice_period(raw):
+                months, days = _notice_period(raw)
+                expiry = _add_months(anchor, months) if months else anchor + timedelta(days=days)
                 period_source = "scraped"
             else:
                 expiry = _add_months(anchor, DEFAULT_PERIOD_MONTHS)
@@ -484,6 +536,18 @@ def build_rows(conn) -> list[dict[str, Any]]:
             # A window cannot end before it opens. Mirrors GUARD 2 above.
             if anchor > expiry:
                 skipped_anchor_after_expiry += 1
+                continue
+
+            # ADDED 2026-09-18. When no bid-in date is published the anchor
+            # IS the expiry, and counties publish these notices ahead of the
+            # expiry date — so the anchor can sit in the future. That tripped
+            # the future-anchor FATAL in main() on 2026-09-18 (34 rows) and
+            # the builder refused to write anything at all. Same treatment as
+            # GUARD 2: skip, count, and let the next run past the date create
+            # the row. Outcome detection for tax windows happens after expiry
+            # anyway, so nothing is lost by waiting.
+            if anchor > today:
+                skipped_future_anchor += 1
                 continue
 
             rows.append({
