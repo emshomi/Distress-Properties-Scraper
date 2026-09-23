@@ -24,9 +24,9 @@ on:
   workflow_dispatch:
     inputs:
       object_name:
-        description: 'Zip filename in the ecrv-extracts bucket'
+        description: 'Zip filename in the ecrv-extracts bucket — full name, including the century (2026-, not 26-)'
         required: true
-        default: '2026-07-27-02-10-41_eCRVExtract.zip'
+        default: '2026-09-21-02-11-28_eCRVExtract.zip'
 jobs:
   ingest:
     name: Ingest eCRV weekly extract
@@ -50,6 +50,41 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Check the object exists
+        # ADDED 2026-09-23. The object name is typed by hand, and on
+        # 2026-09-23 a run was dispatched as "26-09-21-02-11-28_..." — the
+        # century missing from a name the bucket stores in full. The ingest
+        # got as far as the download and raised
+        # StorageException {'statusCode': 400, 'code': 'NoSuchKey'} with a
+        # two-level traceback, which says nothing about what to type
+        # instead. This step costs a second and prints the bucket listing,
+        # so a mistyped name is corrected from the log rather than from the
+        # dashboard.
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OBJECT_NAME: ${{ inputs.object_name }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          from supabase import create_client
+          want = os.environ["OBJECT_NAME"].strip()
+          sb = create_client(os.environ["SUPABASE_URL"],
+                             os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+          names = [o["name"] for o in sb.storage.from_("ecrv-extracts").list()]
+          if want in names:
+              print("[preflight] found %s" % want, flush=True)
+              sys.exit(0)
+          print("[preflight] NOT FOUND in ecrv-extracts: %r" % want, flush=True)
+          near = [n for n in names if want.lstrip("20")[:8] in n]
+          if near:
+              print("[preflight] did you mean: %s" % ", ".join(sorted(near)), flush=True)
+          print("[preflight] most recent objects in the bucket:", flush=True)
+          for n in sorted(names)[-5:]:
+              print("             %s" % n, flush=True)
+          sys.exit(1)
+          PY
+
       - name: Run eCRV ingest
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
