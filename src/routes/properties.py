@@ -2519,13 +2519,16 @@ def _redemption_timing() -> Optional[dict[str, Any]]:
         },
         "basis": (
             "Observed timing from %s tracked mortgage foreclosure windows: "
-            "%s reached a foreclosure sale and %s saw the owner sell during "
-            "the window. Measured from the sheriff sale date. Tax-forfeiture "
-            "windows run on a different statutory clock and are excluded. "
-            "These describe comparable windows across every county we track, "
-            "NOT this property - the per-county figures differ mainly by how "
-            "completely each county has been checked, so they are not "
-            "published."
+            "%s reached a foreclosure sale and %s saw the owner or their "
+            "estate sell during the window. Measured from the sheriff sale "
+            "date. Tax-forfeiture windows run on a different statutory clock "
+            "and are excluded, and since 2026-09-24 so are association-lien "
+            "(ch. 515B) foreclosures - 98 windows whose median bid is 8.2%% "
+            "of assessed value against 69.3%% here, and which resolve on "
+            "different logic. These describe comparable windows across every "
+            "county we track, NOT this property - the per-county figures "
+            "differ mainly by how completely each county has been checked, "
+            "so they are not published."
             % (
                 (fc or oe or {}).get("n", "the"),
                 (fc or {}).get("events", "n/a"),
@@ -2773,9 +2776,10 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
             " %d of those %d outcomes were INFERRED rather than confirmed "
             "outright - a tax-forfeiture owner name, a repeat corporate "
             "seller, or a sale well below assessed value. Excluding them, "
-            "%.1f%% of %d confirmed windows redeemed. Almost every inferred "
-            "outcome is a foreclosure rather than a redemption, so leaving "
-            "them in lowers the rate."
+            "the certificate did not convert in %.1f%% of %d confirmed "
+            "windows. Almost every inferred outcome is a foreclosure that "
+            "completed rather than one that did not, so leaving them in "
+            "lowers the figure."
             % (inferred, base_n, base_confirmed_pct, base_n_confirmed)
         )
 
