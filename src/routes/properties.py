@@ -5244,7 +5244,8 @@ async def get_property_by_id(
         )
         _apply_assessor_owners([shaped])
         _recompute_deal_math([shaped])
-        _apply_redemption_rates([shaped])
+        # _apply_redemption_rates MOVED BELOW, 2026-09-24 — see the note at
+        # the enrichment assignment.
         shaped["raw"] = raw_data
 
         # The view already computes both halves of the composite key, so take
@@ -5270,6 +5271,20 @@ async def get_property_by_id(
         shaped["enrichment"] = (
             _load_parcel_enrichment(county_slug, eff_pid) if eff_pid else None
         )
+
+        # === RATES RUN AFTER ENRICHMENT, 2026-09-24 ===
+        # _redemption_rates_for reads homestead_status, which lives in
+        # shaped["enrichment"] (from core.parcels) rather than on the shaped
+        # row itself. It used to be called 20 lines above this assignment, so
+        # the value was ALWAYS absent, the homestead bucket matched NO
+        # property, and nothing errored — the block simply rendered one fewer
+        # row. That is the largest cut in the view (n=172 homestead, n=116
+        # non-homestead on 2026-09-24) and every subscriber was losing it.
+        #
+        # Nothing else in the function depends on enrichment, and deal math —
+        # which the bid-to-value bucket reads — is computed further up, so
+        # this position satisfies both dependencies.
+        _apply_redemption_rates([shaped])
         # Google panorama IDS ONLY, never pixels. Gated below by
         # redact_property: imagery_pano is in _LOCATOR_FIELDS, so under
         # STANDARD the client receives only imagery.available.
@@ -5365,7 +5380,9 @@ async def get_property(
         shaped = _shape_property_row(rows[0], overlay_map, owner_map, tracker_map, delq_map)
         _apply_assessor_owners([shaped])
         _recompute_deal_math([shaped])
-        _apply_redemption_rates([shaped])
+        # _apply_redemption_rates MOVED BELOW, 2026-09-24 — rates read
+        # homestead_status out of shaped["enrichment"], which is assigned
+        # further down this function.
         shaped["raw"] = rows[0].get("raw_data") or {}
 
         # Attach enriched property characteristics from core.parcels, keyed by
@@ -5378,6 +5395,9 @@ async def get_property(
         eff_pid = _effective_parcel_id(src, raw_data, rows[0])
         county_slug = (_resolve_county(src, raw_data) or "").lower()
         shaped["enrichment"] = _load_parcel_enrichment(county_slug, eff_pid) if eff_pid else None
+
+        # Rates AFTER enrichment — see the note on the other detail route.
+        _apply_redemption_rates([shaped])
 
         # Imagery references (Google pano ids, NEVER pixels — the terms permit
         # storing the id indefinitely and prohibit storing the image). Same
