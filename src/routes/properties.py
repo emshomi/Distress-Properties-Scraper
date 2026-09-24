@@ -2652,7 +2652,26 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
 
     county = (shaped.get("county") or "").strip().lower().replace(" ", "_")
-    homestead_raw = (shaped.get("homestead_status") or "").strip().upper()
+    # === WHERE homestead_status ACTUALLY LIVES, FIXED 2026-09-24 ===
+    # This read shaped["homestead_status"], which is never set. The shaped
+    # row carries "homestead" from detail["gis_homestead"] (the county GIS
+    # layer), while homestead_status comes from core.parcels and is attached
+    # under shaped["enrichment"] by _load_parcel_enrichment — which is why
+    # PropertyDetailPage renders `enr?.homestead_status ?? p.homestead`.
+    #
+    # The consequence was silent: homestead_raw was always "", homestead was
+    # always None, and the homestead bucket therefore matched NO property.
+    # Every subscriber lost the cut with the largest sample in the view
+    # (n=172 homestead, n=116 non-homestead as of 2026-09-24) and nothing
+    # errored. Read the enrichment first, fall back to the GIS flag, and
+    # accept the boolean form the GIS layer uses.
+    _enr = shaped.get("enrichment") or {}
+    _hs = _enr.get("homestead_status")
+    if _hs is None:
+        _hs = shaped.get("homestead")
+    if isinstance(_hs, bool):
+        _hs = "Y" if _hs else "N"
+    homestead_raw = (str(_hs) if _hs is not None else "").strip().upper()
     if homestead_raw in ("Y", "YES") or homestead_raw.startswith("FULL HOMESTEAD"):
         homestead = "homestead"
     elif homestead_raw in ("N", "NO") or homestead_raw.startswith("NON HOMESTEAD"):
