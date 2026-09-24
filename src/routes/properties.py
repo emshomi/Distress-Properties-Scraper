@@ -2558,6 +2558,36 @@ def _load_redemption_rates() -> Optional[list[dict[str, Any]]]:
 
     A rate that folds inferences in without saying so is the same failure as
     publishing a rate without its n.
+
+    === TEN COLUMNS SINCE 2026-09-24, AND THREE WERE RENAMED ===
+    redeemed / redeem_pct / redeemed_confirmed / redeem_pct_confirmed became
+    not_converted / not_converted_pct / not_converted_confirmed /
+    not_converted_pct_confirmed, and unconfirmed_possible / upper_bound_pct
+    were added. This is a rename, not a reshuffle, and it required DROP VIEW
+    rather than CREATE OR REPLACE.
+
+    WHY. Reading the 109 tracker rows carrying outcome = 'redeemed_by_owner'
+    one by one on 2026-09-23: NONE is a recorded certificate of redemption.
+    107 are deeds from the owner's SIDE recorded a median 71 days BEFORE
+    expiry (92 warranty, 13 estate or probate, 2 trustee); 2 are post-expiry
+    transfers matched by name. What the detector establishes is that the
+    certificate did not convert into a property for its holder. That is the
+    number a bidder wants and it is sound. It is NOT "the owner kept the
+    house", which is what every published sentence said.
+
+    The view also now EXCLUDES association-lien (ch. 515B) foreclosures: 98
+    windows at a median bid of $15,419 against a $224,200 median value --
+    8.2% of value against 69.3% for mortgage foreclosures. A $15,000 lien on
+    a $224,000 house gets paid, and pooling those with mortgage foreclosures
+    is the same error as the tax-forfeiture pooling removed on 2026-09-07.
+
+    And 76 windows that EXPIRED with no REO match and no recorded sale --
+    the checker's own note reads "Possible redemption; needs eCRV/recorder
+    confirmation" -- were silently outside the denominator. They are the
+    cases that look MOST like a genuine pay-to-keep redemption. They now
+    arrive as unconfirmed_possible, with upper_bound_pct treating every one
+    as a window the certificate did not convert, so the page can show the
+    range the evidence supports rather than one end of it.
     """
     now = _time_mod.monotonic()
     if (
@@ -2568,8 +2598,9 @@ def _load_redemption_rates() -> Optional[list[dict[str, Any]]]:
     try:
         rows = _fetch_all_rows_in_schema(
             scoring_table, "redemption_rates",
-            "scope, bucket, n, redeemed, redeem_pct, "
-            "n_confirmed, redeemed_confirmed, redeem_pct_confirmed"
+            "scope, bucket, n, not_converted, not_converted_pct, "
+            "n_confirmed, not_converted_confirmed, not_converted_pct_confirmed, "
+            "unconfirmed_possible, upper_bound_pct"
         )
     except Exception as e:
         logger.warning(
@@ -2655,9 +2686,9 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
         ("bid_to_value", bid_bucket),
     ]
     def _num(v):
-        """None-safe float. redeem_pct_confirmed is NULL when a bucket has
-        no confirmed rows at all, and NULLIF in the view guarantees a NULL
-        rather than a divide-by-zero."""
+        """None-safe float. not_converted_pct_confirmed is NULL when a
+        bucket has no confirmed rows at all, and NULLIF in the view
+        guarantees a NULL rather than a divide-by-zero."""
         return None if v is None else float(v)
 
     matched = [
@@ -2665,10 +2696,21 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
             "scope": r["scope"],
             "bucket": r["bucket"],
             "n": r["n"],
-            "redeem_pct": float(r["redeem_pct"]),
+            # KEY NAMES UNCHANGED ON THE WIRE. The frontend's RedemptionRates
+            # type reads redeem_pct / redeem_pct_confirmed, and a rename here
+            # would break every subscriber's page on deploy for no gain --
+            # the honest wording lives in `basis`, which the page renders
+            # verbatim. Rename the wire fields in the same release as the
+            # frontend, not before.
+            "redeem_pct": float(r["not_converted_pct"]),
             # Confirmed-only figures: same bucket, inferred outcomes removed.
             "n_confirmed": r.get("n_confirmed"),
-            "redeem_pct_confirmed": _num(r.get("redeem_pct_confirmed")),
+            "redeem_pct_confirmed": _num(r.get("not_converted_pct_confirmed")),
+            # ADDED 2026-09-24: expired windows with no REO match and no
+            # recorded sale, and the rate with every one of them counted as
+            # a window the certificate did not convert.
+            "unconfirmed_possible": r.get("unconfirmed_possible"),
+            "upper_bound_pct": _num(r.get("upper_bound_pct")),
         }
         for r in rows
         if any(r["scope"] == sc and r["bucket"] == bk for sc, bk in wanted if bk)
@@ -2678,10 +2720,12 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
     matched.sort(key=lambda m: -m["n"])
 
     all_row = next((r for r in rows if r["scope"] == "all"), None)
-    base = float(all_row["redeem_pct"]) if all_row else None
+    base = float(all_row["not_converted_pct"]) if all_row else None
     base_n = all_row["n"] if all_row else None
-    base_confirmed_pct = _num(all_row.get("redeem_pct_confirmed")) if all_row else None
+    base_confirmed_pct = _num(all_row.get("not_converted_pct_confirmed")) if all_row else None
     base_n_confirmed = all_row.get("n_confirmed") if all_row else None
+    base_unconfirmed = all_row.get("unconfirmed_possible") if all_row else None
+    base_upper = _num(all_row.get("upper_bound_pct")) if all_row else None
 
     # === THE BASIS SENTENCE IS COMPOSED HERE, NOT CLIENT-SIDE ===
     # PropertyDetailPage renders `basis` verbatim and never rebuilds it. That
@@ -2695,14 +2739,35 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
     if base_n is not None and base_n_confirmed is not None:
         inferred = base_n - base_n_confirmed
 
+    # === WHAT THIS SENTENCE HAD TO STOP SAYING, 2026-09-24 ===
+    # It said "the share of comparable properties whose owner redeemed".
+    # Reading the underlying records, not one of the 109 detections is a
+    # recorded certificate of redemption: 107 are deeds from the owner's
+    # side recorded a median 71 days before expiry. The figure measures the
+    # certificate not converting -- which is exactly what a bidder needs --
+    # and does not measure a homeowner keeping the house. A subscriber
+    # pricing a certificate is not misled by the corrected wording; they
+    # were misled by the old one.
     basis = (
-        "Observed redemption rates from %s resolved redemption windows. "
-        "Each figure is the share of comparable properties whose owner "
-        "redeemed, with the number of comparables shown. These are "
-        "observed rates, not a prediction for this property, and they "
-        "describe WHETHER an owner redeemed - not when."
+        "Observed outcomes from %s resolved mortgage foreclosure redemption "
+        "windows. Each figure is the share of comparable properties where "
+        "the sheriff's certificate did NOT convert into a property for its "
+        "holder - the owner or their estate sold during the window, or the "
+        "window otherwise ended without the purchaser taking title - with "
+        "the number of comparables shown. These are observed rates, not a "
+        "prediction for this property. They do NOT measure how often an "
+        "owner paid to keep the home: none of the underlying detections is "
+        "a recorded certificate of redemption. Association-lien "
+        "foreclosures are tracked separately and excluded here."
         % (base_n if base_n is not None else "resolved")
     )
+    if base_unconfirmed and base_upper is not None:
+        basis += (
+            " A further %d windows expired with no bank-owned match and no "
+            "recorded sale; counting every one of them as a window the "
+            "certificate did not convert puts the upper bound at %.1f%%."
+            % (base_unconfirmed, base_upper)
+        )
     if inferred and base_confirmed_pct is not None:
         basis += (
             " %d of those %d outcomes were INFERRED rather than confirmed "
@@ -2719,6 +2784,10 @@ def _redemption_rates_for(shaped: dict[str, Any]) -> Optional[dict[str, Any]]:
         "base_n": base_n,
         "base_rate_pct_confirmed": base_confirmed_pct,
         "base_n_confirmed": base_n_confirmed,
+        # ADDED 2026-09-24. Optional on the wire for the same reason the
+        # confirmed pair was: an older frontend ignores them and renders.
+        "base_unconfirmed_possible": base_unconfirmed,
+        "base_upper_bound_pct": base_upper,
         "buckets": matched,
         "basis": basis,
     }
