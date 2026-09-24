@@ -483,6 +483,107 @@ REO_PATTERNS = [
 ]
 REO_REGEX = re.compile("|".join(REO_PATTERNS), re.IGNORECASE)
 
+# === NON-PERSON OWNERS, ADDED 2026-09-24 ===
+# Not an extension of REO_PATTERNS and deliberately separate from it. That
+# list asserts A LENDER HOLDS TITLE, and its "DELIBERATELY NOT ADDED" block
+# is right to keep associations and investor LLCs out of it.
+#
+# The defect was the FALLTHROUGH, not the list. Anything unmatched reached
+# the final branch and was written as "Possible redemption; needs
+# eCRV/recorder confirmation" — which asserts the opposite of what the
+# record shows. Measured on 2026-09-24 across the 76 windows carrying that
+# note:
+#
+#   personal name still on title        42
+#   company or lender now owns it       21   e.g. CLICK N CLOSE INC,
+#                                            EVERETT FINANCIAL INC,
+#                                            HOMES FOR CASH LLC
+#   association now owns it             13   e.g. CEDAR POINTE CARRIAGE
+#                                            HOMES CONDO ASSN, COUNTRYSIDE
+#                                            WEST CONDO ASSN
+#
+# 34 of 76 — nearly half — were entities holding title, described in the
+# database as possible redemptions by a homeowner. This regex does not
+# decide an outcome on its own; it decides whether the honest closing note
+# is "possible redemption" or "an entity holds title, which a redemption
+# by the owner is not".
+NON_PERSON_PATTERNS = [
+    r"\bASS(OC|N)\b", r"ASSOCIATION", r"\bCONDO\b", r"CONDOMINIUM",
+    r"HOMEOWNER", r"\bHOA\b", r"TOWNHOM", r"\bTWNHS\b", r"\bVILLAS?\b",
+    r"\bLLC\b", r"\bL\.L\.C\b", r"\bINC\b", r"\bCORP", r"\bLTD\b",
+    r"\bCOMPANY\b", r"\bPROPERTIES\b", r"\bHOLDINGS\b", r"\bPARTNERS\b",
+    r"\bLP\b", r"\bTRUST\b", r"\bCITY OF\b", r"\bCOUNTY OF\b",
+    r"\bSTATE OF\b", r"\bHABITAT FOR HUMANITY\b",
+]
+NON_PERSON_REGEX = re.compile("|".join(NON_PERSON_PATTERNS), re.IGNORECASE)
+
+_PARTY_NOISE = re.compile(
+    r"\b(THE|AND|INC|INCORPORATED|LLC|CORP|CORPORATION|COMPANY|LTD|LLP|"
+    r"ASSN|ASSOC|ASSOCIATION|TRUST|TRS|TRUSTEE|SUCCESSORS|ASSIGNS|DBA|FKA|"
+    r"AKA|JR|SR|II|III)\b", re.IGNORECASE)
+
+# Spellings the two offices genuinely differ on, folded to one form before
+# the tokens are compared. Measured against real pairs on 2026-09-24:
+# 'CEDAR POINTE CARRIAGE HOMES CONDO ASSN' on the county layer against
+# 'Cedar Pointe Carriage Homes Condominium Association' on the notice.
+_PARTY_CANON = [
+    (re.compile(r"\bCONDOMINIUMS?\b", re.IGNORECASE), "CONDO"),
+    (re.compile(r"\bTOWNHOMES?\b|\bTWNHS\b", re.IGNORECASE), "TOWNHOME"),
+    (re.compile(r"\bAPARTMENTS?\b|\bAPTS?\b", re.IGNORECASE), "APARTMENT"),
+]
+
+
+def norm_party(value):
+    """Loose party-name key for comparing a county owner string to a name on
+    the sheriff's sale notice.
+
+    Deliberately crude. The two sides are written by different offices in
+    different conventions — 'ROBERTA HOMEOWNERS ASSOC INC' on the county
+    layer against 'The Roberta Homeowner's Association, Inc.' on the notice
+    — so punctuation, entity suffixes and word order all differ. Sorting the
+    remaining tokens absorbs 'SMITH JOHN' against 'John Smith' as well.
+
+    This is a MATCH test, never a mismatch test: a positive result is strong
+    evidence, a negative one means nothing, because the same party may be
+    written two ways this does not reconcile. Every caller below treats it
+    that way.
+    """
+    if not value:
+        return ""
+    v = re.sub(r"[^A-Za-z0-9 ]", " ", str(value)).upper()
+    for pat, repl in _PARTY_CANON:
+        v = pat.sub(repl, v)
+    v = _PARTY_NOISE.sub(" ", v)
+    # Tokens of two characters or fewer go: middle initials, 'CO', 'NA',
+    # and the halves of a punctuated 'U.S.' which the county writes as 'US'.
+    # Trailing S is stemmed because HOMEOWNERS and HOMEOWNER are the same
+    # association written by two offices.
+    toks = sorted(t[:-1] if len(t) > 3 and t.endswith("S") else t
+                  for t in v.split() if len(t) > 2)
+    return " ".join(toks)
+
+
+def match_purchaser(owner_values, sold_to):
+    """True when a current owner IS the party that bought at the sheriff's
+    sale — the certificate converted, whoever the buyer was.
+
+    Exact where REO_PATTERNS can only guess. A pattern list has to enumerate
+    lenders; this needs no list at all, and it catches the buyers no list
+    would hold: THE ROBERTA HOMEOWNER'S ASSOCIATION, CLICK N CLOSE INC,
+    HOMES FOR CASH LLC. Only usable where the county publishes the buyer —
+    toWhomSold is a hennepin_sheriff field, so on dakota, washington, anoka
+    and st_louis notices it is null and this returns None.
+    """
+    if not sold_to:
+        return None
+    target = norm_party(sold_to)
+    if not target:
+        return None
+    for v in owner_values:
+        if v and norm_party(v) == target:
+            return v
+    return None
+
 DIGITS_ONLY = re.compile(r"\D+")
 
 
@@ -748,6 +849,7 @@ def decide(cfg, row, attrs, today):
         forfeit = (attrs.get(cfg["forfeit_field"]) or "").strip().upper()
 
     reo_hit = match_reo(owner_values)
+    purchaser_hit = match_purchaser(owner_values, row.get("sold_to"))
 
     # === FORFEITURE STATED IN THE OWNER FIELD (2026-08-25, task 2925) ===
     # Checked BEFORE the REO branch because it is the more specific claim.
@@ -791,6 +893,26 @@ def decide(cfg, row, attrs, today):
                         "(Minn. Stat. ch. 281 track, not ch. 580/582; "
                         "review)" % val,
                         None, row["check_stage"], None)
+
+    # === THE CURRENT OWNER IS THE SALE PURCHASER (2026-09-24) ===
+    # Checked BEFORE the REO branch because it is the stronger evidence: it
+    # names the actual buyer from the notice rather than inferring an
+    # institution from a name pattern. Where both fire they agree, and this
+    # one records WHICH party.
+    #
+    # Found by reading the 76 windows labelled "possible redemption" on
+    # 2026-09-24. PID 0411821310113 (5601 Vera Cruz Ave N, Crystal) was one:
+    # the sheriff's sale bought in by THE ROBERTA HOMEOWNER'S ASSOCIATION for
+    # $17,686 against a $214,600 value, and the county now shows ROBERTA
+    # HOMEOWNERS ASSOC INC as owner. The certificate converted. No lender
+    # pattern could ever have caught it, and the database called it a
+    # possible redemption by the homeowner for three months.
+    if purchaser_hit:
+        return ("foreclosed", False, src + "_owner_matches_purchaser",
+                "Current owner '%s' is the party that bought at the "
+                "sheriff's sale ('%s'), so the certificate converted. Not a "
+                "redemption." % (purchaser_hit, row.get("sold_to")),
+                None, row["check_stage"], None)
 
     if reo_hit:
         # No date: an owner-name match says the lender HOLDS it, not when
@@ -849,11 +971,37 @@ def decide(cfg, row, attrs, today):
                 nxt, min(row["check_stage"] + 1, len(LADDER_OFFSETS)), sale_dt)
 
     # No signal.
+    #
+    # === WHAT THIS NOTE IS ALLOWED TO CLAIM (2026-09-24) ===
+    # It used to say "Possible redemption" for every unmatched row. Of the
+    # 76 rows carrying it, 34 had an ENTITY on title — associations and
+    # investor LLCs that had taken the property — so the note asserted a
+    # homeowner outcome on records showing the opposite. Those 34 also sat
+    # outside the published denominator, which made the error invisible.
+    #
+    # A person's name on title after expiry is genuinely consistent with a
+    # redemption and stays a candidate. An entity's name is not: it is
+    # either the buyer at the sale, the association that foreclosed, or an
+    # investor who bought during the window — none of them a redemption by
+    # the owner. Neither branch asserts an outcome; they differ only in what
+    # the note says is worth confirming, which is what downstream reads.
     nxt = next_ladder_date(expiry, today)
     if nxt is None:
+        entity = next((v for v in owner_values
+                       if v and NON_PERSON_REGEX.search(v)), None)
+        if entity:
+            return ("unknown", True, src + "_entity_holds_title",
+                    "No REO match, no post-expiry sale after full ladder. "
+                    "An entity holds title ('%s') - an association, investor "
+                    "or the sale purchaser under a name no lender pattern "
+                    "covers. NOT a redemption candidate; needs "
+                    "eCRV/recorder confirmation of when title moved."
+                    % entity,
+                    None, len(LADDER_OFFSETS), None)
         return ("unknown", True, src,
-                "No REO match, no post-expiry sale after full ladder. "
-                "Possible redemption; needs eCRV/recorder confirmation.",
+                "No REO match, no post-expiry sale after full ladder, and a "
+                "personal name still holds title. Possible redemption; "
+                "needs eCRV/recorder confirmation.",
                 None, len(LADDER_OFFSETS), None)
     return (None, False, None, "No signal yet", nxt,
             min(row["check_stage"] + 1, len(LADDER_OFFSETS)), None)
@@ -997,8 +1145,18 @@ def process(conn, dry_run, today):
             """
             SELECT t.id, t.county_code, t.parcel_id,
                    regexp_replace(t.parcel_id, '\\D', '', 'g') AS pin_norm,
-                   t.anchor_date, t.redemption_expiry_date, t.check_stage
+                   t.anchor_date, t.redemption_expiry_date, t.check_stage,
+                   -- ADDED 2026-09-24. Who bought at the sheriff's sale, so
+                   -- decide() can test the current owner against the actual
+                   -- purchaser instead of against a list of lender names.
+                   -- NULL on every county except hennepin, which is the only
+                   -- one publishing toWhomSold; the branch that uses it is
+                   -- written to do nothing when it is absent.
+                   e.raw_data->>'toWhomSold' AS sold_to
             FROM outcomes.redemption_tracker t
+            LEFT JOIN signals.distress_events e
+                   ON e.id = t.source_id
+                  AND t.source_table = 'signals.distress_events'
             JOIN (SELECT * FROM unnest(%s::text[], %s::text[])
                     AS m(county_code, pin_regex)) m
               ON m.county_code = t.county_code
