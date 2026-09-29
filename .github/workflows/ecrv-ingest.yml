@@ -20,13 +20,17 @@ name: eCRV Ingest
 #   - the ingest itself now reports county codes with no ecrv_county_map
 #     entry, whose sales join to nothing downstream
 #   - scoring.avm_training is rebuilt, because eCRV is its only input
+#
+# THE ARCHIVE (2014-2023) IS NOT LOADED HERE. It has its own workflow,
+# ecrv-archive-ingest.yml, which writes outcomes.ecrv_sales_history and runs
+# neither the matview refresh nor the AVM rebuild below.
 on:
   workflow_dispatch:
     inputs:
       object_name:
         description: 'Zip filename in the ecrv-extracts bucket — full name, including the century (2026-, not 26-)'
         required: true
-        default: '2026-09-21-02-11-28_eCRVExtract.zip'
+        default: '2026-09-28-02-07-12_eCRVExtract.zip'
 jobs:
   ingest:
     name: Ingest eCRV weekly extract
@@ -60,6 +64,13 @@ jobs:
         # instead. This step costs a second and prints the bucket listing,
         # so a mistyped name is corrected from the log rather than from the
         # dashboard.
+        #
+        # FIXED 2026-09-29: Storage list() returns only 100 objects by
+        # default, sorted by name. Once the 482 archive files (2014-2023)
+        # were uploaded, the first 100 names were all 2014-2016, so every
+        # current file would have been reported NOT FOUND. The check now
+        # SEARCHES for the name instead of scanning a default page, and the
+        # "most recent" listing sorts descending.
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -71,16 +82,24 @@ jobs:
           want = os.environ["OBJECT_NAME"].strip()
           sb = create_client(os.environ["SUPABASE_URL"],
                              os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-          names = [o["name"] for o in sb.storage.from_("ecrv-extracts").list()]
-          if want in names:
+          bucket = sb.storage.from_("ecrv-extracts")
+
+          def names(search, limit=1000, order="asc"):
+              res = bucket.list("", {"limit": limit, "offset": 0,
+                                     "search": search,
+                                     "sortBy": {"column": "name", "order": order}})
+              return [o["name"] for o in (res or []) if o.get("name")]
+
+          if want in names(want):
               print("[preflight] found %s" % want, flush=True)
               sys.exit(0)
           print("[preflight] NOT FOUND in ecrv-extracts: %r" % want, flush=True)
-          near = [n for n in names if want.lstrip("20")[:8] in n]
+          day = want[:10] if want.startswith("20") else ("20" + want)[:10]
+          near = names(day)
           if near:
               print("[preflight] did you mean: %s" % ", ".join(sorted(near)), flush=True)
           print("[preflight] most recent objects in the bucket:", flush=True)
-          for n in sorted(names)[-5:]:
+          for n in names("20", limit=5, order="desc"):
               print("             %s" % n, flush=True)
           sys.exit(1)
           PY
