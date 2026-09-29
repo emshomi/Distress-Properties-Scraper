@@ -34,6 +34,26 @@ calibration views.
 The target is an allow-list, not free text: a typo must fail loudly rather
 than create writes against an unintended table.
 
+=== TWO XML LAYOUTS (found 2026-09-29, 2014 archive dry run) ===
+The archive's early files (2014, possibly later years) are an OLDER export:
+no <?xml?> declaration, root <us.mn.state.mdor.ecrv.extract.form.EcrvForm>,
+and repeated items wrapped one level deeper:
+
+    modern:  <parcels><parcelId>..</parcelId></parcels>            (one per parcel)
+    legacy:  <parcels><...ParcelForm><parcelId>..</parcelId></...ParcelForm>
+                      <...ParcelForm>...</...ParcelForm></parcels>
+    modern:  <individuals><firstName>..</firstName>..</individuals>  (one per person)
+    legacy:  <individuals><...StandardBuyerSellerForm>..</...>
+                          <...StandardBuyerSellerForm>..</...></individuals>
+
+The first 2014 dry run read 0 of 31,649 certificates: the CRV id was found,
+but parcelId sat one level deeper, so every certificate looked parcel-less
+and was skipped. _items() now reads both layouts. The modern path is
+unchanged: an element that carries the fields directly is used as-is.
+
+Legacy files also carry invalid XML character references (e.g. &#11;) that
+even the cp1252 repair cannot parse; a second repair strips them.
+
 === HOW THE ZIP REACHES THIS CODE ===
 Uploaded to the PRIVATE Supabase Storage bucket 'ecrv-extracts' via the
 dashboard, then this loader downloads it by object name. That is deliberate:
@@ -130,6 +150,45 @@ ALLOWED_TARGET_TABLES = frozenset({"ecrv_sales", "ecrv_sales_history"})
 
 _DB_BATCH_SIZE = 500
 
+# Count of XML documents that needed a repair to parse, per ingest. Logged once
+# per file as a number instead of once per certificate: the 2014 dry run
+# printed ~31,000 identical "repaired" lines.
+_REPAIRS = {"cp1252": 0, "charref": 0}
+
+
+def reset_repair_counts() -> None:
+    for k in _REPAIRS:
+        _REPAIRS[k] = 0
+
+
+def repair_counts() -> dict[str, int]:
+    return dict(_REPAIRS)
+
+
+# XML 1.0 forbids character references to control characters other than
+# tab (9), LF (10) and CR (13).
+_BAD_CHARREF = re.compile(
+    rb"&#(?:x0*(?:[0-8bBcCeEfF]|1[0-9a-fA-F])|0*(?:[0-8]|1[124-9]|2[0-9]|3[01]));"
+)
+
+
+def _items(parent: Optional[ET.Element], tag: str, marker_fields: tuple[str, ...]) -> list[ET.Element]:
+    """Return the item elements under parent/<tag>, for either XML layout.
+
+    modern: each <tag> element IS an item (it carries a marker field directly)
+    legacy: each <tag> element WRAPS items (its children carry the fields)
+    """
+    if parent is None:
+        return []
+    out: list[ET.Element] = []
+    for el in parent.findall(tag):
+        if any(el.find(f) is not None for f in marker_fields):
+            out.append(el)
+        else:
+            out.extend(child for child in el
+                       if any(child.find(f) is not None for f in marker_fields))
+    return out
+
 
 def _txt(node: Optional[ET.Element], path: str) -> Optional[str]:
     if node is None:
@@ -184,7 +243,7 @@ def _party_names(form: Optional[ET.Element]) -> list[str]:
     if form is None:
         return []
     names: list[str] = []
-    for ind in form.findall("individuals"):
+    for ind in _items(form, "individuals", ("firstName", "lastName", "middleName")):
         parts = [
             _txt(ind, "firstName"),
             _txt(ind, "middleName"),
@@ -194,7 +253,7 @@ def _party_names(form: Optional[ET.Element]) -> list[str]:
         joined = " ".join(p for p in parts if p)
         if joined:
             names.append(joined)
-    for org in form.findall("organizations"):
+    for org in _items(form, "organizations", ("organizationName",)):
         name = _txt(org, "organizationName")
         if name:
             names.append(name)
@@ -216,20 +275,22 @@ def parse_ecrv_xml(xml_bytes: bytes, source_file: str) -> list[dict[str, Any]]:
         # dropped. The offenders are exactly the characters legal
         # descriptions are full of: ° (414), ¼ (310), curly quotes (211),
         # ½ (77) — quarter-quarter section calls and bearings.
-        #
-        # Every other weekly file parses clean as UTF-8, so this is a
-        # per-export defect at the state's end, not a format change. Decode
-        # as cp1252 and re-encode; verified to recover 198 of 198 with
-        # complete data (CRV id, county, parcels and price on every one).
+        # The 2014 archive files have no declaration at all and need this
+        # on almost every certificate.
+        repaired = xml_bytes.decode("cp1252", errors="replace").encode("utf-8")
         try:
-            repaired = xml_bytes.decode("cp1252", errors="replace").encode("utf-8")
             root = ET.fromstring(repaired)
-            logger.info("eCRV XML repaired via cp1252 fallback",
-                        file=source_file)
-        except (ET.ParseError, UnicodeDecodeError) as e:
-            logger.warning("eCRV XML parse failed", file=source_file,
-                           error=str(e)[:200])
-            return []
+            _REPAIRS["cp1252"] += 1
+        except ET.ParseError:
+            # SECOND REPAIR (2026-09-29): invalid character references such
+            # as &#11; appear in legacy files and are illegal in XML 1.0.
+            try:
+                root = ET.fromstring(_BAD_CHARREF.sub(b"", repaired))
+                _REPAIRS["charref"] += 1
+            except ET.ParseError as e:
+                logger.warning("eCRV XML parse failed", file=source_file,
+                               error=str(e)[:200])
+                return []
 
     crv_raw = _txt(root, "headerForm/crvNumberId")
     if not crv_raw:
@@ -265,7 +326,7 @@ def parse_ecrv_xml(xml_bytes: bytes, source_file: str) -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     seen_raw: set[str] = set()
-    for p in prop.findall("parcels"):
+    for p in _items(prop, "parcels", ("parcelId",)):
         raw_pin = _txt(p, "parcelId")
         if not raw_pin or raw_pin in seen_raw:
             continue          # UNIQUE (crv_number_id, parcel_id_raw)
@@ -344,15 +405,18 @@ def ingest_zip(
     started = datetime.now(timezone.utc)
     source_file = source_file or os.path.basename(zip_path)
 
+    reset_repair_counts()
     rows = list(iter_zip_rows(zip_path, source_file))
     certs = len({r["crv_number_id"] for r in rows})
+    repairs = repair_counts()
     logger.info("eCRV extract parsed", source_file=source_file,
                 certificates=certs, parcel_rows=len(rows),
-                target_table=target_table)
+                target_table=target_table, repaired_cp1252=repairs["cp1252"],
+                repaired_charref=repairs["charref"])
     if not rows:
         return {"source_file": source_file, "target_table": target_table,
                 "certificates": 0, "parcel_rows": 0, "written": 0,
-                "failed": 0}
+                "failed": 0, "repaired": repairs}
 
     now_iso = started.isoformat()
     for r in rows:
@@ -380,6 +444,7 @@ def ingest_zip(
         "parcel_rows": len(rows),
         "written": written,
         "failed": failed,
+        "repaired": repairs,
         "duration_seconds": round(
             (datetime.now(timezone.utc) - started).total_seconds(), 1),
     }
@@ -410,6 +475,8 @@ __all__ = [
     "ALLOWED_TARGET_TABLES",
     "parse_ecrv_xml",
     "iter_zip_rows",
+    "reset_repair_counts",
+    "repair_counts",
     "download_from_storage",
     "ingest_zip",
     "ingest_from_storage",
