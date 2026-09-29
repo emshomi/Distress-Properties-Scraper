@@ -25,7 +25,8 @@ GUARDS
 
 PARSE HEALTH
 For each file it prints xml_files (XML documents in the zip) next to
-certificates (those the parser could key). A gap means certificates the
+certificates (those the parser could key), and repaired=A+B: documents that
+needed the cp1252 repair (A) and the invalid-character-reference repair (B). A gap means certificates the
 parser dropped — no CRV id, no parcels, or unparseable XML. Current weekly
 files show a gap of 0; an older format would show up here first.
 
@@ -54,6 +55,8 @@ from src.scrapers.ecrv_extract import (
     download_from_storage,
     ingest_zip,
     iter_zip_rows,
+    repair_counts,
+    reset_repair_counts,
 )
 
 TARGET_TABLE = "ecrv_sales_history"
@@ -133,10 +136,12 @@ def main() -> int:
             path = download_from_storage(name)
             xml_files = count_xml(path)
             if args.dry_run:
+                reset_repair_counts()
                 rows = list(iter_zip_rows(path, name))
                 certs = len({r["crv_number_id"] for r in rows})
                 stats = {"parcel_rows": len(rows), "certificates": certs,
-                         "written": 0, "failed": 0}
+                         "written": 0, "failed": 0,
+                         "repaired": repair_counts()}
                 dates = sorted(r["deed_date"] for r in rows if r.get("deed_date"))
                 span = f" deeds {dates[0]}..{dates[-1]}" if dates else ""
             else:
@@ -144,11 +149,13 @@ def main() -> int:
                                    target_table=TARGET_TABLE)
                 span = ""
             dropped = max(xml_files - stats["certificates"], 0)
+            rep = stats.get("repaired") or {}
             print(
                 f"[archive] {i:>2}/{len(names)} {name} xml_files={xml_files} "
                 f"certificates={stats['certificates']} dropped={dropped} "
                 f"parcel_rows={stats['parcel_rows']} written={stats['written']} "
-                f"failed={stats['failed']}{span}",
+                f"failed={stats['failed']} repaired={rep.get('cp1252', 0)}"
+                f"+{rep.get('charref', 0)}{span}",
                 flush=True,
             )
             tot["files"] += 1
