@@ -153,7 +153,7 @@ _DB_BATCH_SIZE = 500
 # Count of XML documents that needed a repair to parse, per ingest. Logged once
 # per file as a number instead of once per certificate: the 2014 dry run
 # printed ~31,000 identical "repaired" lines.
-_REPAIRS = {"cp1252": 0, "charref": 0}
+_REPAIRS = {"cp1252": 0, "charref": 0, "ctrl": 0}
 
 
 def reset_repair_counts() -> None:
@@ -170,6 +170,22 @@ def repair_counts() -> dict[str, int]:
 _BAD_CHARREF = re.compile(
     rb"&#(?:x0*(?:[0-8bBcCeEfF]|1[0-9a-fA-F])|0*(?:[0-8]|1[124-9]|2[0-9]|3[01]));"
 )
+
+# THIRD REPAIR (2026-09-29): from 2021 on, ~30-40 certificates a year fail
+# with "not well-formed (invalid token)" even after the two repairs above.
+# Two causes produce exactly that error from expat:
+#   - raw control bytes (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F) pasted into a text
+#     field, illegal anywhere in XML 1.0;
+#   - a bare "&" in text that is not the start of an entity (e.g. "A & B").
+# Strip the first, escape the second. Tab, LF and CR are left alone.
+_RAW_CTRL = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_BARE_AMP = re.compile(rb"&(?!#[0-9]+;|#x[0-9a-fA-F]+;|[A-Za-z_][A-Za-z0-9._-]*;)")
+
+
+def _deep_repair(data: bytes) -> bytes:
+    data = _BAD_CHARREF.sub(b"", data)
+    data = _RAW_CTRL.sub(b"", data)
+    return _BARE_AMP.sub(b"&amp;", data)
 
 
 def _items(parent: Optional[ET.Element], tag: str, marker_fields: tuple[str, ...]) -> list[ET.Element]:
@@ -287,10 +303,15 @@ def parse_ecrv_xml(xml_bytes: bytes, source_file: str) -> list[dict[str, Any]]:
             try:
                 root = ET.fromstring(_BAD_CHARREF.sub(b"", repaired))
                 _REPAIRS["charref"] += 1
-            except ET.ParseError as e:
-                logger.warning("eCRV XML parse failed", file=source_file,
-                               error=str(e)[:200])
-                return []
+            except ET.ParseError:
+                # THIRD REPAIR: raw control bytes and bare ampersands.
+                try:
+                    root = ET.fromstring(_deep_repair(repaired))
+                    _REPAIRS["ctrl"] += 1
+                except ET.ParseError as e:
+                    logger.warning("eCRV XML parse failed", file=source_file,
+                                   error=str(e)[:200])
+                    return []
 
     crv_raw = _txt(root, "headerForm/crvNumberId")
     if not crv_raw:
@@ -412,7 +433,8 @@ def ingest_zip(
     logger.info("eCRV extract parsed", source_file=source_file,
                 certificates=certs, parcel_rows=len(rows),
                 target_table=target_table, repaired_cp1252=repairs["cp1252"],
-                repaired_charref=repairs["charref"])
+                repaired_charref=repairs["charref"],
+                repaired_ctrl=repairs["ctrl"])
     if not rows:
         return {"source_file": source_file, "target_table": target_table,
                 "certificates": 0, "parcel_rows": 0, "written": 0,
