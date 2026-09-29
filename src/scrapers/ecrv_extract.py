@@ -16,6 +16,24 @@ outcomes are "confirmed from county records and state deed filings, not
 inferred," and it feeds the scoring.comp_ratios / distress_multipliers
 calibration views.
 
+=== TWO TARGET TABLES (added 2026-09-29) ===
+  outcomes.ecrv_sales          the live table, 2024 onward. Everything
+                               downstream reads it: comp_ratios,
+                               distress_multipliers, avm_training,
+                               ecrv_buyer_activity, investor_activity,
+                               reo_seller_patterns, distressed_exit_sales.
+                               DEFAULT — the weekly run is unchanged.
+  outcomes.ecrv_sales_history  the MN DOR archive room, 2014-10 to 2023-12
+                               (482 weekly files). Same columns, same unique
+                               key, deliberately SEPARATE so ten years of old
+                               prices cannot move live deal math, the AVM or
+                               the investor lists. Used for owner-at-a-point-
+                               in-time lookups (the redemption checker).
+                               Written only by scripts/run_ecrv_archive_ingest.
+
+The target is an allow-list, not free text: a typo must fail loudly rather
+than create writes against an unintended table.
+
 === HOW THE ZIP REACHES THIS CODE ===
 Uploaded to the PRIVATE Supabase Storage bucket 'ecrv-extracts' via the
 dashboard, then this loader downloads it by object name. That is deliberate:
@@ -87,6 +105,7 @@ public data. Parse them, drop them on the floor.
 Usage:
     python -m scripts.run_ecrv_ingest 2026-07-27-02-10-41_eCRVExtract.zip
     python -m scripts.run_ecrv_ingest --local /path/to/extract.zip
+    python -m scripts.run_ecrv_archive_ingest 2014 [--dry-run]
 """
 
 from __future__ import annotations
@@ -105,6 +124,9 @@ from src.utils.logger import logger
 
 
 STORAGE_BUCKET = "ecrv-extracts"
+
+DEFAULT_TARGET_TABLE = "ecrv_sales"
+ALLOWED_TARGET_TABLES = frozenset({"ecrv_sales", "ecrv_sales_history"})
 
 _DB_BATCH_SIZE = 500
 
@@ -296,23 +318,41 @@ def _chunks(seq: list[Any], n: int) -> Iterator[list[Any]]:
         yield seq[i:i + n]
 
 
-def ingest_zip(zip_path: str, source_file: Optional[str] = None) -> dict[str, Any]:
-    """Parse an extract zip and upsert into outcomes.ecrv_sales.
+def _check_target(target_table: str) -> None:
+    if target_table not in ALLOWED_TARGET_TABLES:
+        raise ValueError(
+            f"target_table {target_table!r} is not allowed; "
+            f"expected one of {sorted(ALLOWED_TARGET_TABLES)}"
+        )
+
+
+def ingest_zip(
+    zip_path: str,
+    source_file: Optional[str] = None,
+    target_table: str = DEFAULT_TARGET_TABLE,
+) -> dict[str, Any]:
+    """Parse an extract zip and upsert into outcomes.<target_table>.
+
+    target_table defaults to 'ecrv_sales' (the weekly behaviour). The archive
+    runner passes 'ecrv_sales_history'. Anything else raises.
 
     Idempotent on (crv_number_id, parcel_id_raw): re-running the same file
     updates rather than duplicates, and a corrected certificate overwrites
     the original.
     """
+    _check_target(target_table)
     started = datetime.now(timezone.utc)
     source_file = source_file or os.path.basename(zip_path)
 
     rows = list(iter_zip_rows(zip_path, source_file))
     certs = len({r["crv_number_id"] for r in rows})
     logger.info("eCRV extract parsed", source_file=source_file,
-                certificates=certs, parcel_rows=len(rows))
+                certificates=certs, parcel_rows=len(rows),
+                target_table=target_table)
     if not rows:
-        return {"source_file": source_file, "certificates": 0,
-                "parcel_rows": 0, "written": 0, "failed": 0}
+        return {"source_file": source_file, "target_table": target_table,
+                "certificates": 0, "parcel_rows": 0, "written": 0,
+                "failed": 0}
 
     now_iso = started.isoformat()
     for r in rows:
@@ -323,7 +363,7 @@ def ingest_zip(zip_path: str, source_file: Optional[str] = None) -> dict[str, An
     for batch in _chunks(rows, _DB_BATCH_SIZE):
         try:
             res = (
-                outcomes_table("ecrv_sales")
+                outcomes_table(target_table)
                 .upsert(batch, on_conflict="crv_number_id,parcel_id_raw")
                 .execute()
             )
@@ -331,10 +371,11 @@ def ingest_zip(zip_path: str, source_file: Optional[str] = None) -> dict[str, An
         except Exception as e:
             failed += len(batch)
             logger.warning("eCRV upsert failed", batch_size=len(batch),
-                           error=str(e)[:500])
+                           target_table=target_table, error=str(e)[:500])
 
     stats = {
         "source_file": source_file,
+        "target_table": target_table,
         "certificates": certs,
         "parcel_rows": len(rows),
         "written": written,
@@ -346,11 +387,16 @@ def ingest_zip(zip_path: str, source_file: Optional[str] = None) -> dict[str, An
     return stats
 
 
-def ingest_from_storage(object_name: str) -> dict[str, Any]:
+def ingest_from_storage(
+    object_name: str,
+    target_table: str = DEFAULT_TARGET_TABLE,
+) -> dict[str, Any]:
     """Download an extract from the bucket, ingest it, clean up the temp file."""
+    _check_target(target_table)
     path = download_from_storage(object_name)
     try:
-        return ingest_zip(path, source_file=object_name)
+        return ingest_zip(path, source_file=object_name,
+                          target_table=target_table)
     finally:
         try:
             os.unlink(path)
@@ -360,6 +406,8 @@ def ingest_from_storage(object_name: str) -> dict[str, Any]:
 
 __all__ = [
     "STORAGE_BUCKET",
+    "DEFAULT_TARGET_TABLE",
+    "ALLOWED_TARGET_TABLES",
     "parse_ecrv_xml",
     "iter_zip_rows",
     "download_from_storage",
