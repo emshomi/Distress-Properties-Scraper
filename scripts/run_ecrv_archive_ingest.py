@@ -25,8 +25,9 @@ GUARDS
 
 PARSE HEALTH
 For each file it prints xml_files (XML documents in the zip) next to
-certificates (those the parser could key), and repaired=A+B: documents that
-needed the cp1252 repair (A) and the invalid-character-reference repair (B). A gap means certificates the
+certificates (those the parser could key), and repaired=A+B+C: documents that
+needed the cp1252 repair (A), the invalid-character-reference repair (B) and
+the control-character / bare-ampersand repair (C), printed as A+B+C. A gap means certificates the
 parser dropped — no CRV id, no parcels, or unparseable XML. Current weekly
 files show a gap of 0; an older format would show up here first.
 
@@ -155,7 +156,7 @@ def main() -> int:
                 f"certificates={stats['certificates']} dropped={dropped} "
                 f"parcel_rows={stats['parcel_rows']} written={stats['written']} "
                 f"failed={stats['failed']} repaired={rep.get('cp1252', 0)}"
-                f"+{rep.get('charref', 0)}{span}",
+                f"+{rep.get('charref', 0)}+{rep.get('ctrl', 0)}{span}",
                 flush=True,
             )
             tot["files"] += 1
