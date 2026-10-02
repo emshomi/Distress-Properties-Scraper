@@ -1,24 +1,23 @@
 name: Ramsey Tax Scraper
-# Manual + monthly. Ramsey's attributed parcel data (owner, value, special
-# assessments) refreshes slowly — monthly is plenty, and a daily poll of 163K
-# parcels would be wasteful. Two ORDERED steps in one job:
-#   1. ramsey_parcels   — streaming reload of the ~163K parcel spine
-#   2. ramsey_tax_roll  — mine that spine for special-assessment-burden events
-# Order matters: the miner reads the parcels the loader just refreshed, so they
-# run sequentially in the SAME job (a guaranteed order, not a timing guess).
+# Manual + monthly. Owns Ramsey's monthly refresh. Two ORDERED steps in one job:
+#   1. ramsey_parcels   - streaming reload of the ~163K parcel spine
+#   2. ramsey_tax_roll  - mine that spine for special-assessment-burden events
+# 2026-10-02: ramsey-parcels.yml had the same cron and collided on
+# core.parcels (lock timeouts, 55P03). Its schedule was removed; both
+# workflows now share a concurrency group so they can never overlap.
+# Timeout raised 30 -> 60: the parcel step alone takes ~27 minutes.
 on:
   workflow_dispatch:
   schedule:
-    # 1st of the month, 13:30 UTC = 7:30am Central (standard) / 8:30am (DST).
-    # Offset from the daily sheriff jobs (12:00-12:20 UTC) so nothing overlaps.
     - cron: '30 13 1 * *'
+concurrency:
+  group: ramsey-parcels-spine
+  cancel-in-progress: false
 jobs:
   scrape:
     name: Run Ramsey parcels + tax-roll
     runs-on: ubuntu-latest
-    # Pure httpx + DB mining, no Playwright. But the parcels load streams ~163K
-    # records and the tax-roll scans all of them, so give generous headroom.
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,21 +32,16 @@ jobs:
           pip install -r requirements.txt
       - name: Run Ramsey parcels (spine) then tax-roll (signal)
         env:
-          # --- Required: database ---
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # --- Required: app config (mirror Railway's values) ---
           ENVIRONMENT: production
           LOG_LEVEL: INFO
           ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
-          # --- Geocoding (parcel_resolver may call these) ---
           GEOCODING_ENABLED: 'true'
           GEOCODING_CACHE_DAYS: '30'
           NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
           MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
-          # --- Scheduler (only used by Railway, but config may require it) ---
           SCHEDULER_TIMEZONE: America/Chicago
-          # --- Feature flags: enable ONLY the two Ramsey tax jobs ---
           SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
           SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
           SCRAPER_HENNEPIN_SHERIFF_ENABLED: 'false'
