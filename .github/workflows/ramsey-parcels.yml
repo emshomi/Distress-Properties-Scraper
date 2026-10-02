@@ -1,27 +1,17 @@
 name: Ramsey Parcels Loader
-# Manual + monthly. ADDED 2026-07-28: run_ramsey_parcels.py and
-# src/scrapers/ramsey_parcels.py both existed, and 163,896 Ramsey parcels
-# are loaded, but there was no workflow — the spine had been run some other
-# way and could not be re-run from the browser. That surfaced when the
-# owner-classifier fix reclassified every other county's owners and Ramsey
-# kept 366 government parcels misfiled as individual, with no way to
-# refresh them.
-   on:
-     workflow_dispatch:
-     # No schedule (removed 2026-10-02). The monthly refresh is owned by
-     # ramsey-tax-scraper, which reloads the spine and then mines the tax
-     # roll in order. Both on the same cron collided on core.parcels
-     # (lock timeouts, 55P03) and failed every month since August.
-     # This workflow stays for manual re-runs only.
-   concurrency:
-     group: ramsey-parcels-spine
-     cancel-in-progress: false
-   jobs:
+# Manual only. ADDED 2026-07-28 so the Ramsey spine can be re-run from the
+# browser. Schedule REMOVED 2026-10-02: ramsey-tax.yml owns the monthly
+# refresh (spine, then tax roll, in order). Both on the same cron collided
+# on core.parcels (lock timeouts, 55P03) and failed every month since August.
+on:
+  workflow_dispatch:
+concurrency:
+  group: ramsey-parcels-spine
+  cancel-in-progress: false
+jobs:
   scrape:
     name: Run Ramsey parcels (spine + owners)
     runs-on: ubuntu-latest
-    # ~164K parcels. Hennepin's 448K run takes well under an hour; this is
-    # roughly a third of that, with headroom.
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -37,21 +27,16 @@ name: Ramsey Parcels Loader
           pip install -r requirements.txt
       - name: Run Ramsey parcels loader
         env:
-          # --- Required: database ---
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # --- Required: app config (mirror Railway's values) ---
           ENVIRONMENT: production
           LOG_LEVEL: INFO
           ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
-          # --- Geocoding (parcel_resolver may call these) ---
           GEOCODING_ENABLED: 'true'
           GEOCODING_CACHE_DAYS: '30'
           NOMINATIM_USER_AGENT: ${{ secrets.NOMINATIM_USER_AGENT }}
           MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
-          # --- Scheduler (only used by Railway, but config may require it) ---
           SCHEDULER_TIMEZONE: America/Chicago
-          # --- Feature flags: enable ONLY this job ---
           SCRAPER_ANOKA_PARCELS_ENABLED: 'false'
           SCRAPER_ANOKA_SHERIFF_ENABLED: 'false'
           SCRAPER_DAKOTA_SHERIFF_ENABLED: 'false'
