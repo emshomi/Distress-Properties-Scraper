@@ -6,14 +6,17 @@ name: Ramsey Parcels Loader
 # owner-classifier fix reclassified every other county's owners and Ramsey
 # kept 366 government parcels misfiled as individual, with no way to
 # refresh them.
-on:
-  workflow_dispatch:
-  schedule:
-    # 1st of the month, 13:30 UTC = 7:30am Central (standard) / 8:30am (DST).
-    # The 1st is Ramsey's existing monthly slot, ahead of Olmsted (2nd),
-    # Fillmore (3rd) and Wabasha (4th, quarterly).
-    - cron: '30 13 1 * *'
-jobs:
+   on:
+     workflow_dispatch:
+     # No schedule (removed 2026-10-02). The monthly refresh is owned by
+     # ramsey-tax-scraper, which reloads the spine and then mines the tax
+     # roll in order. Both on the same cron collided on core.parcels
+     # (lock timeouts, 55P03) and failed every month since August.
+     # This workflow stays for manual re-runs only.
+   concurrency:
+     group: ramsey-parcels-spine
+     cancel-in-progress: false
+   jobs:
   scrape:
     name: Run Ramsey parcels (spine + owners)
     runs-on: ubuntu-latest
