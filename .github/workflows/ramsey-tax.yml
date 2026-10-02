@@ -17,7 +17,7 @@ jobs:
   scrape:
     name: Run Ramsey parcels + tax-roll
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
