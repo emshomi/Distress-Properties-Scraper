@@ -374,14 +374,43 @@ def _apply_postponement(existing_row: dict[str, Any],
     # newer source_url, confidence and extraction flags — strictly better than
     # the superseded copy. title and description embed the sale date in prose
     # and would otherwise still read the old one back to a human.
+    #
+    # === UPDATE THE MATCHED ROW BY ID, NOT EVERY ROW WITH THIS source_id ===
+    # (changed 2026-10-23)
+    #
+    # This UPDATE used to filter on source_id. source_id is per FORECLOSURE,
+    # not per event row, so it also hit the RESOLVED rows of earlier versions
+    # of the same foreclosure -- and moved them all to the same new date.
+    # distress_events_source_identity_key is (county_code, source, source_id,
+    # event_date), so two rows landing on one date is a 23505 and the whole
+    # approval 500s ("Approve failed. Try again.").
+    #
+    # Measured live 2026-10-23, washington 26-003550FC (Meadowridge Trail,
+    # Scandia): parcel 2803220420005 holds event 209438 (2026-07-28, resolved
+    # 08-16) and event 209464 (2026-09-15, live), both source_id
+    # '26-003550FC#2803220420005'. Approving the 10-15 postponement
+    # (extraction 695) tried to move BOTH to 2026-10-15. Every package notice
+    # postponed more than once is in this shape, which is why "they never
+    # work when they come like this".
+    #
+    # The id is the row the caller's guard matched -- the live event. When it
+    # is missing nothing is changed: a skipped postponement is recoverable, an
+    # unscoped date rewrite is not.
+    _event_id = existing_row.get("id")
+    if _event_id is None:
+        logger.warning(
+            "postponement skipped -- matched event row carries no id",
+            source_id=source_id,
+        )
+        return False
+
     signals_table("distress_events").update({
         "event_date": new_event.get("event_date"),
         "event_value": new_event.get("event_value"),
         "raw_data": new_event.get("raw_data"),
         "title": new_event.get("title"),
         "description": new_event.get("description"),
-    }).in_("source", list(_PROMOTION_SOURCES)).eq(
-        "source_id", source_id).execute()
+    }).eq("id", _event_id).execute()
 
     # sheriff_sales has no source_id column; parcel_id is the handle, and the
     # synthetic PID is built from source_id so it identifies the same
@@ -612,12 +641,35 @@ async def approve_extraction(payload: AdminActionIn) -> dict[str, Any]:
             # deliberately NOT part of the match — a postponement keeps the same
             # parcel with a later date, and _apply_postponement below must still
             # see it as the same foreclosure moving, not a new one.
-            existing = (
+            #
+            # === LIVE ROW ONLY, SCOPED TO COUNTY, NEWEST FIRST (2026-10-23) ===
+            #
+            # This was .eq(parcel_id).limit(1) with no resolved_at filter, no
+            # county and no order -- so on a parcel holding an old RESOLVED
+            # event and a live one it could hand _apply_postponement either.
+            # 26-003550FC parcel 2803220420005 holds both (209438 resolved
+            # 07-28, 209464 live 09-15). The postponement must move the live
+            # one. resolved_at IS NULL matches the published-PID fallback
+            # below, which already required it.
+            #
+            # county_code because Minnesota parcel IDs are not unique across
+            # counties (95,036 PINs in more than one county, measured
+            # 2026-08-11). If the event carries no county the filter is left
+            # off, which is exactly the behaviour before this change.
+            _guard_county = (built["distress_event"] or {}).get("county_code")
+            _guard_q = (
                 signals_table("distress_events")
                 .select("id, event_date, source")
                 .in_("source", list(_PROMOTION_SOURCES))
                 .eq("parcel_id", effective_pid)
                 .eq("event_type", "sheriff_sale")
+                .is_("resolved_at", "null")
+            )
+            if _guard_county:
+                _guard_q = _guard_q.eq("county_code", _guard_county)
+            existing = (
+                _guard_q
+                .order("event_date", desc=True)
                 .limit(1)
                 .execute()
             )
