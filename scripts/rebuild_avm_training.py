@@ -16,9 +16,23 @@ object and IS current. avm_training was built by hand three times
 sql/avm_training_set.sql builds it with two pg_cron jobs and says twice:
 "UNSCHEDULE BOTH WHEN DONE. Neither self-terminates." That is why it was
 never scheduled -- nobody wants a cadence job that must be stopped by hand.
-The pg_cron shape exists because a single fill statement times out. A
-script holding its own connection has no such limit, loops county by
-county, and exits.
+The pg_cron shape exists because a single fill statement times out. This
+script loops county by county and exits.
+
+=== STATEMENT TIMEOUT ===
+
+The database role behind DATABASE_URL carries a 2-minute statement_timeout.
+Holding our own connection does NOT escape it -- a role default applies to
+every session that role opens. Measured 2026-11-09: the run cancelled the
+hennepin KNN statement at exactly 120s (fillmore finished 20:57:27, cancel
+at 20:59:27). hennepin is 55,911 of 225,753 rows; at ~2.2ms per row for
+each of two nearest-neighbour subqueries its single UPDATE runs ~4 minutes.
+
+Every write transaction therefore starts with SET LOCAL statement_timeout
+= 0 (no_timeout below). SET LOCAL, not SET: it lasts exactly one
+transaction, so it works through the Supabase pooler in transaction mode,
+where a session-level SET can land on a different backend and silently do
+nothing. The job's own timeout-minutes is what stops a runaway pass.
 
 === WHY A FULL REBUILD AND NOT AN APPEND ===
 
@@ -76,6 +90,14 @@ MIN_RATIO_OF_PREVIOUS = 0.90
 ABSOLUTE_MIN_ROWS = 50_000
 
 
+def no_timeout(cur):
+    """Lift the role's statement_timeout for the CURRENT transaction only.
+    Call it first in every transaction that runs a long statement; it ends
+    at the commit, so it must be repeated after each one. See the
+    STATEMENT TIMEOUT note in the module docstring."""
+    cur.execute("SET LOCAL statement_timeout = 0")
+
+
 def log(msg):
     print("[avm-rebuild] %s %s"
           % (datetime.now(timezone.utc).strftime("%H:%M:%S"), msg),
@@ -112,6 +134,7 @@ def counties_to_fill(cur):
 
 def build_empty(cur):
     log("creating %s" % NEW)
+    no_timeout(cur)
     cur.execute("DROP TABLE IF EXISTS %s" % NEW)
     # WHERE false copies column types and no rows -- instant. Creating it
     # from the populated view times out. (sql/avm_training_set.sql, B.)
@@ -129,6 +152,7 @@ def fill(conn, counties):
     t0 = time.time()
     for i, county in enumerate(counties, 1):
         with conn.cursor() as cur:
+            no_timeout(cur)
             cur.execute(
                 "INSERT INTO %s (ecrv_id, crv_number_id, county_code, "
                 "parcel_id, deed_date, purchase_amt, emv_total, "
@@ -162,6 +186,7 @@ def build_indexes(conn):
     a top-N heapsort: 143ms vs 30,770ms for 50 rows, measured 2026-08-23."""
     log("building indexes")
     with conn.cursor() as cur:
+        no_timeout(cur)
         cur.execute("CREATE INDEX avm_training_new_geom_idx "
                     "ON %s USING gist (geom)" % NEW)
         cur.execute("CREATE INDEX avm_training_new_cty_date "
@@ -182,6 +207,7 @@ def knn(conn):
     t0 = time.time()
     for i, county in enumerate(counties, 1):
         with conn.cursor() as cur:
+            no_timeout(cur)
             cur.execute("""
                 UPDATE {new} t
                 SET knn_ratio = k.med, knn_count = k.n
@@ -218,6 +244,7 @@ def knn(conn):
 def validate(cur, previous_rows):
     """A green build is not evidence. Measure the new table before trusting
     it with the live name."""
+    no_timeout(cur)
     cur.execute("SELECT count(*), count(DISTINCT county_code), "
                 "count(knn_ratio), max(deed_date) FROM %s" % NEW)
     rows, counties, with_knn, newest = cur.fetchone()
@@ -244,6 +271,7 @@ def swap(conn):
     renamed, or nothing changed."""
     log("swapping")
     with conn.cursor() as cur:
+        no_timeout(cur)
         cur.execute("DROP TABLE IF EXISTS %s" % OLD)
         cur.execute("ALTER TABLE %s RENAME TO avm_training_old" % LIVE)
         cur.execute("ALTER INDEX scoring.avm_training_geom_idx "
@@ -278,6 +306,7 @@ def main() -> int:
     previous_rows = None
     try:
         with conn.cursor() as cur:
+            no_timeout(cur)
             ensure_build_log(cur)
             cur.execute("SELECT count(*) FROM %s" % LIVE)
             previous_rows = cur.fetchone()[0]
