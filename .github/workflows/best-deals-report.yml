@@ -1,0 +1,61 @@
+name: Best Deals Report
+
+# Weekly "best of the best" investor report, emailed to ALERT_EMAIL_TO only
+# (internal; property-level detail never goes to anyone else).
+#
+# Weekly: Wednesday, after the Monday eCRV load + AVM rebuild and Tuesday's
+# scraper runs. On demand: Actions -> Best Deals Report -> Run workflow, with
+# an optional county (e.g. hennepin) and list size.
+on:
+  workflow_dispatch:
+    inputs:
+      county:
+        description: 'County slug for a single-county report (blank = all counties), e.g. hennepin, washington, st_louis'
+        required: false
+        default: ''
+      top_n:
+        description: 'How many properties in the top list'
+        required: false
+        default: '25'
+      dry_run:
+        description: 'Print the report in the log and send nothing (1 = yes)'
+        required: false
+        default: '0'
+  schedule:
+    # 13:00 UTC = 7am Central (standard) / 8am Central (DST). Wednesdays.
+    - cron: '0 13 * * 3'
+
+jobs:
+  best-deals:
+    name: Build and email best-deals report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install httpx
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx
+
+      - name: Run best-deals report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          # Scheduled runs have no inputs, so these fall back to the defaults.
+          REPORT_COUNTY: ${{ github.event.inputs.county || '' }}
+          REPORT_TOP_N: ${{ github.event.inputs.top_n || '25' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: |
+          python -m scripts.best_deals_report
