@@ -324,7 +324,11 @@ def _money(v):
 
 def _place(s):
     a = s["address"] or f"parcel {s['parcel_id'] or '?'}"
-    return f"{a}, {s['city']}" if s["city"] else a
+    # mnpublicnotice often writes the full line ("1251 MACARTHUR AVE, WEST ST
+    # PAUL, MN 55118") into address; appending city again doubled it.
+    if s["city"] and s["city"].lower() not in a.lower():
+        return f"{a}, {s['city']}"
+    return a
 
 
 def _header(r):
