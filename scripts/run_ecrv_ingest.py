@@ -53,10 +53,17 @@ def report_unmapped_counties(source_file: str) -> None:
     A row that is written but unjoinable is worse than one that fails: a
     failure is counted and retried, this was neither.
 
-    NON-FATAL BY DESIGN. An unmapped code is not a bad file. Most of the
-    28 still unmapped are counties with no parcels loaded, which no map
-    entry would fix -- the mapping is derived by joining eCRV parcel IDs
-    against core.parcels, so a county with no parcels cannot be derived.
+    NON-FATAL BY DESIGN. An unmapped code is not a bad file. Every code
+    still unmapped (28 as of 2026-09-01) is already IDENTIFIED: eCRV county
+    codes are alphabetical by county name, confirmed against FIPS gaps and
+    core.counties. What each lacks is a parcel loader. Its map row waits
+    for that loader, then for a match rate measured by joining that one
+    county's eCRV parcel IDs against its own rows in core.parcels -- the
+    join_field / match_rate / verified_on columns mean every row was
+    measured. Do NOT identify a code by matching digits-only parcel IDs
+    across the state: short IDs collide, and code 41 "matched" fillmore,
+    becker, morrison and houston at once. See
+    HANDOFF_2026-09-01_ecrv_county_mapping.md.
     This prints; it never changes the exit code. Any exception here is
     swallowed for the same reason: a broken warning must not break a
     working ingest.
@@ -127,10 +134,12 @@ def report_unmapped_counties(source_file: str) -> None:
             flush=True,
         )
         print(
-            "[ecrv-ingest] a code with parcels loaded in core.parcels can be "
-            "mapped by joining its digits-only parcel IDs against them; one "
-            "with no parcels loaded cannot, and needs the parcel loader "
-            "first",
+            "[ecrv-ingest] codes are alphabetical by county name and the 28 "
+            "unmapped are already identified -- do not match digits-only "
+            "parcel IDs across the state to guess one (short IDs collide). "
+            "A county's map row waits for its parcel loader and a match rate "
+            "measured against that county's own parcels; see "
+            "HANDOFF_2026-09-01_ecrv_county_mapping.md",
             flush=True,
         )
     except Exception as e:
