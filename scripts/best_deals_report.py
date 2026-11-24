@@ -38,12 +38,11 @@ EXCLUDED FROM THE TOP LIST, AND COUNTED IN THE EMAIL
   * Commercial and industrial property: a $10M building wins on dollars by
     being large. Listed in its own short section.
 
-TAGGED, NOT HIDDEN
-  verify        buyer pays 5-10% of value and no association was detected --
-                the gray zone just above the guard
-  type unknown  no property type and no year built (could be land or a farm)
-  homestead     county GIS says owner-occupied (Hennepin rows only)
-  INTENT FILED  owner has filed a notice of intent to redeem
+RANKED BEST FIRST (Task 244) -- see WORK_DAYS_MIN / PAYS_PCT_* below.
+  Rank 1 is the best deal. Each row carries a `why` sentence: the numbers,
+  then absentee / homestead / distress signals / postponements / an old
+  assessment year / intent to redeem. Rows that are not ranked follow in the
+  CSV with the reason first. No `source` column.
 
 SELF-CONTAINED, like health_alert.py: Supabase REST with httpx, Resend HTTP.
 No app code imported.
@@ -77,6 +76,23 @@ MIN_DAYS_LEFT = 21
 LIEN_RATIO_GUARD = 0.05      # buyer pays < 5% of value -> treated as a lien
 VERIFY_RATIO_MAX = 0.10      # 5-10% and no association detected -> "verify"
 NON_RESIDENTIAL = {"commercial", "industrial"}
+
+# THE DEFAULT RANKING (Task 244, 2026-11-23). Rank 1 is the best deal; the
+# reader never re-sorts. A row is RANKED only if it is workable:
+#   * residential, not an association lien, property type or age known
+#   * WORK_DAYS_MIN+ days left -- under that there is no time to find the
+#     owner, agree terms and close
+#   * buyer pays PAYS_PCT_MIN-PAYS_PCT_MAX % of value -- under 10% is mostly
+#     liens or data errors, over 60% leaves too little after costs
+# then by spread, largest first. Everything else stays in the CSV BELOW the
+# ranked rows, unranked, with the reason in the `why` column.
+#
+# Fitted to buying FROM THE OWNER during the window (Govire Connect). For a
+# certificate buyer, low-% windows mostly do not convert: the August read of
+# scoring.redemption_rates had bid-under-50% not converting ~72% (n=25).
+WORK_DAYS_MIN = 45
+PAYS_PCT_MIN = 10.0
+PAYS_PCT_MAX = 60.0
 PAGE = 1000
 
 # ---- Ported VERBATIM from src/routes/properties.py (2026-11-23). ----------
@@ -274,47 +290,104 @@ def dedupe(shaped):
     return list(best.values()) + no_key
 
 
-def tags(s):
-    t = []
-    if s["intent_filed"]:
-        t.append("INTENT FILED")
-    if (s["pays_pct"] is not None and s["pays_pct"] < VERIFY_RATIO_MAX * 100
-            and not s["lien"]):
-        t.append("verify")
+def _short_money(v):
+    if v is None:
+        return "—"
+    return f"${v/1e6:.2f}M" if abs(v) >= 1e6 else f"${v/1e3:,.0f}K"
+
+
+def exclusions(s):
+    """Why a scored row is NOT ranked. Empty list = ranked."""
+    out = []
+    if s["lien"]:
+        out.append("association lien — the first mortgage survives the sale, "
+                   "so this spread is not real")
+        return out
+    if s["non_residential"]:
+        out.append("commercial/industrial — different buyer; listed separately")
+        return out
+    pct = s["pays_pct"]
+    if pct is not None and pct < PAYS_PCT_MIN:
+        out.append(f"pays only {pct}% of value — check for an unpublished "
+                   f"senior lien before trusting it")
+    if pct is not None and pct > PAYS_PCT_MAX:
+        out.append(f"pays {pct}% of value — thin margin after costs")
+    d = s["days_left"]
+    if isinstance(d, (int, float)) and d < WORK_DAYS_MIN:
+        out.append(f"only {d} days left — too short to reach the owner and close")
     if not s["property_type"] and not s["year_built"]:
-        t.append("type unknown")
-    if str(s["homestead"] or "").upper() == "H":
-        t.append("homestead")
+        out.append("property type and age unknown (could be land) — look it up")
+    return out
+
+
+def notes(s):
+    """Facts worth knowing about a row, for the `why` sentence."""
+    n = []
+    if s["intent_filed"]:
+        n.append("owner FILED intent to redeem — likely to keep it")
     if s["absentee"] is True:
-        t.append("absentee")
+        n.append("absentee owner")
+    if str(s["homestead"] or "").upper() == "H":
+        n.append("owner-occupied (homestead)")
     if (s["signal_count"] or 1) >= 2:
-        t.append(f"{s['signal_count']} signals")
+        n.append(f"{s['signal_count']} distress signals"
+                 + (f" ({s['signals']})" if s["signals"] else ""))
     if s["postponements"]:
-        t.append(f"postponed x{s['postponements']}")
-    return t
+        n.append(f"sale postponed {s['postponements']}x")
+    try:
+        lag = date.today().year - int(s["emv_year"])
+        if lag >= 2:
+            n.append(f"value is a {s['emv_year']} assessment — likely understated")
+    except (TypeError, ValueError):
+        pass
+    if s["year_built"]:
+        n.append(f"built {s['year_built']}")
+    return n
+
+
+def why(s):
+    if s["spread"] is None:
+        return "Not ranked: no county value or no price published."
+    head = (f"Pays {s['pays_pct']}% of value — {_short_money(s['spread'])} "
+            f"spread, {s['days_left']} days left")
+    ex = exclusions(s)
+    extra = notes(s)
+    if ex:
+        return ("Not ranked: " + "; ".join(ex) + ". "
+                + f"({_short_money(s['spread'])} spread, {s['days_left']} days left.)")
+    if extra:
+        tail = "; ".join(extra)
+        return head + ". " + tail[0].upper() + tail[1:] + "."
+    return head + "."
 
 
 def build(shaped, top_n, county):
     rows = dedupe(shaped)
     scored = [s for s in rows if s["spread"] is not None]
-    unscored = len(rows) - len(scored)
+    unscored = [s for s in rows if s["spread"] is None]
     by_spread = sorted(scored, key=lambda s: s["spread"], reverse=True)
+    ranked = [s for s in by_spread if not exclusions(s)]
+    for i, s in enumerate(ranked, 1):
+        s["rank"] = i
     liens = [s for s in by_spread if s["lien"]]
-    clean = [s for s in by_spread if not s["lien"]]
-    resi = [s for s in clean if not s["non_residential"]]
-    comm = [s for s in clean if s["non_residential"]]
-    top = resi[:top_n]
+    comm = [s for s in by_spread if not s["lien"] and s["non_residential"]]
+    outside = [s for s in by_spread if exclusions(s)
+               and not s["lien"] and not s["non_residential"]]
+    top = ranked[:top_n]
     top_ids = {id(s) for s in top}
-    stacked = [s for s in resi if (s["signal_count"] or 1) >= 2
-               and id(s) not in top_ids][:10]
+    stacked = [s for s in by_spread if not s["lien"] and not s["non_residential"]
+               and (s["signal_count"] or 1) >= 2 and id(s) not in top_ids][:10]
     per_county = {}
     for s in top:
         per_county[s["county"]] = per_county.get(s["county"], 0) + 1
     return {
-        "pool": len(rows), "unscored": unscored, "liens": liens,
+        "pool": len(rows), "unscored": len(unscored), "liens": liens,
+        "ranked_n": len(ranked), "outside_n": len(outside),
         "top": top, "stacked": stacked, "commercial": comm[:5],
         "per_county": sorted(per_county.items(), key=lambda kv: -kv[1]),
-        "county": county, "all_ranked": by_spread,
+        "county": county,
+        # CSV order: best first, then everything that was not ranked.
+        "csv_rows": ranked + outside + comm + liens + unscored,
     }
 
 
@@ -334,9 +407,12 @@ def _place(s):
 def _header(r):
     scope = r["county"].title() if r["county"] else "all counties"
     L = [f"Govire best deals — {date.today():%a %b %d, %Y} — {scope}",
-         f"Pool: {r['pool']} open windows (completed sales, {MIN_DAYS_LEFT}+ "
-         f"days left). {len(r['liens'])} excluded as likely association "
-         f"liens; {r['unscored']} have no value or price to score."]
+         f"Ranked best first: residential, {WORK_DAYS_MIN}+ days left, buyer "
+         f"pays {PAYS_PCT_MIN:.0f}-{PAYS_PCT_MAX:.0f}% of value, then largest "
+         f"spread. {r['ranked_n']} qualify out of {r['pool']} open windows.",
+         f"Not ranked: {r['outside_n']} outside those limits, "
+         f"{len(r['liens'])} association liens, {r['unscored']} with no value "
+         f"or price — all in the CSV below the ranked rows, with the reason."]
     if r["per_county"]:
         L.append("Top list by county: " + ", ".join(
             f"{c.title()} {n}" for c, n in r["per_county"]))
@@ -345,73 +421,63 @@ def _header(r):
 
 def _sections(r):
     L = []
-    for title, items in (("STACKED DISTRESS — 2+ signals, outside the top list",
+    for title, items in (("STACKED DISTRESS — 2+ signals, not in the top list",
                           r["stacked"]),
                          ("COMMERCIAL / INDUSTRIAL — top 5", r["commercial"])):
         if items:
             L += ["", title]
             for s in items:
-                L.append(f"  - {_place(s)}: spread {_money(s['spread'])}, "
-                         f"pays {s['pays_pct']}%, {s['days_left']}d left"
-                         + (f", {s['signals']}" if s['signals'] else ""))
+                L.append(f"  - {_place(s)}: {why(s)}")
     if r["liens"]:
         L += ["", f"EXCLUDED AS LIKELY ASSOCIATION LIENS ({len(r['liens'])}) — "
-                  f"senior mortgage survives the sale, spread is not real. "
-                  f"Largest five:"]
+                  f"largest five:"]
         for s in r["liens"][:5]:
-            why = "named association" if s["assoc_named"] else "pays <5% of value"
+            how = "named association" if s["assoc_named"] else "pays <5% of value"
             L.append(f"  - {_place(s)}: pays {_money(s['buyer_pays'])} "
-                     f"against {_money(s['value'])} ({why})")
+                     f"against {_money(s['value'])} ({how})")
     L += ["", "How to read this: spread = county market value minus what a "
               "buyer pays (final bid for Hennepin, notice amount due "
-              "elsewhere). Market value is the county assessment, not an "
-              "appraisal. Homestead/absentee exist for Hennepin rows only. "
-              "Anoka, Dakota and Ramsey sheriff feeds are not reporting, so "
-              "those counties appear only through newspaper notices. "
-              "Full ranked list attached as CSV."]
+              "elsewhere). It is room in the deal, not profit — the owner can "
+              "still redeem, other liens may exist, and the value is the "
+              "assessor's, not an appraisal. Ranking fits buying from the "
+              "owner during the window. Anoka, Dakota and Ramsey sheriff "
+              "feeds are not reporting; those counties appear only through "
+              "newspaper notices."]
     return L
 
 
 def render_text(r):
-    L = _header(r) + ["", f"TOP {len(r['top'])} — residential, ranked by spread"]
-    for i, s in enumerate(r["top"], 1):
-        t = tags(s)
-        L.append(f"{i:>2}. {_place(s)} ({s['county'].title()})")
-        L.append(f"    value {_money(s['value'])}  pays {_money(s['buyer_pays'])} "
-                 f"({s['pays_pct']}%, {s['price_basis']})  spread "
-                 f"{_money(s['spread'])}  {s['days_left']}d left"
-                 + (f"  built {s['year_built']}" if s['year_built'] else "")
-                 + (f"  [{', '.join(t)}]" if t else ""))
+    L = _header(r) + ["", f"TOP {len(r['top'])} — best first"]
+    for s in r["top"]:
+        L.append(f"{s['rank']:>2}. {_place(s)} ({s['county'].title()})")
+        L.append(f"    value {_money(s['value'])}  pays {_money(s['buyer_pays'])}"
+                 f"  spread {_money(s['spread'])}")
+        L.append(f"    {why(s)}")
     return "\n".join(L + _sections(r))
 
 
 def render_html(r):
-    def row(i, s):
-        t = tags(s)
-        sub = s["county"].title()
-        if s["year_built"]:
-            sub += f" · built {s['year_built']}"
-        if s["property_type"]:
-            sub += f" · {s['property_type']}"
+    def row(s):
         return (
-            f"<tr><td>{i}</td>"
-            f"<td><b>{html.escape(_place(s))}</b><br><small>{html.escape(sub)}</small>"
-            + (f"<br><small><b>{html.escape(', '.join(t))}</b></small>" if t else "")
-            + f"</td><td align=right>{_money(s['spread'])}</td>"
+            f"<tr><td>{s['rank']}</td>"
+            f"<td><b>{html.escape(_place(s))}</b><br>"
+            f"<small>{html.escape(s['county'].title())}</small><br>"
+            f"<small>{html.escape(why(s))}</small></td>"
+            f"<td align=right>{_money(s['spread'])}</td>"
             f"<td align=right>{_money(s['value'])}</td>"
             f"<td align=right>{_money(s['buyer_pays'])}<br>"
-            f"<small>{s['pays_pct']}% · {s['price_basis']}</small></td>"
+            f"<small>{s['pays_pct']}%</small></td>"
             f"<td align=right>{s['days_left']}</td></tr>")
     head = "<br>".join(html.escape(x) for x in _header(r))
-    rows = "".join(row(i, s) for i, s in enumerate(r["top"], 1))
+    rows = "".join(row(s) for s in r["top"])
     rest = html.escape("\n".join(_sections(r)).strip())
     return (
         "<div style='font-family:Arial,sans-serif;font-size:14px'>"
         f"<p>{head}</p>"
-        f"<h3>Top {len(r['top'])} — residential, ranked by spread</h3>"
+        f"<h3>Top {len(r['top'])} — best first</h3>"
         "<table cellpadding=6 cellspacing=0 border=1 "
         "style='border-collapse:collapse;border-color:#ddd'>"
-        "<tr style='background:#f3f3f3'><th>#</th><th>Property</th>"
+        "<tr style='background:#f3f3f3'><th>#</th><th>Property and why</th>"
         "<th>Spread</th><th>Value</th><th>Buyer pays</th><th>Days left</th></tr>"
         f"{rows}</table>"
         "<pre style='font-family:Arial,sans-serif;white-space:pre-wrap'>"
@@ -419,19 +485,19 @@ def render_html(r):
 
 
 def to_csv(r):
+    """Best first. Ranked rows carry rank 1..N; every other row follows,
+    unranked, with its reason in `why`. No `source` column (operator asked
+    2026-11-23); price_basis still says where the price came from."""
     buf = io.StringIO()
-    cols = ["rank", "county", "address", "city", "parcel_id", "property_type",
-            "year_built", "sqft", "value", "emv_year", "buyer_pays",
-            "price_basis", "pays_pct", "spread", "sale_date", "days_left",
-            "postponements", "homestead", "absentee", "intent_filed",
-            "signal_count", "signals", "excluded_reason", "tags", "mortgagee",
-            "source"]
+    cols = ["rank", "why", "county", "address", "city", "parcel_id",
+            "property_type", "year_built", "sqft", "value", "emv_year",
+            "buyer_pays", "price_basis", "pays_pct", "spread", "sale_date",
+            "days_left", "postponements", "homestead", "absentee",
+            "intent_filed", "signal_count", "signals", "mortgagee"]
     w = csv.writer(buf)
     w.writerow(cols)
-    for i, s in enumerate(r["all_ranked"], 1):
-        reason = ("association lien" if s["lien"] else
-                  "non-residential" if s["non_residential"] else "")
-        vals = dict(s, rank=i, excluded_reason=reason, tags="; ".join(tags(s)))
+    for s in r["csv_rows"]:
+        vals = dict(s, why=why(s), rank=s.get("rank"))
         w.writerow([vals.get(c) if vals.get(c) is not None else "" for c in cols])
     return buf.getvalue()
 
