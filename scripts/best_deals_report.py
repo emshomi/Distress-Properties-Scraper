@@ -331,13 +331,13 @@ def notes(s):
         n.append("owner-occupied (homestead)")
     if (s["signal_count"] or 1) >= 2:
         n.append(f"{s['signal_count']} distress signals"
-                 + (f" ({s['signals']})" if s["signals"] else ""))
+                 + (f" ({str(s['signals']).replace('_', ' ')})" if s["signals"] else ""))
     if s["postponements"]:
         n.append(f"sale postponed {s['postponements']}x")
     try:
         lag = date.today().year - int(s["emv_year"])
         if lag >= 2:
-            n.append(f"value is a {s['emv_year']} assessment — likely understated")
+            n.append(f"value is a {int(s['emv_year'])} assessment — likely understated")
     except (TypeError, ValueError):
         pass
     if s["year_built"]:
@@ -391,6 +391,15 @@ def build(shaped, top_n, county):
     }
 
 
+def _ptype(s):
+    t = s.get("property_type")
+    return str(t).replace("_", " ").title() if t else None
+
+
+def _ranked_why(s):
+    return (f"Ranked #{s['rank']}. " if s.get("rank") else "") + why(s)
+
+
 def _money(v):
     return "—" if v is None else f"${v:,.0f}"
 
@@ -427,7 +436,7 @@ def _sections(r):
         if items:
             L += ["", title]
             for s in items:
-                L.append(f"  - {_place(s)}: {why(s)}")
+                L.append(f"  - {_place(s)}: {_ranked_why(s)}")
     if r["liens"]:
         L += ["", f"EXCLUDED AS LIKELY ASSOCIATION LIENS ({len(r['liens'])}) — "
                   f"largest five:"]
@@ -502,15 +511,237 @@ def to_csv(r):
     return buf.getvalue()
 
 
-def send(api_key, to_addr, from_addr, subject, text, html_body, csv_text):
+# ============================================================
+# PDF (Task 245) -- the same report as a printable, shareable-looking file.
+# reportlab is imported lazily: if it is missing the email still goes out,
+# with the CSV and without the PDF, and the log says so.
+# Palette is the 2026-09-16 brand: Ink #141413, Ivory #FAF9F5, Amber #E0A83C.
+# Built-in Helvetica only (no font files in the repo); every character used
+# here, including the em dash, is in its WinAnsi set.
+# ============================================================
+def render_pdf(r):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter, landscape
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (KeepTogether, Paragraph,
+                                        SimpleDocTemplate, Spacer, Table,
+                                        TableStyle)
+    except ImportError:
+        print("WARNING: reportlab not installed — PDF skipped", flush=True)
+        return None
+
+    INK = colors.HexColor("#141413")
+    IVORY = colors.HexColor("#FAF9F5")
+    AMBER = colors.HexColor("#E0A83C")
+    MUTED = colors.HexColor("#6B6A64")
+    LINE = colors.HexColor("#E6E3DA")
+    ZEBRA = colors.HexColor("#F6F4EE")
+    GREEN = colors.HexColor("#2F6B3A")
+
+    def st(name, **kw):
+        base = dict(fontName="Helvetica", fontSize=9, leading=11.5,
+                    textColor=INK)
+        base.update(kw)
+        return ParagraphStyle(name, **base)
+
+    s_title = st("t", fontName="Helvetica-Bold", fontSize=22, leading=26)
+    s_sub = st("s", fontSize=10.5, leading=14, textColor=MUTED)
+    s_h = st("h", fontName="Helvetica-Bold", fontSize=13, leading=16,
+             spaceBefore=6, spaceAfter=6)
+    s_cell = st("c", fontSize=8.6, leading=11)
+    s_addr = st("a", fontName="Helvetica-Bold", fontSize=9.4, leading=12)
+    s_why = st("w", fontSize=7.8, leading=10, textColor=MUTED)
+    s_num = st("n", fontSize=9.2, leading=12, alignment=2)
+    s_big = st("b", fontName="Helvetica-Bold", fontSize=9.6, leading=12,
+               alignment=2, textColor=GREEN)
+    s_rank = st("r", fontName="Helvetica-Bold", fontSize=13, leading=15,
+                alignment=1, textColor=INK)
+    s_note = st("note", fontSize=8.2, leading=11, textColor=MUTED)
+    s_kpi_v = st("kv", fontName="Helvetica-Bold", fontSize=20, leading=23)
+    s_kpi_l = st("kl", fontSize=8, leading=10, textColor=MUTED)
+
+    E = html.escape
+    buf = io.BytesIO()
+    page_w, page_h = landscape(letter)
+    margin = 0.55 * inch
+    scope = r["county"].replace("_", " ").title() if r["county"] else "All counties"
+    stamp = f"{date.today():%B %d, %Y}"
+
+    def chrome(canvas, doc):
+        canvas.saveState()
+        # top band
+        canvas.setFillColor(INK)
+        canvas.rect(0, page_h - 0.42 * inch, page_w, 0.42 * inch, fill=1, stroke=0)
+        canvas.setFillColor(AMBER)
+        canvas.rect(0, page_h - 0.46 * inch, page_w, 0.04 * inch, fill=1, stroke=0)
+        canvas.setFillColor(IVORY)
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(margin, page_h - 0.29 * inch, "govire")
+        canvas.setFont("Helvetica", 8.5)
+        canvas.drawString(margin + 52, page_h - 0.29 * inch,
+                          "PUBLIC RECORDS, MADE VISIBLE")
+        canvas.drawRightString(page_w - margin, page_h - 0.29 * inch,
+                               f"Best deals  ·  {scope}  ·  {stamp}")
+        # footer
+        canvas.setFillColor(MUTED)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(margin, 0.35 * inch,
+                          "INTERNAL — not for distribution. Spread is room in "
+                          "the deal, not profit. County assessments, not appraisals.")
+        canvas.drawRightString(page_w - margin, 0.35 * inch,
+                               f"Patnu Consulting LLC  ·  page {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(buf, pagesize=landscape(letter),
+                            leftMargin=margin, rightMargin=margin,
+                            topMargin=0.75 * inch, bottomMargin=0.6 * inch,
+                            title=f"Govire best deals — {stamp}",
+                            author="Govire (Patnu Consulting LLC)")
+    avail = page_w - 2 * margin
+    story = []
+
+    story.append(Paragraph(f"Best deals this week", s_title))
+    story.append(Paragraph(
+        f"{E(scope)}  ·  {stamp}  ·  ranked best first — residential, "
+        f"{WORK_DAYS_MIN}+ days left in the redemption window, buyer pays "
+        f"{PAYS_PCT_MIN:.0f}–{PAYS_PCT_MAX:.0f}% of value, then largest spread",
+        s_sub))
+    story.append(Spacer(1, 10))
+
+    counties_in_top = len({s["county"] for s in r["top"]})
+    best = r["top"][0] if r["top"] else None
+    kpis = [
+        (str(r["ranked_n"]), "deals qualify"),
+        (str(r["pool"]), "open windows checked"),
+        (_short_money(best["spread"]) if best else "—", "largest qualifying spread"),
+        (str(len(r["liens"])), "association liens excluded"),
+        (str(counties_in_top), "counties in the top list"),
+    ]
+    kt = Table([[Paragraph(v, s_kpi_v) for v, _ in kpis],
+                [Paragraph(E(l), s_kpi_l) for _, l in kpis]],
+               colWidths=[avail / len(kpis)] * len(kpis))
+    kt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), IVORY),
+        ("LINEABOVE", (0, 0), (-1, 0), 2, AMBER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, 0), 9),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 9),
+        ("LINEAFTER", (0, 0), (-2, -1), 0.5, LINE),
+    ]))
+    story.append(kt)
+    story.append(Spacer(1, 14))
+
+    # ---- ranked table ----
+    story.append(Paragraph(f"Top {len(r['top'])}", s_h))
+    widths = [0.45, 4.6, 1.05, 1.05, 1.15, 0.6]
+    widths = [w * inch for w in widths]
+    widths[1] = avail - sum(widths) + widths[1]
+    head = ["#", "Property — and why it ranks here", "Spread", "Value",
+            "Buyer pays", "Days"]
+    data = [[Paragraph(f"<font color='#FAF9F5'><b>{h}</b></font>",
+                       st("hh", fontSize=8.4, alignment=0 if i == 1 else
+                          (1 if i == 0 else 2))) for i, h in enumerate(head)]]
+    for s in r["top"]:
+        prop = [Paragraph(E(_place(s)), s_addr),
+                Paragraph(E(s["county"].replace("_", " ").title()
+                            + (f" · {_ptype(s)}" if _ptype(s) else "")),
+                          s_why),
+                Paragraph(E(why(s)), s_why)]
+        data.append([
+            Paragraph(str(s["rank"]), s_rank),
+            prop,
+            Paragraph(_money(s["spread"]), s_big),
+            Paragraph(_money(s["value"]), s_num),
+            [Paragraph(_money(s["buyer_pays"]), s_num),
+             Paragraph(f"{s['pays_pct']}%", st("pp", fontSize=7.8,
+                                               textColor=MUTED, alignment=2))],
+            Paragraph(str(s["days_left"]), s_num),
+        ])
+    t = Table(data, colWidths=widths, repeatRows=1)
+    ts = [
+        ("BACKGROUND", (0, 0), (-1, 0), INK),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.4, LINE),
+        ("LINEBELOW", (0, 0), (-1, 0), 2, AMBER),
+    ]
+    for i in range(1, len(data)):
+        if i % 2 == 0:
+            ts.append(("BACKGROUND", (0, i), (-1, i), ZEBRA))
+    for i in range(1, min(4, len(data))):
+        ts.append(("BACKGROUND", (0, i), (0, i), AMBER))
+    t.setStyle(TableStyle(ts))
+    story.append(t)
+
+    # ---- short sections ----
+    def mini(title, items, line):
+        if not items:
+            return
+        rows = [[Paragraph(E(_place(s)), s_addr), Paragraph(E(line(s)), s_cell)]
+                for s in items]
+        mt = Table(rows, colWidths=[avail * 0.36, avail * 0.64])
+        mt.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.4, LINE),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(Spacer(1, 12))
+        story.append(KeepTogether([Paragraph(E(title), s_h), mt]))
+
+    mini("Stacked distress — two or more public signals, not in the top list",
+         r["stacked"], _ranked_why)
+    mini("Commercial and industrial — different buyer", r["commercial"],
+         lambda s: f"{_money(s['spread'])} spread, pays {s['pays_pct']}%, "
+                   f"{s['days_left']} days left")
+    mini(f"Excluded: likely association liens ({len(r['liens'])}) — largest five",
+         r["liens"][:5],
+         lambda s: f"pays {_money(s['buyer_pays'])} against "
+                   f"{_money(s['value'])} — the first mortgage survives the "
+                   f"sale, so this spread is not real")
+
+    story.append(Spacer(1, 14))
+    story.append(KeepTogether([
+        Paragraph("How to read this", s_h),
+        Paragraph(
+            "Spread is the county's assessed market value minus what a buyer "
+            "pays: the final bid at the sheriff sale for Hennepin, the amount "
+            "due on the published notice elsewhere. It is room in the deal, "
+            "not profit — the owner can still redeem during the window, other "
+            "liens may sit on the title, and the value is the assessor's, not "
+            "an appraisal. The ranking fits buying from the owner during the "
+            "redemption window. Homestead and absentee are known for Hennepin "
+            "only. Anoka, Dakota and Ramsey sheriff feeds are not reporting; "
+            "those counties appear only through newspaper notices. The full "
+            "list, including every property that did not rank and why, is in "
+            "the attached CSV.", s_note),
+    ]))
+
+    doc.build(story, onFirstPage=chrome, onLaterPages=chrome)
+    return buf.getvalue()
+
+
+def send(api_key, to_addr, from_addr, subject, text, html_body, csv_text,
+         pdf_bytes=None):
     payload = {
         "from": from_addr, "to": [to_addr], "subject": subject,
         "text": text, "html": html_body,
         "attachments": [{
             "filename": f"govire_best_deals_{date.today().isoformat()}.csv",
-            "content": base64.b64encode(csv_text.encode("utf-8")).decode("ascii"),
+            # utf-8-SIG: the byte-order mark tells Excel the file is UTF-8.
+            # Without it Excel reads it as Windows-1252 and every em dash in
+            # the why column shows as "â€”" (seen 2026-11-23).
+            "content": base64.b64encode(csv_text.encode("utf-8-sig")).decode("ascii"),
         }],
     }
+    if pdf_bytes:
+        payload["attachments"].insert(0, {
+            "filename": f"govire_best_deals_{date.today().isoformat()}.pdf",
+            "content": base64.b64encode(pdf_bytes).decode("ascii"),
+        })
     try:
         resp = httpx.post("https://api.resend.com/emails",
                           headers={"Authorization": f"Bearer {api_key}",
@@ -544,6 +775,9 @@ def main() -> int:
     text = render_text(report)
     print(text, flush=True)          # also in the Actions log
     if dry:
+        pdf = render_pdf(report)
+        if pdf:
+            print(f"PDF built: {len(pdf):,} bytes", flush=True)
         print("\nDRY_RUN=1 — nothing sent.", flush=True)
         return 0
 
@@ -551,7 +785,8 @@ def main() -> int:
     subject = (f"[Govire deals] Top {len(report['top'])} — {scope} — "
                f"{date.today():%b %d}")
     send(_env("RESEND_API_KEY"), _env("ALERT_EMAIL_TO"), _env("ALERT_EMAIL_FROM"),
-         subject, text, render_html(report), to_csv(report))
+         subject, text, render_html(report), to_csv(report),
+         render_pdf(report))
     return 0
 
 
